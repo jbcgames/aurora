@@ -233,3 +233,13 @@ GXBool AuroraReadbackGet(AuroraReadbackStream stream, AuroraReadbackDest* dests,
   return GX_FALSE;
 }
 }
+
+extern "C" {
+void AuroraSetPresentArea(float left, float top, float right, float bottom) {
+  (void)left; (void)top; (void)right; (void)bottom;
+}
+
+void AuroraSetDrawsBlocking(bool blocking) {
+  (void)blocking;
+}
+}

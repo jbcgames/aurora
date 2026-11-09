@@ -2,6 +2,9 @@
 #define DOLPHIN_GXAURORA_H
 
 #include <dolphin/types.h>
+#ifndef __cplusplus
+#include <stdbool.h>
+#endif
 #include <dolphin/gx/GXEnum.h>
 
 #if __cplusplus
@@ -422,6 +425,8 @@ void AuroraForgetMemory(const void* lo, const void* hi);
 void AuroraMoveMemory(const void* from, const void* to, u32 size);
 void AuroraSetSharpTextures(GXBool sharp);
 void AuroraSetPresentBackdrop(GXBool enabled);
+void AuroraSetPresentArea(float left, float top, float right, float bottom);
+void AuroraSetDrawsBlocking(bool blocking);
 
 typedef u32 AuroraReadbackStream;
 
