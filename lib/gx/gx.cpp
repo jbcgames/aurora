@@ -613,25 +613,23 @@ void move_memory(const void* from_, const void* to_, u32 size) noexcept {
     return reinterpret_cast<const void*>(reinterpret_cast<uintptr_t>(p) + delta);
   };
   std::vector<std::pair<const void*, GXState::CopyTextureRef>> copies;
+  for (auto& [dest, ref] : g_gxState.copyTextures) {
+    if (in(dest)) {
+      copies.emplace_back(shift(dest), std::move(ref));
+    }
+  }
+  absl::erase_if(g_gxState.copyTextures, [&](const auto& kv) { return in(kv.first); });
+
   std::vector<std::pair<const void*, const void*>> aliases;
-  for (auto it = g_gxState.copyTextures.begin(); it != g_gxState.copyTextures.end();) {
-    if (in(it->first)) {
-      copies.emplace_back(shift(it->first), std::move(it->second));
-      it = g_gxState.copyTextures.erase(it);
-    } else {
-      ++it;
-    }
-  }
-  for (auto it = s_copyAliases.begin(); it != s_copyAliases.end();) {
-    if (in(it->first) || in(it->second)) {
-      const auto d = in(it->first) ? shift(it->first) : it->first;
-      const auto s = in(it->second) ? shift(it->second) : it->second;
+  for (const auto& [dest, src] : s_copyAliases) {
+    if (in(dest) || in(src)) {
+      const auto d = in(dest) ? shift(dest) : dest;
+      const auto s = in(src) ? shift(src) : src;
       aliases.emplace_back(d, s);
-      it = s_copyAliases.erase(it);
-    } else {
-      ++it;
     }
   }
+  absl::erase_if(s_copyAliases, [&](const auto& kv) { return in(kv.first) || in(kv.second); });
+
   for (auto& [dest, ref] : copies) {
     g_gxState.copyTextures[dest] = std::move(ref);
   }
