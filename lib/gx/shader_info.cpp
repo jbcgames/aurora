@@ -409,7 +409,7 @@ gfx::Range build_uniform(const ShaderInfo& info, u32 vtxStart, const BindGroupRa
   auto proj = g_gxState.proj;
   if (g_gxState.projScaleX != 1.f && !gfx::is_offscreen()) {
     const float s = g_gxState.projScaleX;
-    proj.m0 = proj.m0 * s;
+    proj.m0 = proj.m0 * Vec4{s, s, s, s};
   }
   buf.append(proj);
 
