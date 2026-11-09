@@ -667,7 +667,7 @@ bool aurora_dvd_open(const char* disc_path) {
       .close = sdlStreamClose,
   };
   const NodDiscOptions options{
-      .preloader_threads = 1,
+      .preloader_threads = 0,
   };
 
   NodHandle* discHandle;

@@ -49,6 +49,10 @@ int __cntlzw(unsigned int val) {
 
 void init_texobj_common(GXTexObj_& obj, const void* data, u16 width, u16 height, u32 format, GXTexWrapMode wrapS,
                         GXTexWrapMode wrapT, GXBool mipmap) {
+  if (obj.texObjId != 0) {
+    GX_WRITE_AURORA(GX_AURORA_DESTROY_TEXOBJ);
+    GX_WRITE_U32(obj.texObjId);
+  }
   obj = {};
   obj.mWidth = width;
   obj.mHeight = height;
@@ -306,8 +310,12 @@ u32 GXGetTexBufferSize(u16 width, u16 height, u32 fmt, GXBool mips, u8 maxLod) {
 }
 
 void GXInitTlutObj(GXTlutObj* obj_, const void* data, GXTlutFmt format, u16 entries) {
-  memset(obj_, 0, sizeof(GXTlutObj));
   auto* obj = reinterpret_cast<GXTlutObj_*>(obj_);
+  if (obj->tlutObjId != 0) {
+    GX_WRITE_AURORA(GX_AURORA_DESTROY_TLUT);
+    GX_WRITE_U32(obj->tlutObjId);
+  }
+  memset(obj_, 0, sizeof(GXTlutObj));
   obj->data = data;
   obj->format = format;
   obj->numEntries = entries;

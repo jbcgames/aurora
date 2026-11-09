@@ -12,16 +12,16 @@ add_library(aurora_core STATIC
         lib/input/sdl_input.hpp
         lib/input/source_state.cpp
         lib/input/source_state.hpp
-        lib/io.cpp
-        lib/io.hpp
+        lib/window.cpp
         lib/logging.cpp
         lib/system_info.cpp
         lib/system_info.hpp
-        lib/thread.cpp
+        lib/io.hpp
+        lib/io.cpp
         lib/thread.hpp
-        lib/time.cpp
+        lib/thread.cpp
         lib/time_internal.hpp
-        lib/window.cpp
+        lib/time.cpp
 )
 add_library(aurora::core ALIAS aurora_core)
 set_target_properties(aurora_core PROPERTIES FOLDER "aurora")
@@ -35,15 +35,13 @@ if (AURORA_ENABLE_GX AND AURORA_CACHE_USE_ZSTD)
     target_link_libraries(aurora_core PRIVATE zstd::libzstd)
 endif ()
 
-if (CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
-    target_compile_options(aurora_core PUBLIC
-            /Zc:__cplusplus # Enable updated `__cplusplus` macro
-    )
-endif ()
-
 if (CMAKE_SYSTEM_NAME STREQUAL Windows)
     # stuff for fetching system info.
-    target_link_libraries(aurora_core PRIVATE wbemuuid.lib comsuppw.lib ntdll.lib DXGI.lib)
+    if (MSVC)
+        target_link_libraries(aurora_core PRIVATE wbemuuid.lib comsuppw.lib ntdll.lib DXGI.lib)
+    else ()
+        target_link_libraries(aurora_core PRIVATE wbemuuid dxgi ole32 oleaut32 ntdll)
+    endif ()
 elseif (APPLE)
     target_sources(aurora_core PRIVATE lib/system_info_mac.mm)
 endif ()
@@ -60,7 +58,7 @@ if (AURORA_ENABLE_GX)
     target_link_libraries(aurora_core PUBLIC imgui)
 endif ()
 
-if (AURORA_ENABLE_RMLUI)
+if(AURORA_ENABLE_RMLUI)
     target_compile_definitions(aurora_core PUBLIC AURORA_ENABLE_RMLUI)
 
     target_sources(aurora_core PRIVATE
@@ -71,7 +69,6 @@ if (AURORA_ENABLE_RMLUI)
             lib/rmlui/SystemInterface_Aurora.cpp
             lib/rmlui/FileInterface_SDL.cpp
             lib/rmlui/GlassFilter.cpp
-            lib/rmlui/ImageEffects.cpp
     )
     target_link_libraries(aurora_core PUBLIC rmlui)
 
@@ -79,43 +76,25 @@ if (AURORA_ENABLE_RMLUI)
 endif ()
 
 if (AURORA_ENABLE_GX)
-    target_compile_definitions(aurora_core PUBLIC AURORA_ENABLE_GX WEBGPU_DAWN)
+    target_compile_definitions(aurora_core PUBLIC AURORA_ENABLE_GX)
+    # Hand-rolled GLES backend. Dawn (lib/dawn/, lib/webgpu/gpu*.cpp) is gone; the
+    # GL device layer (lib/gl/device.cpp) implements the historical aurora::webgpu
+    # interface directly against OpenGLES. gpu_prof/sdl2shim_present keep their
+    # files (Tracy stub / device EFB present) with the Dawn touchpoints removed.
     target_sources(aurora_core PRIVATE
-            lib/webgpu/gpu.cpp
-            lib/webgpu/gpu_cache.cpp
             lib/webgpu/gpu_prof.cpp
-            lib/dawn/BackendBinding.cpp
-            lib/dawn/TracyPlatform.cpp
+            lib/webgpu/sdl2shim_present.cpp
+            lib/gl/device.cpp
+            lib/gl/gl_loader.cpp
+            lib/gl/context.cpp
+            lib/gl/backend.cpp
+            lib/gl/pass.cpp
+            lib/gl/program.cpp
+            lib/gl/binary_cache.cpp
+            lib/gl/census.cpp
+            lib/gl/textures.cpp
+            lib/gl/buffers.cpp
+            lib/gl/fbo_cache.cpp
+            lib/gl/state.cpp
     )
-    if (CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "GNU")
-        set_source_files_properties(lib/dawn/TracyPlatform.cpp PROPERTIES COMPILE_FLAGS -fno-rtti)
-    endif ()
-    target_link_libraries(aurora_core PRIVATE dawn::webgpu_dawn)
-    if (DAWN_ENABLE_VULKAN)
-        target_compile_definitions(aurora_core PRIVATE DAWN_ENABLE_BACKEND_VULKAN)
-    endif ()
-    if (DAWN_ENABLE_METAL)
-        target_compile_definitions(aurora_core PRIVATE DAWN_ENABLE_BACKEND_METAL)
-        target_sources(aurora_core PRIVATE lib/dawn/MetalBinding.mm)
-        set_source_files_properties(lib/dawn/MetalBinding.mm PROPERTIES COMPILE_FLAGS -fobjc-arc)
-        target_link_options(aurora_core PUBLIC "LINKER:-weak_framework,Metal")
-    endif ()
-    if (DAWN_ENABLE_D3D11)
-        target_compile_definitions(aurora_core PRIVATE DAWN_ENABLE_BACKEND_D3D11)
-    endif ()
-    if (DAWN_ENABLE_D3D12)
-        target_compile_definitions(aurora_core PRIVATE DAWN_ENABLE_BACKEND_D3D12)
-    endif ()
-    if (DAWN_ENABLE_DESKTOP_GL OR DAWN_ENABLE_OPENGLES)
-        target_compile_definitions(aurora_core PRIVATE DAWN_ENABLE_BACKEND_OPENGL)
-        if (DAWN_ENABLE_DESKTOP_GL)
-            target_compile_definitions(aurora_core PRIVATE DAWN_ENABLE_BACKEND_DESKTOP_GL)
-        endif ()
-        if (DAWN_ENABLE_OPENGLES)
-            target_compile_definitions(aurora_core PRIVATE DAWN_ENABLE_BACKEND_OPENGLES)
-        endif ()
-    endif ()
-    if (DAWN_ENABLE_NULL)
-        target_compile_definitions(aurora_core PRIVATE DAWN_ENABLE_BACKEND_NULL)
-    endif ()
 endif ()

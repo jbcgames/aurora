@@ -4,7 +4,9 @@
 
 #include "clear.hpp"
 #include "depth_peek.hpp"
+#include "efb_blend6.hpp"
 #include "pipeline_cache.hpp"
+#include "recording.hpp"
 #include "tex_copy_conv.hpp"
 #include "tex_palette_conv.hpp"
 #include "../gx/gx.hpp"
@@ -18,6 +20,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <utility>
@@ -119,6 +122,13 @@ void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame, Render
   // Bind bind group for the whole pass
   pass.SetBindGroup(0, resources().staticBindGroup);
   pass.SetBindGroup(2, gx::g_emptyTextureBindGroup);
+  // 0229: consecutive GX draws skip the state the previous one set (gx::render_seq).
+  // AURORA_GX_SEQ=0: every GX draw sets all of its state (gx::render), for A/B comparisons.
+  static const bool seqOn = [] {
+    const char* e = std::getenv("AURORA_GX_SEQ");
+    return !(e && e[0] == '0');
+  }();
+  gx::RenderSeqState seq;
 
   for (auto& cmd : passInfo.commands) {
 #ifdef AURORA_GFX_DEBUG_GROUPS
@@ -154,12 +164,17 @@ void render_pass(const wgpu::RenderPassEncoder& pass, FramePacket& frame, Render
     } break;
     case CommandType::Draw: {
       auto& draw = cmd.data.draw;
-      if (draw.encoder != nullptr) {
+      if (const gx::DrawData* gxDraw = seqOn ? gx_draw_payload(draw) : nullptr) {
+        gx::render_seq(*gxDraw, pass, seq);
+      } else if (draw.encoder != nullptr) {
+        seq.valid = false;  // another draw type may set any pass state
         draw.encoder(draw.payload.data(), pass, passInfo);
+        seq.valid = false;
       }
     } break;
     case CommandType::CustomDraw: {
       render_custom_draw(cmd.data.customDraw, pass, passInfo);
+      seq.valid = false;
       g_currentPipeline = nullptr;
       pass.SetBindGroup(0, resources().staticBindGroup);
       pass.SetBindGroup(2, gx::g_emptyTextureBindGroup);
@@ -191,6 +206,9 @@ void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo,
     return;
   }
 
+  for (const auto& op : passInfo.ramPreOps) {
+    op(cmd, frame);
+  }
   for (const auto& conv : passInfo.paletteConvs) {
     tex_palette_conv::run(cmd, conv);
   }
@@ -249,6 +267,9 @@ void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo,
   render_pass(pass, frame, passInfo);
   pass.End();
 
+  // 0176: RGBA6 blend results stored as 6-bit values before anything reads the target.
+  efb_blend6::after_pass(cmd, frame, passInfo);
+
   if (passInfo.captureDepthSnapshot) {
     depth_peek::encode_frame_snapshot(cmd, passInfo.copySourceDepthView,
                                       passInfo.colorAttachments[SceneColorAttachmentIndex].size, passInfo.msaaSamples);
@@ -260,9 +281,7 @@ void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo,
     const bool needsScaling = dstSize.width != static_cast<uint32_t>(passInfo.resolveRect.width) ||
                               dstSize.height != static_cast<uint32_t>(passInfo.resolveRect.height);
     const bool isDepth = gx::is_depth_format(passInfo.resolveFormat);
-    if (isDepth && passInfo.msaaSamples > 1) {
-      Log.fatal("Depth tex copies from multisampled EFB targets are not supported");
-    }
+    // Depth copies from a multisampled EFB read sample 0 (tex_copy_conv's MS depth pipelines).
     const tex_copy_conv::ConvRequest convReq{
         .fmt = passInfo.resolveFormat,
         .srcFmt = passInfo.resolveSourceFormat,
@@ -270,13 +289,14 @@ void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo,
         .uniformRange = passInfo.resolveUniformRange,
         .dst = passInfo.resolveTarget,
         .sampleFilter = needsScaling ? tex_copy_conv::SampleFilter::Linear : tex_copy_conv::SampleFilter::Nearest,
+        .srcSamples = isDepth ? passInfo.msaaSamples : 1u,
     };
     const bool needsOpaqueAlpha = !isDepth && !gx::efb_has_alpha(convReq.srcFmt);
     const bool sameFormat =
         passInfo.resolveTarget->format == passInfo.colorAttachments[SceneColorAttachmentIndex].format;
     if (needsConversion) {
       tex_copy_conv::run(cmd, convReq);
-    } else if (needsScaling || needsOpaqueAlpha || !sameFormat) {
+    } else if (needsScaling || needsOpaqueAlpha || !sameFormat || passInfo.resolveFiltered) {
       tex_copy_conv::blit(cmd, convReq);
     } else {
       const webgpu::gpu_prof::Zone zone{cmd, "EFB copy"};
@@ -298,6 +318,10 @@ void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& passInfo,
       };
       cmd.CopyTextureToTexture(&src, &dst, &size);
     }
+  }
+
+  for (const auto& op : passInfo.ramPostOps) {
+    op(cmd, frame);
   }
 
   if (passInfo.snapshotColorDst) {
@@ -403,6 +427,8 @@ void copy_staging_to_high_water(wgpu::CommandEncoder& cmd, FramePacket& frame, c
 
 namespace detail {
 void encode_op(wgpu::CommandEncoder& cmd, FramePacket& frame, const FrameOp& op) {
+  // 0212: the previous pass's 6-bit resolve, unless this pass clears that target unseen.
+  efb_blend6::before_op(cmd, frame, op.type == FrameOpType::RenderPass ? op.renderPass : nullptr);
   copy_staging_to_high_water(cmd, frame, op);
   switch (op.type) {
   case FrameOpType::RenderPass:
@@ -424,6 +450,8 @@ void encode_op(wgpu::CommandEncoder& cmd, FramePacket& frame, const FrameOp& op)
   }
 }
 } // namespace detail
+
+void reset_bound_pipeline() noexcept { g_currentPipeline = nullptr; }
 
 void bind_pipeline(const wgpu::RenderPipeline& pipeline, const wgpu::RenderPassEncoder& pass) {
   if (pipeline.Get() == g_currentPipeline) {

@@ -1,9 +1,12 @@
 #include "thread.hpp"
 
+#include <aurora/thread_hooks.h>
+
 #include <SDL3/SDL_thread.h>
 #include <tracy/Tracy.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <charconv>
 #include <cstdint>
 #include <fstream>
@@ -27,6 +30,9 @@
 
 namespace aurora::thread {
 namespace {
+std::atomic<AuroraThreadStartHook> sStartHook{nullptr};
+std::atomic<AuroraThreadTickHook> sTickHook{nullptr};
+
 struct Processor {
   uint16_t group = 0;
   uint32_t number = 0;
@@ -293,6 +299,20 @@ void set_current(const Options& options) noexcept {
   if (options.affinity == Affinity::SharedCache) {
     pin_shared_cache();
   }
+  if (const auto hook = sStartHook.load(std::memory_order_acquire)) {
+    hook(options.name.c_str());
+  }
+}
+
+void tick() noexcept {
+  if (const auto hook = sTickHook.load(std::memory_order_relaxed)) {
+    hook();
+  }
 }
 
 } // namespace aurora::thread
+
+void aurora_set_thread_hooks(AuroraThreadStartHook start, AuroraThreadTickHook tick) {
+  aurora::thread::sStartHook.store(start, std::memory_order_release);
+  aurora::thread::sTickHook.store(tick, std::memory_order_release);
+}

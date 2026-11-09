@@ -123,7 +123,7 @@ struct uint_of_size<8> {
   using type = uint64_t;
 };
 template <size_t N>
-using uint_of_size_t = uint_of_size<N>::type;
+using uint_of_size_t = typename uint_of_size<N>::type;
 
 template <typename T>
   requires(std::is_floating_point_v<T> && requires { typename uint_of_size_t<sizeof(T)>; })
@@ -160,6 +160,9 @@ ALWAYS_INLINE constexpr auto underlying(T value) noexcept -> std::underlying_typ
 #define AURORA_ASSERT(cond, msg, ...)                                                                                  \
   if (!(cond))                                                                                                         \
   UNLIKELY FATAL(msg, ##__VA_ARGS__)
+#ifndef ASSERT
+#define ASSERT(cond, msg, ...) AURORA_ASSERT(cond, msg, ##__VA_ARGS__)
+#endif
 #ifdef NDEBUG
 #define CHECK(cond, msg, ...)
 #else
@@ -283,6 +286,7 @@ public:
   [[nodiscard]] uint8_t* data() noexcept { return m_data; }
   [[nodiscard]] const uint8_t* data() const noexcept { return m_data; }
   [[nodiscard]] size_t size() const noexcept { return m_length; }
+  [[nodiscard]] size_t capacity() const noexcept { return m_capacity; }
   [[nodiscard]] bool empty() const noexcept { return m_length == 0; }
 
   void append(const void* data, size_t size) {

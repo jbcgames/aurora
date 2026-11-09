@@ -1,6 +1,23 @@
 include_guard(GLOBAL)
 include("${CMAKE_CURRENT_LIST_DIR}/AuroraTargetPlatform.cmake")
 
+if (NOT WIN32 AND NOT ANDROID AND CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm" AND EXISTS "/home/jbc/sdl3-shim/libSDL3.so")
+  if (NOT TARGET SDL3::SDL3)
+    add_library(SDL3::SDL3 SHARED IMPORTED GLOBAL)
+    set(_sdl3_inc "/home/jbc/sdl3-shim/include")
+    if (NOT EXISTS "${_sdl3_inc}")
+      set(_sdl3_inc "${CMAKE_BINARY_DIR}/_deps/sdl-src/include")
+    endif ()
+    set_target_properties(SDL3::SDL3 PROPERTIES
+      IMPORTED_LOCATION "/home/jbc/sdl3-shim/libSDL3.so"
+      INTERFACE_INCLUDE_DIRECTORIES "${_sdl3_inc}"
+    )
+  endif ()
+  set(AURORA_SDL3_TARGET SDL3::SDL3 CACHE INTERNAL "" FORCE)
+  message(STATUS "aurora: Using bmdhacks SDL3-over-SDL2 shim from /home/jbc/sdl3-shim/libSDL3.so")
+  return()
+endif ()
+
 # Resolve SDL3 dependency based on AURORA_SDL3_PROVIDER and AURORA_SDL3_LINKAGE.
 #
 # After this module runs, the variable AURORA_SDL3_TARGET is set to the

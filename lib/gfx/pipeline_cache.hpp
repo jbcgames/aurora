@@ -1,6 +1,8 @@
 #pragma once
 
-#include "types.hpp"
+#include "common.hpp"
+
+#include <functional>
 
 namespace aurora::gfx::clear {
 struct PipelineConfig;
@@ -16,31 +18,16 @@ struct PipelineConfig;
 
 namespace aurora::gfx {
 
-enum class ShaderType : uint8_t {
-  Clear = 0,
-  GX = 1,
-  Rml = 2,
-};
-
-struct CompiledPipeline {
-  wgpu::RenderPipeline main;
-  wgpu::RenderPipeline prepass;
-
-  [[nodiscard]] uint32_t pipeline_count() const {
-    return static_cast<uint32_t>(static_cast<bool>(main)) + static_cast<uint32_t>(static_cast<bool>(prepass));
-  }
-};
+using NewPipelineCallback = std::function<gl::Pipeline()>;
 
 void initialize_pipeline_cache();
 void shutdown_pipeline_cache();
 void begin_pipeline_frame();
 void end_pipeline_frame();
-void rebuild_pipeline_cache();
 
-PipelineRef find_pipeline(const gx::PipelineConfig& config, const RenderTargetLayout& layout);
-PipelineRef find_pipeline(const clear::PipelineConfig& config, const RenderTargetLayout& layout);
-PipelineRef find_pipeline(const rmlui::PipelineConfig& config);
+template <typename Config>
+PipelineRef find_pipeline(ShaderType type, const Config& config, NewPipelineCallback&& cb);
 
-bool get_pipeline(PipelineRef ref, CompiledPipeline& pipeline);
+bool get_pipeline(PipelineRef ref, gl::Pipeline& pipeline);
 
 } // namespace aurora::gfx

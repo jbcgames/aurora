@@ -1,6 +1,9 @@
 #include "gpu.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <thread>
+#include <cstdlib>
 #include <atomic>
 #include <array>
 #include <cmath>
@@ -40,6 +43,24 @@ void clear_offscreen_cache();
 namespace aurora::webgpu {
 static Module Log("aurora::gpu");
 
+bool create_log_enabled() {
+  static const bool on = std::getenv("AURORA_CREATE_LOG") != nullptr;
+  return on;
+}
+static int64_t create_now_ns() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+CreateTimer::CreateTimer(const char* w) : what(w), t0(create_log_enabled() ? create_now_ns() : 0) {}
+CreateTimer::~CreateTimer() {
+  if (!create_log_enabled()) {
+    return;
+  }
+  const double ms = double(create_now_ns() - t0) / 1e6;
+  if (ms >= 0.5) {
+    Log.info("create: {} took {:.2f} ms (thread {:x})", what, ms, std::hash<std::thread::id>{}(std::this_thread::get_id()) & 0xFFFF);
+  }
+}
+
 wgpu::Device g_device;
 wgpu::Queue g_queue;
 wgpu::Surface g_surface;
@@ -67,9 +88,12 @@ wgpu::AdapterInfo g_adapterInfo;
 static wgpu::SurfaceCapabilities g_surfaceCapabilities;
 bool g_hasCoreFeatures = false;
 bool g_dualSourceBlendingSupported = false;
+bool g_clipDistancesSupported = false;
 bool g_bcTexturesSupported = false;
 bool g_astcTexturesSupported = false;
 bool g_textureComponentSwizzleSupported = false;
+uint32_t g_msaaSupportMask = 1;
+uint32_t g_msaaRequested = 1;
 static std::atomic_bool g_initialized = false;
 static std::atomic_bool g_vsyncEnabled = true;
 
@@ -545,6 +569,7 @@ fn fs_premultiplied_alpha(in: VertexOutput) -> @location(0) vec4<f32> {
             },
         .fragment = &fragmentState,
     };
+    const ::aurora::webgpu::CreateTimer createTimer_569{"pipeline gpu.cpp:569"}; // 0223 (AURORA_CREATE_LOG)
     return g_device.CreateRenderPipeline(&pipelineDescriptor);
   };
   g_CopyPipeline = make_copy_pipeline("XFB Copy Pipeline", "fs_opaque", nullptr);
@@ -641,6 +666,7 @@ void create_resample_pipeline() {
           },
       .fragment = &fragmentState,
   };
+  const ::aurora::webgpu::CreateTimer createTimer_665{"pipeline gpu.cpp:665"}; // 0223 (AURORA_CREATE_LOG)
   g_ResamplePipeline = g_device.CreateRenderPipeline(&pipelineDescriptor);
 
   const wgpu::BufferDescriptor uniformBufferDescriptor{
@@ -925,6 +951,7 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
     g_astcTexturesSupported = false;
     g_textureComponentSwizzleSupported = false;
     g_dualSourceBlendingSupported = false;
+    g_clipDistancesSupported = false;
     wgpu::SupportedFeatures supportedFeatures;
     g_adapter.GetFeatures(&supportedFeatures);
     for (size_t i = 0; i < supportedFeatures.featureCount; ++i) {
@@ -950,6 +977,32 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
         requiredFeatures.push_back(feature);
       }
 #endif
+      // 0028: shadow-map casters clip each instance to its cube face (enhanced lighting).
+      if (feature == wgpu::FeatureName::ClipDistances && std::getenv("AURORA_NO_CLIP_DISTANCES") == nullptr) {
+        g_clipDistancesSupported = true;
+        requiredFeatures.push_back(feature);
+      }
+#ifndef TRACY_ENABLE
+      // 0028: AURORA_ENH_GPU_TIMING=1 times the enhanced-lighting shadow passes on the GPU.
+      // 0176: AURORA_EFB_BLEND6_TIMING=1 times the RGBA6 blend resolves.
+      // 0210: AURORA_GPU_PROFILE=<s> logs every pass's GPU time (gpu_prof.cpp).
+      if (feature == wgpu::FeatureName::TimestampQuery && (std::getenv("AURORA_ENH_GPU_TIMING") != nullptr ||
+                                                           std::getenv("AURORA_EFB_BLEND6_TIMING") != nullptr ||
+                                                           std::getenv("AURORA_GPU_PROFILE") != nullptr)) {
+        requiredFeatures.push_back(feature);
+      }
+#endif
+    }
+    // Aurora calls the device from several threads at once (GX FIFO processor: bind groups, copy
+    // textures; render worker: encoding, copy conversions; pipeline compile threads). Dawn native
+    // only serializes device calls with this feature; without it, rare overlapping calls crashed
+    // inside Dawn (CreateBindGroup on the FIFO thread while the render worker ran a copy
+    // conversion: 3 of ~200 SMS test runs). The adapter list does not name it (magic_enum), so it
+    // is checked directly. AURORA_NO_DEVICE_SYNC=1 for A/B.
+    if (g_adapter.HasFeature(wgpu::FeatureName::ImplicitDeviceSynchronization) &&
+        std::getenv("AURORA_NO_DEVICE_SYNC") == nullptr) {
+      requiredFeatures.push_back(wgpu::FeatureName::ImplicitDeviceSynchronization);
+      Log.info("Implicit device synchronization on");
     }
     std::string featureList;
     for (auto featureName : requiredFeatures) {
@@ -968,7 +1021,8 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
           store_to_cache(key.data(), key.size(), value.data(), value.size(), nullptr);
         });
 
-    constexpr std::array enableToggles{
+    // 0210: the GPU profile's encoder-level timestamps (gpu_prof::Zone) are an unsafe API in Dawn.
+    std::vector<const char*> enableToggles{
 #if _WIN32
         "use_dxc",
 #ifndef NDEBUG
@@ -976,7 +1030,6 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
 #endif
 #endif
 #ifdef NDEBUG
-        "skip_validation",
         "disable_robustness",
 #endif
 #ifndef ANDROID
@@ -986,6 +1039,16 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
         "enable_immediate_error_handling",
         "gl_allow_context_on_multi_threads",
     };
+    if (std::getenv("AURORA_GPU_PROFILE") != nullptr) {
+      enableToggles.push_back("allow_unsafe_apis");
+    }
+#ifdef NDEBUG
+    // 0233: AURORA_DAWN_VALIDATION=1 (testing) keeps Dawn's validation on in release builds, to find
+    // API misuse that one driver tolerates and another does not (errors are then fatal, as usual).
+    if (const char* v = std::getenv("AURORA_DAWN_VALIDATION"); v == nullptr || std::atoi(v) == 0) {
+      enableToggles.push_back("skip_validation");
+    }
+#endif
     constexpr std::array disableToggles{
         "timestamp_quantization",
         // Adreno strikes again!
@@ -1065,6 +1128,37 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
   Log.info("Using surface format {}, present mode {}", magic_enum::enum_name(surfaceFormat),
            magic_enum::enum_name(presentMode));
   const auto size = window::get_window_size();
+  // 0233: MSAA only at sample counts the backend can create. WebGPU defines 1 and 4 (guaranteed for
+  // the scene's BGRA8/RGBA8 color and Depth32Float). Dawn's D3D12 backend passes any count to the
+  // driver (2x/8x work there; D3D feature level 11 requires them for these formats), but its Vulkan,
+  // Metal and GL backends only translate 1 and 4: 2x/8x reached an unreachable path when the scene
+  // targets were created (abort on Windows; Linux/RADV: the game stopped right after the cache opened,
+  // issue #14). Without core features (compatibility devices, e.g. OpenGL ES) the multisampled depth
+  // reads of the depth copies are not available, so no MSAA there.
+  g_msaaRequested = std::max(g_config.msaa, 1u);
+  g_msaaSupportMask = 1u;
+  if (g_hasCoreFeatures && g_backendType != wgpu::BackendType::Null) {
+    g_msaaSupportMask |= 1u << 2;
+    if (g_backendType == wgpu::BackendType::D3D12) {
+      g_msaaSupportMask |= (1u << 1) | (1u << 3);
+    }
+  }
+  {
+    uint32_t samples = 1;
+    for (uint32_t s = 8; s > 1; s >>= 1) {
+      if (s <= g_msaaRequested && (g_msaaSupportMask & s) != 0) {
+        samples = s;
+        break;
+      }
+    }
+    if (samples != g_msaaRequested) {
+      Log.warn("MSAA {}x is not supported on this device ({}{}); using {}", g_msaaRequested, backendName,
+               g_hasCoreFeatures ? "" : ", compatibility mode", samples > 1 ? fmt::format("{}x", samples) : "no MSAA");
+    } else if (samples > 1) {
+      Log.info("MSAA {}x", samples);
+    }
+    g_config.msaa = samples;
+  }
   g_graphicsConfig = GraphicsConfig{
       .surfaceConfiguration =
           wgpu::SurfaceConfiguration{
@@ -1081,7 +1175,47 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
   create_copy_pipeline();
   create_resample_pipeline();
   gpu_prof::initialize();
-  resize_swapchain(size.fb_width, size.fb_height, size.native_fb_width, size.native_fb_height, true);
+  // 0233: the scene targets are created inside error scopes; if the multisampled ones fail (out of
+  // memory at a large size, a driver refusing the count), say so and continue without MSAA instead
+  // of running on with invalid targets (the first frame would then be a fatal uncaptured error).
+  {
+    const auto popScope = [](std::string& message) {
+      wgpu::ErrorType result = wgpu::ErrorType::NoError;
+      const auto future = g_device.PopErrorScope(
+          wgpu::CallbackMode::WaitAnyOnly,
+          [&](wgpu::PopErrorScopeStatus status, wgpu::ErrorType type, wgpu::StringView msg) {
+            if (status == wgpu::PopErrorScopeStatus::Success && type != wgpu::ErrorType::NoError) {
+              result = type;
+              message.assign(msg.data, msg.length);
+            }
+          });
+      g_instance.WaitAny(future, UINT64_MAX);
+      return result;
+    };
+    for (;;) {
+      g_device.PushErrorScope(wgpu::ErrorFilter::OutOfMemory);
+      g_device.PushErrorScope(wgpu::ErrorFilter::Internal);
+      g_device.PushErrorScope(wgpu::ErrorFilter::Validation);
+      resize_swapchain(size.fb_width, size.fb_height, size.native_fb_width, size.native_fb_height, true);
+      std::string message;
+      std::string m;
+      if (popScope(m) != wgpu::ErrorType::NoError && message.empty()) message = m;
+      if (popScope(m) != wgpu::ErrorType::NoError && message.empty()) message = m;
+      if (popScope(m) != wgpu::ErrorType::NoError && message.empty()) message = m;
+      if (message.empty()) {
+        break;
+      }
+      if (g_graphicsConfig.msaaSamples <= 1) {
+        Log.error("Creating the render targets failed: {}", message);
+        break;
+      }
+      Log.error("Creating the {}x MSAA render targets failed ({}); continuing without MSAA",
+                g_graphicsConfig.msaaSamples, message);
+      g_msaaSupportMask &= (g_graphicsConfig.msaaSamples - 1u) | 1u;
+      g_graphicsConfig.msaaSamples = 1;
+      g_config.msaa = 1;
+    }
+  }
   g_initialized = true;
   return true;
 }

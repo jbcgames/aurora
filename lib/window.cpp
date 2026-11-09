@@ -337,13 +337,33 @@ const AuroraEvent* poll_events() {
 }
 
 bool create_window(AuroraBackend backend) {
-  SDL_WindowFlags flags = SDL_WINDOW_HIGH_PIXEL_DENSITY;
+  const char* videoDriver = SDL_GetCurrentVideoDriver();
+  const bool sdl2ShimDriver = videoDriver != nullptr && SDL_strcmp(videoDriver, "sdl2") == 0;
+
+  if (sdl2ShimDriver && backend != BACKEND_OPENGLES && backend != BACKEND_NULL) {
+    constexpr std::array kBackendNames{"Auto",     "D3D11",  "D3D12",  "Metal", "Vulkan",
+                                       "OpenGL", "OpenGLES", "WebGPU", "Null"};
+    const auto idx = static_cast<size_t>(backend);
+    Log.info("Skipping backend {} on the sdl2 shim driver (GLES-only display path)",
+             idx < kBackendNames.size() ? kBackendNames[idx] : "?");
+    return false;
+  }
+
+  SDL_WindowFlags flags = 0;
+  if (!sdl2ShimDriver) {
+    flags |= SDL_WINDOW_HIGH_PIXEL_DENSITY;
+  }
 #if TARGET_OS_IOS || TARGET_OS_TV
   flags |= SDL_WINDOW_FULLSCREEN;
 #else
   flags |= SDL_WINDOW_HIDDEN | SDL_WINDOW_RESIZABLE;
   if (g_config.startFullscreen) {
     flags |= SDL_WINDOW_FULLSCREEN;
+  }
+#endif
+#ifdef AURORA_ENABLE_GX
+  if (backend == BACKEND_OPENGL || backend == BACKEND_OPENGLES) {
+    flags |= SDL_WINDOW_OPENGL;
   }
 #endif
   auto width = static_cast<Sint32>(g_config.windowWidth);
@@ -357,6 +377,19 @@ bool create_window(AuroraBackend backend) {
   }
   if (height < 480) {
     height = 480;
+  }
+
+  if (sdl2ShimDriver) {
+    const SDL_DisplayID display = SDL_GetPrimaryDisplay();
+    const SDL_DisplayMode* mode = display != 0 ? SDL_GetDesktopDisplayMode(display) : nullptr;
+    if (mode != nullptr && mode->w > 0 && mode->h > 0) {
+      width = mode->w;
+      height = mode->h;
+      Log.info("Device panel mode is {}x{}; sizing the window to fill it", width, height);
+    } else {
+      Log.warn("Could not query the device panel mode ({}); leaving window at {}x{}",
+               SDL_GetError(), width, height);
+    }
   }
 
   Sint32 posX = g_config.windowPosX;
@@ -379,7 +412,12 @@ bool create_window(AuroraBackend backend) {
       SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, SDL_GetError());
   TRY(SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_FLAGS_NUMBER, flags), "Failed to set {}: {}",
       SDL_PROP_WINDOW_CREATE_FLAGS_NUMBER, SDL_GetError());
-  TRY(SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_EXTERNAL_GRAPHICS_CONTEXT_BOOLEAN, backend != BACKEND_NULL),
+  if (flags & SDL_WINDOW_OPENGL) {
+    TRY(SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_OPENGL_BOOLEAN, true),
+        "Failed to set {}: {}", SDL_PROP_WINDOW_CREATE_OPENGL_BOOLEAN, SDL_GetError());
+  }
+  const bool externalGraphicsContext = sdl2ShimDriver && backend != BACKEND_NULL;
+  TRY(SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_EXTERNAL_GRAPHICS_CONTEXT_BOOLEAN, externalGraphicsContext),
       "Failed to set {}: {}", SDL_PROP_WINDOW_CREATE_EXTERNAL_GRAPHICS_CONTEXT_BOOLEAN, SDL_GetError());
   g_window = SDL_CreateWindowWithProperties(props);
   if (g_window == nullptr) {
@@ -602,6 +640,8 @@ void set_frame_buffer_scale(float scale) {
   g_frameBufferScale = scale;
   request_frame_buffer_resize();
 }
+
+float get_frame_buffer_scale() { return g_frameBufferScale; }
 
 void set_frame_buffer_aspect_fit(bool fit) {
   if (g_frameBufferAspectFit == fit) {

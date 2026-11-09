@@ -1,6 +1,8 @@
+#include "../gx/command_processor.hpp"
 #include "recording.hpp"
 
 #include "encoding.hpp"
+#include "enhanced.hpp"
 #include "frame.hpp"
 #include "resource_cache.hpp"
 
@@ -69,6 +71,7 @@ struct FrameRecorder {
 };
 
 FrameRecorder g_recorder;
+efb_ram::PassOp g_nextResolveOp; // consumed by the next resolve_pass_into
 
 std::string pass_label(std::string_view kind) {
 #ifdef AURORA_GFX_DEBUG_GROUPS
@@ -177,6 +180,9 @@ PassSnapshotEntry& acquire_pass_snapshot(uint32_t width, uint32_t height, bool w
         .sampleCount = 1,
     };
     auto texture = webgpu::g_device.CreateTexture(&desc);
+    if (std::getenv("AURORA_TEX_LOG") != nullptr) {
+      Log.info("texture '{}' {}x{} created", desc.label.data ? std::string_view(desc.label.data, desc.label.length == SIZE_MAX ? std::strlen(desc.label.data) : desc.label.length) : std::string_view(), desc.size.width, desc.size.height);
+    }
     auto view = texture.CreateView();
     entry.color = webgpu::TextureWithSampler{
         .texture = std::move(texture),
@@ -196,6 +202,9 @@ PassSnapshotEntry& acquire_pass_snapshot(uint32_t width, uint32_t height, bool w
         .sampleCount = 1,
     };
     auto texture = webgpu::g_device.CreateTexture(&desc);
+    if (std::getenv("AURORA_TEX_LOG") != nullptr) {
+      Log.info("texture '{}' {}x{} created", desc.label.data ? std::string_view(desc.label.data, desc.label.length == SIZE_MAX ? std::strlen(desc.label.data) : desc.label.length) : std::string_view(), desc.size.width, desc.size.height);
+    }
     auto view = texture.CreateView();
     entry.depth = webgpu::TextureWithSampler{
         .texture = std::move(texture),
@@ -215,6 +224,9 @@ PassSnapshotEntry& acquire_pass_snapshot(uint32_t width, uint32_t height, bool w
         .sampleCount = 1,
     };
     auto texture = webgpu::g_device.CreateTexture(&desc);
+    if (std::getenv("AURORA_TEX_LOG") != nullptr) {
+      Log.info("texture '{}' {}x{} created", desc.label.data ? std::string_view(desc.label.data, desc.label.length == SIZE_MAX ? std::strlen(desc.label.data) : desc.label.length) : std::string_view(), desc.size.width, desc.size.height);
+    }
     auto view = texture.CreateView();
     entry.normal = webgpu::TextureWithSampler{
         .texture = std::move(texture),
@@ -387,6 +399,9 @@ OffscreenCacheEntry get_offscreen_textures(uint32_t width, uint32_t height) {
       .sampleCount = 1,
   };
   auto colorTexture = webgpu::g_device.CreateTexture(&colorDesc);
+  if (std::getenv("AURORA_TEX_LOG") != nullptr) {
+    Log.info("texture '{}' {}x{} created", colorDesc.label.data ? std::string_view(colorDesc.label.data, colorDesc.label.length == SIZE_MAX ? std::strlen(colorDesc.label.data) : colorDesc.label.length) : std::string_view(), colorDesc.size.width, colorDesc.size.height);
+  }
   auto colorView = colorTexture.CreateView();
   webgpu::TextureWithSampler color{
       .texture = std::move(colorTexture),
@@ -405,6 +420,9 @@ OffscreenCacheEntry get_offscreen_textures(uint32_t width, uint32_t height) {
       .sampleCount = 1,
   };
   auto depthTexture = webgpu::g_device.CreateTexture(&depthDesc);
+  if (std::getenv("AURORA_TEX_LOG") != nullptr) {
+    Log.info("texture '{}' {}x{} created", depthDesc.label.data ? std::string_view(depthDesc.label.data, depthDesc.label.length == SIZE_MAX ? std::strlen(depthDesc.label.data) : depthDesc.label.length) : std::string_view(), depthDesc.size.width, depthDesc.size.height);
+  }
   auto depthView = depthTexture.CreateView();
   webgpu::TextureWithSampler depth{
       .texture = std::move(depthTexture),
@@ -569,6 +587,7 @@ void begin_recording(FramePacket& packet, size_t frameSlot) {
   g_recorder.packet = &packet;
   g_recorder.frameSlot = frameSlot;
   g_passSnapshotPools[frameSlot].used = 0;
+  enhanced::begin_frame();
   g_recorder.drawCallCount = 0;
   g_recorder.mergedDrawCallCount = 0;
   g_recorder.suspendedEfbPass.reset();
@@ -603,6 +622,7 @@ RecordedFrame end_recording() {
   for (auto& array : gx::g_gxState.arrays) {
     array.cachedRange = {};
   }
+  gx::fifo::reset_dynamic_arrays();
 #if defined(AURORA_GFX_DEBUG_GROUPS)
   if (!g_recorder.debugGroupStack.empty()) {
     for (auto& item : std::ranges::reverse_view(g_recorder.debugGroupStack)) {
@@ -789,6 +809,47 @@ gx::DrawData* get_last_draw_command() {
   return &inline_payload<gx::DrawData>(last.data.draw.payload.data());
 }
 
+gx::DrawData* get_draw_command_before_last() {
+  if (g_recorder.currentRenderPass >= current_render_passes().size()) {
+    return nullptr;
+  }
+  auto& commands = current_render_passes()[g_recorder.currentRenderPass].commands;
+  if (commands.size() < 2) {
+    return nullptr;
+  }
+  auto& cmd = commands[commands.size() - 2];
+  if (cmd.type != CommandType::Draw || cmd.data.draw.encoder != encode_draw<gx::render, gx::DrawData>) {
+    return nullptr;
+  }
+  return &inline_payload<gx::DrawData>(cmd.data.draw.payload.data());
+}
+
+std::pair<uint32_t, uint32_t> next_command_position() noexcept {
+  if (g_recorder.currentRenderPass >= current_render_passes().size()) {
+    return {UINT32_MAX, 0};
+  }
+  return {g_recorder.currentRenderPass,
+          static_cast<uint32_t>(current_render_passes()[g_recorder.currentRenderPass].commands.size())};
+}
+
+const gx::DrawData* gx_draw_at(uint32_t pass, uint32_t index) noexcept {
+  if (pass >= current_render_passes().size() || index >= current_render_passes()[pass].commands.size()) {
+    return nullptr;
+  }
+  const auto& cmd = current_render_passes()[pass].commands[index];
+  if (cmd.type != CommandType::Draw || cmd.data.draw.encoder != encode_draw<gx::render, gx::DrawData>) {
+    return nullptr;
+  }
+  return &inline_payload<gx::DrawData>(const_cast<std::byte*>(cmd.data.draw.payload.data()));
+}
+
+const gx::DrawData* gx_draw_payload(const detail::DrawCommand& cmd) noexcept {
+  if (cmd.encoder != encode_draw<gx::render, gx::DrawData>) {
+    return nullptr;
+  }
+  return &inline_payload<gx::DrawData>(const_cast<std::byte*>(cmd.payload.data()));
+}
+
 Vec2<uint32_t> get_render_target_size() noexcept {
   if (g_recorder.currentRenderPass < current_render_passes().size()) {
     const auto& size =
@@ -823,9 +884,29 @@ PipelineRef pipeline_ref(const clear::PipelineConfig& config) {
   return find_pipeline(config, get_render_target_layout());
 }
 
+// Copy filter weights for tex_copy_conv::Uniforms::filterTaps: line above (taps 0+1), this line
+// (2+3+4), line below (5+6), one byte each; 0 when the filter is off (accuracy option) or the
+// taps are the pass-through ones (0, 64, 0).
+static uint32_t copy_filter_taps() {
+  if ((gx::g_accuracyFlags.load(std::memory_order_relaxed) & GX_AURORA_ACCURACY_COPY_FILTER) == 0) {
+    return 0;
+  }
+  const auto& t = gx::g_gxState.copyVFilter;
+  const uint32_t above = t[0] + t[1];
+  const uint32_t center = t[2] + t[3] + t[4];
+  const uint32_t below = t[5] + t[6];
+  if (above == 0 && below == 0 && center == 64) {
+    return 0;
+  }
+  return above | (center << 8) | (below << 16);
+}
+
 void resolve_pass_into(TextureHandle texture, ClipRect rect, bool clearColor, bool clearAlpha, bool clearDepth,
                        Vec4<float> clearColorValue, float clearDepthValue, GXTexFmt resolveFormat,
                        GXPixelFmt sourceFormat) {
+  if (!g_recorder.inOffscreen) {
+    enhanced::before_efb_copy();
+  }
   // Resolve current render pass
   auto& prevPass = current_render_passes()[g_recorder.currentRenderPass];
   prevPass.resolveTarget = std::move(texture);
@@ -834,12 +915,28 @@ void resolve_pass_into(TextureHandle texture, ClipRect rect, bool clearColor, bo
   prevPass.resolveSourceFormat = sourceFormat;
   const auto srcW = static_cast<float>(prevPass.colorAttachments[SceneColorAttachmentIndex].size.width);
   const auto srcH = static_cast<float>(prevPass.colorAttachments[SceneColorAttachmentIndex].size.height);
+  // One row of the copy source (the filter's neighbour spacing) and the copy clamp bits.
+  const float rowStep = 1.f / std::max(srcH, 1.f);
+  const u32 clamp = gx::g_gxState.copyClamp;
   const tex_copy_conv::Uniforms uniforms{
       .offset = {static_cast<float>(rect.x) / srcW, static_cast<float>(rect.y) / srcH},
       .scale = {static_cast<float>(rect.width) / srcW, static_cast<float>(rect.height) / srcH},
       .opaqueAlpha = !gx::efb_has_alpha(sourceFormat),
+      // 1 = the format's precision, 2 = its smoothed average (0190, GX_AURORA_ACCURACY_EFB_SMOOTH)
+      .quantize = (gx::g_accuracyFlags.load(std::memory_order_relaxed) & GX_AURORA_ACCURACY_EFB_DEPTH) == 0 ? 0u
+                  : (gx::g_accuracyFlags.load(std::memory_order_relaxed) & GX_AURORA_ACCURACY_EFB_SMOOTH) != 0 ? 2u
+                                                                                                             : 1u,
+      .lineStep = rowStep,
+      .filterTaps = gx::is_depth_format(resolveFormat) ? 0u : copy_filter_taps(),
+      .clampTop = (clamp & 1) != 0 ? static_cast<float>(rect.y) / srcH + 0.5f * rowStep : -1.f,
+      .clampBottom = (clamp & 2) != 0 ? static_cast<float>(rect.y + rect.height) / srcH - 0.5f * rowStep : 2.f,
   };
+  prevPass.resolveFiltered = uniforms.filterTaps != 0;
   prevPass.resolveUniformRange = push_uniform(uniforms);
+  if (g_nextResolveOp) {
+    prevPass.ramPostOps.push_back(std::move(g_nextResolveOp));
+    g_nextResolveOp = {};
+  }
   enqueue_pass(current_frame_packet(), g_recorder.currentRenderPass);
 
   // Populate new render pass from previous
@@ -851,6 +948,11 @@ void resolve_pass_into(TextureHandle texture, ClipRect rect, bool clearColor, bo
   const auto bottom = std::clamp<int32_t>(rect.y + rect.height, top, static_cast<int32_t>(targetSize.height));
   const ClipRect clearRect{.x = left, .y = top, .width = right - left, .height = bottom - top};
   const bool fullTarget = left == 0 && top == 0 && right == targetSize.width && bottom == targetSize.height;
+  if ((clearColor || clearDepth) && !g_recorder.inOffscreen) {
+    enhanced::efb_cleared(float(clearRect.width) * float(clearRect.height) /
+                              std::max(float(targetSize.width) * float(targetSize.height), 1.f),
+                          clearColor, clearDepth);
+  }
   RenderPass newPass{
       .label = pass_label(g_recorder.inOffscreen ? "Offscreen" : "EFB"),
       .colorAttachments = prevPass.colorAttachments,
@@ -910,6 +1012,56 @@ void resolve_pass_into(TextureHandle texture, ClipRect rect, bool clearColor, bo
   }
   push_command(CommandType::SetViewport, Command::Data{.setViewport = g_recorder.cachedViewport});
   push_command(CommandType::SetScissor, Command::Data{.setScissor = g_recorder.cachedScissor});
+}
+
+bool queue_pre_pass_ops(std::vector<efb_ram::PassOp> ops) {
+  if (!g_recorder.active() || g_recorder.currentRenderPass == UINT32_MAX) {
+    return false;
+  }
+  auto& renderPass = current_render_passes()[g_recorder.currentRenderPass];
+  if (renderPass.sealed) {
+    return false;
+  }
+  for (auto& op : ops) {
+    renderPass.ramPreOps.push_back(std::move(op));
+  }
+  return true;
+}
+
+void set_next_resolve_op(efb_ram::PassOp op) { g_nextResolveOp = std::move(op); }
+
+Viewport current_viewport() noexcept { return g_recorder.cachedViewport; }
+ClipRect current_scissor() noexcept { return g_recorder.cachedScissor; }
+
+bool push_scene_op(SceneOp op) {
+  if (!g_recorder.active() || g_recorder.currentRenderPass == UINT32_MAX || g_recorder.inOffscreen) {
+    return false;
+  }
+  auto& prevPass = current_render_passes()[g_recorder.currentRenderPass];
+  const auto& color = prevPass.colorAttachments[SceneColorAttachmentIndex];
+  if (color.semantic != ColorAttachmentSemantic::SceneColor || !prevPass.copySourceTexture ||
+      !prevPass.copySourceDepthView) {
+    return false;
+  }
+  ScenePassTargets targets{
+      .colorView = color.view,
+      .resolveView = color.resolveView,
+      .colorFormat = color.format,
+      .colorSource = prevPass.copySourceTexture,
+      .depthSource = prevPass.copySourceDepthView,
+      .msaa = prevPass.msaaSamples,
+      .width = color.size.width,
+      .height = color.size.height,
+  };
+  prevPass.ramPostOps.push_back([op = std::move(op), targets](const wgpu::CommandEncoder& cmd, detail::FramePacket&) {
+    op(cmd, targets);
+  });
+  prevPass.colorPostOps = true; // 0212
+  // The op must run even when the pass itself drew nothing.
+  prevPass.discardable = false;
+  enqueue_pass(current_frame_packet(), g_recorder.currentRenderPass);
+  resume_efb_pass_loading(prevPass);
+  return true;
 }
 
 void queue_palette_conv(tex_palette_conv::ConvRequest req) {
@@ -1129,6 +1281,22 @@ bool push_encoder_task(EncoderTaskId type, const void* payload, size_t payloadSi
 
   resume_efb_pass_loading(prevPass);
   return true;
+}
+
+void note_efb_blend6(bool dither) noexcept {
+  if (!g_recorder.active() || g_recorder.currentRenderPass >= g_recorder.passes().size()) {
+    return;
+  }
+  const uint8_t bit = dither ? 2 : 1;
+  auto* pass = &g_recorder.passes()[g_recorder.currentRenderPass];
+  // The quantization after the pass dithers or not as a whole: when the dither state of the blended
+  // draws changes, the EFB pass is split so each part is quantized with its own.
+  if (pass->efbBlend6 != 0 && (pass->efbBlend6 & bit) == 0 && !g_recorder.inOffscreen && !pass->sealed) {
+    enqueue_pass(current_frame_packet(), g_recorder.currentRenderPass);
+    resume_efb_pass_loading(current_render_passes()[g_recorder.currentRenderPass]);
+    pass = &g_recorder.passes()[g_recorder.currentRenderPass];
+  }
+  pass->efbBlend6 |= bit;
 }
 
 template <>

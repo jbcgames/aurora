@@ -1,24 +1,18 @@
 #pragma once
 
-#include <aurora/gfx.hpp>
-
-#include "types.hpp"
-
-#include <array>
-
-#include <webgpu/webgpu_cpp.h>
+#include "common.hpp"
 
 namespace aurora::gfx::clear {
 struct DrawData {
   PipelineRef pipeline;
-  wgpu::Color color;
+  gl::Color color;
   float depth = 0.f;
-  ClipRect rect{};
 };
 
-constexpr uint32_t ClearPipelineConfigVersion = 5;
+constexpr uint32_t ClearPipelineConfigVersion = 2;
 struct PipelineConfig {
   uint32_t version = ClearPipelineConfigVersion;
+  uint32_t msaaSamples = 1;
   bool clearColor = true;
   bool clearAlpha = true;
   bool clearDepth = true;
@@ -26,6 +20,9 @@ struct PipelineConfig {
 };
 static_assert(std::has_unique_object_representations_v<PipelineConfig>);
 
-wgpu::RenderPipeline create_pipeline(const PipelineConfig& config, const RenderTargetLayout& layout);
-void render(const DrawData& data, const wgpu::RenderPassEncoder& pass, const wgpu::Extent3D& targetSize);
+// Compile the shared clear program. Must run on the render worker (context current);
+// gfx::initialize calls it before any pipeline is built. Idempotent.
+void init_program();
+gl::Pipeline create_pipeline(const PipelineConfig& config);
+void render(const DrawData& data, gl::PassEncoder& pass, const gl::Extent3D& targetSize);
 } // namespace aurora::gfx::clear

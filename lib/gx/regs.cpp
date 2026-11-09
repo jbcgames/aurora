@@ -477,6 +477,7 @@ void bp_tex(u8 reg, u32 value) noexcept {
   const u32 idx = reg - 0x80;
   const u32 kind = (idx & 0x1F) / 4;
   const u32 texMapId = (idx & 3) + (idx >= 0x20 ? 4 : 0);
+  g_gxState.textureDirty++;
   auto& slot = g_gxState.loadedTextures[texMapId];
   switch (kind) {
   case 0: // Mode0
@@ -536,7 +537,7 @@ constexpr auto kBpRegs = [] {
   regs[0x40] = {bp_z_mode, DirtyPipeline};
   regs[0x41] = {bp_cmode0, DirtyPipeline};
   regs[0x42] = {bp_cmode1, DirtyPipeline};
-  regs[0x43] = {bp_pe_ctrl, DirtyPipeline};
+  regs[0x43] = {bp_pe_ctrl};
   regs[0x4F] = {bp_clear_ra};
   regs[0x50] = {bp_clear_bg};
   regs[0x51] = {bp_clear_depth};
@@ -1010,6 +1011,15 @@ bool copy_xf_data(u32 addr, const u8* data, u32 len, std::endian e) noexcept {
     bool changed = false;
     for (u32 i = 0; i < len; i++) {
       changed |= store_xf_f32(flat[i], read_bits<u32>(data + i * 4, e));
+    }
+    // smstrikers-port: rows 30+ are texture matrix memory and addressable as
+    // position matrices, so mirror the write. See MaxPnMtx.
+    const u32 pnIdx = addr / 12;
+    if (len == 12 && pnIdx < MaxPnMtx) {
+      f32* pnFlat = reinterpret_cast<f32*>(&g_gxState.pnMtx[pnIdx].pos);
+      for (u32 i = 0; i < len; i++) {
+        changed |= store_xf_f32(pnFlat[i], read_bits<u32>(data + i * 4, e));
+      }
     }
     if (changed) {
       g_gxState.dirty |= DirtyUniform;

@@ -46,6 +46,7 @@ public:
   std::optional<QueueItem> pop_for(std::chrono::milliseconds timeout, bool& closed);
   void close();
   void reset();
+  void wake_worker();
   [[nodiscard]] size_t size() const;
 
 private:
@@ -83,6 +84,9 @@ void enqueue_work(WorkCallback work);
 void synchronize();
 
 bool is_worker_thread() noexcept;
+// False when the worker was never started (single-threaded mode): enqueue() then executes
+// work inline on the calling thread.
+bool is_running() noexcept;
 bool is_idle() noexcept;
 
 } // namespace aurora::gfx::render_worker

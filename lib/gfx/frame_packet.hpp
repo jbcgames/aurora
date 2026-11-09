@@ -2,6 +2,7 @@
 
 #include "pipeline_cache.hpp"
 #include "types.hpp"
+#include "efb_ram.hpp"
 #include "tex_palette_conv.hpp"
 #include "texture.hpp"
 
@@ -90,6 +91,7 @@ struct RenderPass {
   GXPixelFmt resolveSourceFormat = GX_PF_RGBA6_Z24;
   ClipRect resolveRect;
   Range resolveUniformRange;
+  bool resolveFiltered = false; // the copy applies the vertical copy filter (needs the shader path)
   wgpu::Texture snapshotColorDst;
   wgpu::TextureView snapshotDepthDst;
   wgpu::Texture snapshotNormalDst;
@@ -107,7 +109,15 @@ struct RenderPass {
   bool discardable = false;
   bool captureDepthSnapshot = false;
   bool sealed = false;
+  // 0176: blended RGBA6 draws in this pass (bit 0 without dither, bit 1 with): the color target is
+  // quantized after the pass (efb_blend6::resolve)
+  uint8_t efbBlend6 = 0;
+  // 0212: a post-op reads this pass's color target (push_scene_op); EFB-copy RAM ops only read
+  // their copy textures.
+  bool colorPostOps = false;
   std::vector<tex_palette_conv::ConvRequest> paletteConvs;
+  std::vector<efb_ram::PassOp> ramPreOps;  // before the pass (EFB copy RAM decodes)
+  std::vector<efb_ram::PassOp> ramPostOps; // after the resolve (EFB copy RAM encode/readback)
 
   RenderTargetLayout target_layout() const noexcept;
   bool has_consumer() const { return resolveTarget || snapshotColorDst || snapshotDepthDst || snapshotNormalDst; }

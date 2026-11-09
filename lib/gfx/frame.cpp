@@ -1,6 +1,8 @@
 #include "frame.hpp"
 
 #include "depth_peek.hpp"
+#include "efb_blend6.hpp"
+#include "enhanced.hpp"
 #include "pipeline_cache.hpp"
 #include "recording.hpp"
 #include "render_worker.hpp"
@@ -9,6 +11,7 @@
 #include "tex_palette_conv.hpp"
 #include "texture_replacement.hpp"
 #include "../gx/gx.hpp"
+#include "../activity.hpp"
 #ifdef AURORA_ENABLE_RMLUI
 #include "../rmlui/pipeline.hpp"
 #endif
@@ -402,6 +405,8 @@ void initialize() {
   depth_peek::initialize();
   tex_copy_conv::initialize();
   tex_palette_conv::initialize();
+  efb_ram::initialize();
+  efb_blend6::initialize();
 
   // For uniform & storage buffer offset alignments
   g_device.GetLimits(&g_resources.limits);
@@ -426,6 +431,8 @@ void initialize() {
                "Shared Index Buffer");
   createBuffer(g_resources.storageBuffer, wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst, StorageBufferSize,
                "Shared Storage Buffer");
+  createBuffer(g_resources.maskBuffer, wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst, MaskBufferSize,
+               "Enhanced Shadow Mask Buffer");
   for (size_t i = 0; i < g_stagingBuffers.size(); ++i) {
     const auto label = fmt::format("Staging Buffer {}", i);
     createBuffer(g_stagingBuffers[i], wgpu::BufferUsage::MapWrite | wgpu::BufferUsage::CopySrc, StagingBufferSize,
@@ -458,6 +465,15 @@ void initialize() {
                     .type = wgpu::BufferBindingType::ReadOnlyStorage,
                 },
         },
+        // 0028: enhanced-lighting shadow masks
+        wgpu::BindGroupLayoutEntry{
+            .binding = 2,
+            .visibility = wgpu::ShaderStage::Fragment,
+            .buffer =
+                wgpu::BufferBindingLayout{
+                    .type = wgpu::BufferBindingType::ReadOnlyStorage,
+                },
+        },
     };
     const wgpu::BindGroupLayoutDescriptor layoutDesc{
         .label = "Static bind group layout",
@@ -473,6 +489,10 @@ void initialize() {
         wgpu::BindGroupEntry{
             .binding = 1,
             .buffer = g_resources.storageBuffer,
+        },
+        wgpu::BindGroupEntry{
+            .binding = 2,
+            .buffer = g_resources.maskBuffer,
         },
     };
     const wgpu::BindGroupDescriptor bindGroupDescriptor{
@@ -542,6 +562,8 @@ void shutdown() {
   depth_peek::shutdown();
   tex_copy_conv::shutdown();
   tex_palette_conv::shutdown();
+  efb_ram::shutdown();
+  efb_blend6::shutdown();
   texture_replacement::shutdown();
   gx::shutdown();
 #ifdef AURORA_ENABLE_RMLUI
@@ -560,6 +582,7 @@ void shutdown() {
   g_resources.uniformBuffer = {};
   g_resources.indexBuffer = {};
   g_resources.storageBuffer = {};
+  g_resources.maskBuffer = {};
   g_stagingBuffers.fill({});
   for (auto& packet : g_framePackets) {
     packet = {};
@@ -594,6 +617,7 @@ bool wait_for_staging_buffer(size_t slot) {
 
 size_t acquire_frame_slot() {
   ZoneScopedN("Acquire frame slot");
+  const activity::Scope busy{activity::Thread::Host, "waiting for a frame slot (the render worker still has two frames)"};
   const auto waitStart = PresentClock::now();
   while (true) {
     if (const auto slot = g_frameSlots.try_acquire()) {
@@ -608,6 +632,7 @@ size_t acquire_frame_slot() {
 
 std::optional<size_t> acquire_mapped_staging_buffer() {
   ZoneScopedN("Acquire mapped staging buffer");
+  const activity::Scope busy{activity::Thread::Host, "waiting for a staging buffer (its GPU frame to finish and map)"};
   while (true) {
     if (auto slot = g_stagingSlots.try_acquire()) {
       if (wait_for_staging_buffer(*slot)) {
@@ -681,6 +706,7 @@ void end_frame(EndFrameCallback callback) {
   const size_t stagingSlot = frame.stagingBuffer;
   render_worker::enqueue_end_frame(frameId, [frameSlot, stagingSlot, callback = std::move(callback)]() mutable {
     auto& packet = g_framePackets[frameSlot];
+    efb_blend6::flush(packet.encoder, packet); // 0212: a resolve still deferred at the frame's end
     g_stagingBuffers[stagingSlot].Unmap();
     g_mappingStates[stagingSlot].store(BufferMapState::Unmapped, std::memory_order_release);
     auto encoder = std::move(packet.encoder);
@@ -700,13 +726,18 @@ void end_frame(EndFrameCallback callback) {
     g_frameSlots.release(frameSlot);
     expire_cached_bind_groups();
     map_staging_buffer(stagingSlot, true);
+    const activity::Scope events{activity::Thread::RenderWorker, "processing Dawn events (Instance::ProcessEvents)"};
     process_events();
   });
 }
 
 uint32_t current_frame() noexcept { return g_frameIndex; }
 
-void after_submit() noexcept { depth_peek::after_submit(); }
+void after_submit() noexcept {
+  efb_ram::finish_maps();
+  depth_peek::after_submit();
+  enhanced::after_submit();
+}
 
 void gpu_synchronize() { render_worker::synchronize(); }
 

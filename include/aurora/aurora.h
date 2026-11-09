@@ -131,6 +131,7 @@ void aurora_shutdown();
 const AuroraEvent* aurora_update();
 bool aurora_begin_frame();
 void aurora_end_frame();
+void aurora_flush_present();
 
 void aurora_set_log_level(AuroraLogLevel level);
 void aurora_set_pause_on_focus_lost(bool value);
@@ -138,11 +139,23 @@ void aurora_set_background_input(bool value);
 void aurora_set_resampler(AuroraSampler sampler);
 /** Sets the clock timescale. Default 1.0f. 0.0f is paused. Range 0.0f-16.0f. */
 void aurora_set_timescale(float scale);
+/** Test aid (0224): saves the next frame's game image (render resolution, before post-processing
+ * and UI) as a binary PPM at `path`. */
+void aurora_request_screenshot(const char* path);
+
+void aurora_set_double_buffering(bool enable);
+bool aurora_get_double_buffering();
+void aurora_fifo_finish_frame_producer();
 
 SDL_Window* aurora_get_window();
 AuroraWindowSize aurora_get_window_size();
 
 AuroraBackend aurora_get_backend();
+/** 0233: MSAA sample counts the graphics device supports, as a bit mask (bit n set: 2^n samples;
+ * bit 0, no MSAA, is always set). Valid after aurora_initialize. */
+uint32_t aurora_get_msaa_support();
+/** 0233: the sample count in use (AuroraConfig::msaa, or the highest supported count below it). */
+uint32_t aurora_get_msaa();
 const AuroraBackend* aurora_get_available_backends(size_t* count);
 float aurora_get_timescale();
 

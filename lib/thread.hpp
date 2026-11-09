@@ -22,6 +22,9 @@ struct Options {
 // Applies thread options to the current thread
 void set_current(const Options& options) noexcept;
 
+// The host's tick hook (aurora/thread_hooks.h), if any: call from a long-lived thread's loop.
+void tick() noexcept;
+
 class Thread {
 public:
   Thread() noexcept = default;
