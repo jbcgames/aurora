@@ -19,7 +19,10 @@ void GXSetScissor(u32 left, u32 top, u32 width, u32 height) {
   __gx->bpSent = 1;
 }
 
-// TODO GXSetScissorBoxOffset
+void GXSetScissorBoxOffset(s32 x_off, s32 y_off) {
+  (void)x_off;
+  (void)y_off;
+}
 
 void GXSetCullMode(GXCullMode mode) {
   // Swap front/back to match hardware convention

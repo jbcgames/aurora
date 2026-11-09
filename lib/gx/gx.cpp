@@ -23,6 +23,7 @@
 #include <mutex>
 #include <optional>
 #include <utility>
+#include <vector>
 
 static aurora::Module Log("aurora::gx");
 
@@ -553,8 +554,12 @@ void evict_tlut_object(u32 tlutObjId) noexcept {
   }
 }
 
+// GXAliasCopyTex destinations whose source was not copied yet (dest -> src)
+static absl::flat_hash_map<const void*, const void*> s_copyAliases;
+
 void clear_copy_texture_cache() noexcept {
   g_gxState.copyTextures.clear();
+  s_copyAliases.clear();
   g_gxState.copyTextureCache.clear();
   for (auto& [_, cache] : s_tlutObjectCaches) {
     cache.dynamicPaletteTextures.clear();
@@ -562,6 +567,78 @@ void clear_copy_texture_cache() noexcept {
 }
 
 void clear_static_texture_cache() noexcept { s_staticTextureCacheClearPending.store(true, std::memory_order_release); }
+
+void alias_copy_texture(const void* src, const void* dest) noexcept {
+  const auto it = g_gxState.copyTextures.find(src);
+  if (it == g_gxState.copyTextures.end() || !it->second.handle) {
+    s_copyAliases[dest] = src;
+    return;
+  }
+  g_gxState.copyTextures[dest] = it->second;
+  s_copyAliases.erase(dest);
+}
+
+void forget_memory(const void* lo_, const void* hi_) noexcept {
+  const auto lo = reinterpret_cast<uintptr_t>(lo_);
+  const auto hi = reinterpret_cast<uintptr_t>(hi_);
+  if (hi <= lo) {
+    return;
+  }
+  const auto in = [lo, hi](const void* p) {
+    return reinterpret_cast<uintptr_t>(p) >= lo && reinterpret_cast<uintptr_t>(p) < hi;
+  };
+  absl::erase_if(g_gxState.copyTextures, [&](const auto& kv) { return in(kv.first); });
+  absl::erase_if(s_copyAliases, [&](const auto& kv) { return in(kv.first) || in(kv.second); });
+  for (auto it = g_gxState.copyTextureCache.begin(); it != g_gxState.copyTextureCache.end();) {
+    if (in(it->first.dest)) {
+      g_gxState.copyTextureCache.erase(it++);
+    } else {
+      ++it;
+    }
+  }
+}
+
+void move_memory(const void* from_, const void* to_, u32 size) noexcept {
+  const auto from = reinterpret_cast<uintptr_t>(from_);
+  const auto to = reinterpret_cast<uintptr_t>(to_);
+  if (from == to || size == 0) {
+    return;
+  }
+  const auto delta = static_cast<intptr_t>(to - from);
+  const auto in = [from, size](const void* p) {
+    const auto u = reinterpret_cast<uintptr_t>(p);
+    return u >= from && u < from + size;
+  };
+  const auto shift = [delta](const void* p) {
+    return reinterpret_cast<const void*>(reinterpret_cast<uintptr_t>(p) + delta);
+  };
+  std::vector<std::pair<const void*, GXState::CopyTextureRef>> copies;
+  std::vector<std::pair<const void*, const void*>> aliases;
+  for (auto it = g_gxState.copyTextures.begin(); it != g_gxState.copyTextures.end();) {
+    if (in(it->first)) {
+      copies.emplace_back(shift(it->first), std::move(it->second));
+      it = g_gxState.copyTextures.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  for (auto it = s_copyAliases.begin(); it != s_copyAliases.end();) {
+    if (in(it->first) || in(it->second)) {
+      const auto d = in(it->first) ? shift(it->first) : it->first;
+      const auto s = in(it->second) ? shift(it->second) : it->second;
+      aliases.emplace_back(d, s);
+      it = s_copyAliases.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  for (auto& [dest, ref] : copies) {
+    g_gxState.copyTextures[dest] = std::move(ref);
+  }
+  for (const auto& [dest, src] : aliases) {
+    s_copyAliases[dest] = src;
+  }
+}
 
 void expire_texture_object_caches() noexcept {
   // Ages out cache entries whose game-side GXTexObj is gone. GXInitTexObj mints a fresh
@@ -678,6 +755,7 @@ void expire_texture_object_caches() noexcept {
 }
 
 void evict_copy_texture(const void* dest) noexcept {
+  s_copyAliases.erase(dest);
   absl::flat_hash_set<const void*> sourceIdentities;
   if (const auto it = g_gxState.copyTextures.find(dest); it != g_gxState.copyTextures.end()) {
     if (it->second.handle) {
@@ -792,7 +870,16 @@ void resolve_sampled_textures(const ShaderInfo& info) noexcept {
 
     GXState::CopyTextureRef* copyRef = nullptr;
     if (!g_gxState.copyTextures.empty() && obj.data != nullptr) {
-      const auto copyIt = g_gxState.copyTextures.find(obj.data);
+      auto copyIt = g_gxState.copyTextures.find(obj.data);
+      if (copyIt == g_gxState.copyTextures.end() && !s_copyAliases.empty()) {
+        if (const auto alias = s_copyAliases.find(obj.data); alias != s_copyAliases.end()) {
+          if (const auto src = g_gxState.copyTextures.find(alias->second);
+              src != g_gxState.copyTextures.end() && src->second.handle) {
+            copyIt = g_gxState.copyTextures.insert_or_assign(obj.data, src->second).first;
+            s_copyAliases.erase(alias);
+          }
+        }
+      }
       if (copyIt != g_gxState.copyTextures.end()) {
         copyRef = &copyIt->second;
         copyRef->lastUsedFrame = gfx::current_frame();

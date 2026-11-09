@@ -201,6 +201,14 @@ void GXSetTexCopyDst(u16 wd, u16 ht, GXTexFmt fmt, GXBool mipmap) {
 // TODO GXSetDispCopyFrame2Field
 // TODO GXSetCopyClamp
 
+f32 GXGetYScaleFactor(u16 efbHeight, u16 xfbHeight) {
+  f32 yScale = static_cast<f32>(xfbHeight) / static_cast<f32>(efbHeight);
+  if (yScale > 1.0f) {
+    yScale = 1.0f;
+  }
+  return yScale;
+}
+
 u32 GXSetDispCopyYScale(f32 vscale) { return 0; }
 
 void GXSetCopyClear(GXColor color, u32 depth) {

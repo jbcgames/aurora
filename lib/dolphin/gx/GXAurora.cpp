@@ -242,4 +242,9 @@ void AuroraSetPresentArea(float left, float top, float right, float bottom) {
 void AuroraSetDrawsBlocking(bool blocking) {
   (void)blocking;
 }
+
+void AuroraFlushTextureCaches(void) {
+  aurora::gx::clear_static_texture_cache();
+  aurora::gx::clear_copy_texture_cache();
+}
 }
