@@ -598,7 +598,7 @@ void forget_memory(const void* lo_, const void* hi_) noexcept {
   }
 }
 
-void move_memory(const void* from_, const void* to_, u32 size) noexcept {
+void move_memory(const void* from_, const void* to_, size_t size) noexcept {
   const auto from = reinterpret_cast<uintptr_t>(from_);
   const auto to = reinterpret_cast<uintptr_t>(to_);
   if (from == to || size == 0) {
