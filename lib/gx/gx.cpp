@@ -1180,6 +1180,7 @@ gl::Pipeline build_pipeline(const PipelineConfig& config, uint32_t program, cons
   state.topology =
       config.triangleStripTopology != 0 ? gfx::PrimitiveTopology::TriangleStrip : gfx::PrimitiveTopology::TriangleList;
   state.primitiveRestart = config.triangleStripTopology != 0;
+  state.alphaToCoverage = (config.shaderConfig.edgeAA == 1 && config.msaaSamples > 1);
 
   // Native vertex layout as a present-attr bitmask over canonical GX attr order
   // (GX_VA_PNMTXIDX..GX_VA_TEX7). The draw path (pass.cpp) decodes it into the VAO;
@@ -1280,8 +1281,41 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
   if (g_gxState.alphaCompare) {
     config.shaderConfig.alphaCompare = g_gxState.alphaCompare;
   }
-  const auto cullMode = config.shaderConfig.lineMode == 0 ? g_gxState.cullMode : GX_CULL_NONE;
+  auto cullMode = config.shaderConfig.lineMode == 0 ? g_gxState.cullMode : GX_CULL_NONE;
+  if (g_gxState.projScaleX < 0.f && !gfx::is_offscreen()) {
+    if (cullMode == GX_CULL_FRONT) {
+      cullMode = GX_CULL_BACK;
+    } else if (cullMode == GX_CULL_BACK) {
+      cullMode = GX_CULL_FRONT;
+    }
+  }
   const auto [polygonOffset, polygonOffsetScale] = polygon_offset_for_cull_mode(cullMode);
+
+  // aurora/paper.h: distance-field maps the stages sample, shadow draws, smooth cut-out edges
+  if (g_gxState.paperSdfMaps != 0) {
+    u8 sampled = 0;
+    for (u8 i = 0; i < g_gxState.numTevStages; ++i) {
+      const auto map = g_gxState.tevStages[i].texMapId;
+      if (map != GX_TEXMAP_NULL && map < MaxTextures) {
+        sampled |= static_cast<u8>(1u << map);
+      }
+    }
+    config.shaderConfig.sdfMaps = sampled & g_gxState.paperSdfMaps;
+  }
+  const bool paperShadow = g_gxState.paperShadow && config.shaderConfig.lineMode == 0 && !gfx::is_offscreen();
+  config.shaderConfig.shadowFill = paperShadow ? 1 : 0;
+  if (g_gxState.paperEdges != 0 && !paperShadow && config.shaderConfig.lineMode == 0 &&
+      paper_cutout_threshold(config.shaderConfig.alphaCompare) >= 0.f) {
+    const bool blends = g_gxState.blendMode == GX_BM_BLEND && g_gxState.blendFacSrc == GX_BL_SRCALPHA &&
+                        g_gxState.blendFacDst == GX_BL_INVSRCALPHA;
+    if (blends) {
+      config.shaderConfig.edgeAA = 2;
+    } else if (g_gxState.blendMode == GX_BM_NONE && !g_gxState.alphaUpdate && gfx::get_sample_count() > 1 &&
+               !gfx::is_offscreen()) {
+      config.shaderConfig.edgeAA = 1;
+    }
+  }
+
   config = {
       .msaaSamples = gfx::get_sample_count(),
       .shaderConfig = config.shaderConfig,
@@ -1300,6 +1334,19 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
       .alphaUpdate = cullMode == GX_CULL_ALL ? false : g_gxState.alphaUpdate,
       .colorUpdate = cullMode == GX_CULL_ALL ? false : g_gxState.colorUpdate,
   };
+  if (paperShadow) {
+    config.depthFunc = GX_LESS;
+    config.cullMode = GX_CULL_NONE;
+    config.blendMode = GX_BM_BLEND;
+    config.blendFacSrc = GX_BL_SRCALPHA;
+    config.blendFacDst = GX_BL_INVSRCALPHA;
+    config.blendOp = GX_LO_CLEAR;
+    config.dstAlpha = UINT32_MAX;
+    config.depthCompare = true;
+    config.depthUpdate = true;
+    config.alphaUpdate = false;
+    config.colorUpdate = true;
+  }
 }
 
 GXBindGroups build_bind_groups(const ShaderInfo& info) noexcept {

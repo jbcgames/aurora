@@ -21,6 +21,13 @@ bool aurora_dvd_open(const char* disc_path);
 void aurora_dvd_close(void);
 
 /**
+ * Block until every queued DVD command has completed, its callback included.
+ * Async reads complete on a worker thread; a caller that needs them to finish
+ * at a deterministic point (e.g. once per frame in a repeatable test run) waits here.
+ */
+void aurora_dvd_wait_idle(void);
+
+/**
  * OVERLAY FILES!
  *
  * Overlay files allow you to replace and add ("overlay") files that are present in the loaded DVD.

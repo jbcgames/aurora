@@ -30,6 +30,13 @@ extern "C" {
 #define GX_AURORA_LOAD_PROJECTION_FULL 0x0003
 
 /**
+ * Scales clip-space x of every following draw to the main framebuffer (not
+ * offscreen targets): widescreen without changing the game's projections,
+ * which GXGetProjection still returns as set. Must be followed by one f32.
+ */
+#define GX_AURORA_SET_PROJECTION_SCALE_X 0x0004
+
+/**
  * Aurora equivalent of CP_REG_ARRAYBASE_ID: sets the base address and size of a vertex array.
  * This command must be followed by a 64-bit memory address, 32-bit size, and 1-byte little-endian flag.
  * The index of the vertex array is given by the lowest 4 bits of the command ID,
@@ -316,6 +323,14 @@ void GXSetReplayMaskAurora(u8 on);
  * Load an arbitrary 4x4 projection matrix, avoiding the 6-parameter hardware encoding.
  */
 void GXSetProjectionFull(const void* mtx);
+
+/**
+ * Multiplies clip-space x by scale for the following draws to the main
+ * framebuffer (1 = off). With the framebuffer locked to a wider aspect
+ * (VILockAspectRatio), scale = logical aspect / locked aspect keeps shapes
+ * and shows more horizontally.
+ */
+void GXSetProjectionScaleX(f32 scale);
 
 /**
  * Create an offscreen framebuffer and switch rendering to it.

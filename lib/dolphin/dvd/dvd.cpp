@@ -479,6 +479,15 @@ public:
     }
   }
 
+  // Every queued command done, callbacks included (a callback may queue more).
+  void wait_idle() {
+    if (std::this_thread::get_id() == m_thread.get_id()) {
+      return;
+    }
+    std::unique_lock lk{m_mutex};
+    m_doneCv.wait(lk, [&] { return !m_running || (m_queue.empty() && m_activeBlock == nullptr); });
+  }
+
   void wait(const DVDCommandBlock* block) {
     if (block == nullptr) {
       return;
@@ -708,6 +717,8 @@ bool aurora_dvd_open(const char* disc_path) {
   s_worker.start();
   return true;
 }
+
+void aurora_dvd_wait_idle(void) { s_worker.wait_idle(); }
 
 void aurora_dvd_close(void) {
   s_worker.stop();

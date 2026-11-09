@@ -66,7 +66,7 @@ f32 C_VECSquareMag(const Vec* v) {
   assert(v && "VECMag():  NULL VecPtr 'v' ");
 
   sqmag = v->z * v->z + ((v->x * v->x) + (v->y * v->y));
-  return sqmag;
+  return ppc_flush_denormal(sqmag);
 }
 
 f32 PSVECSquareMag(const Vec* v) {
@@ -79,7 +79,7 @@ f32 PSVECSquareMag(const Vec* v) {
   xx = v->x * v->x;
   yy = v->y * v->y;
   xx_zz = fmaf(v->z, v->z, xx);
-  return fmaf(xx_zz, 1.0f, yy);
+  return ppc_flush_denormal(fmaf(xx_zz, 1.0f, yy));
 }
 
 f32 C_VECMag(const Vec* v) {
@@ -175,14 +175,14 @@ f32 C_VECSquareDistance(const Vec* a, const Vec* b) {
   diff.x = a->x - b->x;
   diff.y = a->y - b->y;
   diff.z = a->z - b->z;
-  return (diff.z * diff.z) + ((diff.x * diff.x) + (diff.y * diff.y));
+  return ppc_flush_denormal((diff.z * diff.z) + ((diff.x * diff.x) + (diff.y * diff.y)));
 }
 
 f32 PSVECSquareDistance(const Vec* a, const Vec* b) {
   f32 dx = a->x - b->x;
   f32 dy = a->y - b->y;
   f32 dz = a->z - b->z;
-  return (dx * dx + dy * dy) + dz * dz;
+  return ppc_flush_denormal((dx * dx + dy * dy) + dz * dz);
 }
 
 f32 C_VECDistance(const Vec* a, const Vec* b) {

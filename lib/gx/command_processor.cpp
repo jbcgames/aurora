@@ -8,8 +8,10 @@
 #include "pipeline.hpp"
 #include "shader_info.hpp"
 #include "../internal.hpp"
+#include <aurora/paper.h>
 
 #include <absl/container/flat_hash_map.h>
+#include <limits>
 #include <tracy/Tracy.hpp>
 
 #include <bit>
@@ -1764,6 +1766,134 @@ static void handle_draw_overrun [[noreturn]] (u32 totalVtxBytes, const u8* data,
 }
 
 // Draw command handler - parses vertices inline and caches results
+
+struct BoundingBox {
+  bool armed = false;
+  bool unknown = false;
+  float left = 0.f, top = 0.f, right = -1.f, bottom = -1.f;
+  u16 result[4] = {0x3FF, 0x3FF, 0, 0};
+};
+BoundingBox sBbox;
+
+bool bbox_read_position(const u8* vtx, GXVtxFmt fmt, float out[3], u32& pnMtx) noexcept {
+  const auto& vf = g_gxState.vtxFmts[fmt];
+  u32 off = 0;
+  pnMtx = g_gxState.currentPnMtx;
+  for (int i = GX_VA_PNMTXIDX; i < GX_VA_POS; ++i) {
+    switch (g_gxState.vtxDesc[i]) {
+    case GX_NONE:
+      break;
+    case GX_DIRECT:
+      if (i == GX_VA_PNMTXIDX) {
+        pnMtx = vtx[off] / 3;
+      }
+      off += comp_type_size(static_cast<GXAttr>(i), vf.attrs[i].type) *
+             comp_cnt_count(static_cast<GXAttr>(i), vf.attrs[i].cnt);
+      break;
+    case GX_INDEX8:
+      off += 1;
+      break;
+    case GX_INDEX16:
+      off += 2;
+      break;
+    }
+  }
+  const auto& af = vf.attrs[GX_VA_POS];
+  const u32 count = af.cnt == GX_POS_XY ? 2 : 3;
+  const u8* src = nullptr;
+  bool le = false;
+  switch (g_gxState.vtxDesc[GX_VA_POS]) {
+  case GX_DIRECT:
+    src = vtx + off;
+    break;
+  case GX_INDEX8:
+  case GX_INDEX16: {
+    const u32 idx = g_gxState.vtxDesc[GX_VA_POS] == GX_INDEX8 ? vtx[off] : (u32(vtx[off]) << 8 | vtx[off + 1]);
+    const auto& arr = g_gxState.arrays[GX_VA_POS];
+    if (arr.data == nullptr || arr.stride == 0) {
+      return false;
+    }
+    if (arr.size != 0 && u64(idx) * arr.stride + u64(count) * 4 > arr.size + 4) {
+      return false;
+    }
+    src = static_cast<const u8*>(arr.data) + u64(idx) * arr.stride;
+    le = arr.le;
+    break;
+  }
+  default:
+    return false;
+  }
+  const float scale = 1.f / static_cast<float>(1u << af.frac);
+  for (u32 c = 0; c < count; ++c) {
+    switch (af.type) {
+    case GX_U8:
+      out[c] = static_cast<float>(src[c]) * scale;
+      break;
+    case GX_S8:
+      out[c] = static_cast<float>(static_cast<s8>(src[c])) * scale;
+      break;
+    case GX_U16:
+    case GX_S16: {
+      u16 v;
+      memcpy(&v, src + 2 * c, 2);
+      if (!le) {
+        v = bswap(v);
+      }
+      out[c] = (af.type == GX_U16 ? static_cast<float>(v) : static_cast<float>(static_cast<s16>(v))) * scale;
+      break;
+    }
+    case GX_F32: {
+      u32 v;
+      memcpy(&v, src + 4 * c, 4);
+      if (!le) {
+        v = bswap(v);
+      }
+      out[c] = std::bit_cast<float>(v);
+      break;
+    }
+    default:
+      return false;
+    }
+  }
+  if (count == 2) {
+    out[2] = 0.f;
+  }
+  return true;
+}
+
+void bbox_add_vertices(const u8* data, u32 vtxCount, u32 vtxSize, GXVtxFmt fmt) noexcept {
+  if (vtxSize == 0) {
+    return;
+  }
+  const auto& proj = g_gxState.proj;
+  const auto& vp = g_gxState.logicalViewport;
+  for (u32 i = 0; i < vtxCount && !sBbox.unknown; ++i) {
+    float p[3];
+    u32 mtx;
+    if (!bbox_read_position(data + i * vtxSize, fmt, p, mtx) || mtx >= MaxPnMtx) {
+      sBbox.unknown = true;
+      break;
+    }
+    const auto& m = g_gxState.pnMtx[mtx].pos;
+    const float v0 = m.m0[0] * p[0] + m.m0[1] * p[1] + m.m0[2] * p[2] + m.m0[3];
+    const float v1 = m.m1[0] * p[0] + m.m1[1] * p[1] + m.m1[2] * p[2] + m.m1[3];
+    const float v2 = m.m2[0] * p[0] + m.m2[1] * p[1] + m.m2[2] * p[2] + m.m2[3];
+    const float cx = proj.m0[0] * v0 + proj.m0[1] * v1 + proj.m0[2] * v2 + proj.m0[3];
+    const float cy = proj.m1[0] * v0 + proj.m1[1] * v1 + proj.m1[2] * v2 + proj.m1[3];
+    const float cw = proj.m3[0] * v0 + proj.m3[1] * v1 + proj.m3[2] * v2 + proj.m3[3];
+    if (!(cw > 1e-6f)) {
+      sBbox.unknown = true;
+      break;
+    }
+    const float sx = vp.left + (cx / cw + 1.f) * 0.5f * vp.width;
+    const float sy = vp.top + (1.f - cy / cw) * 0.5f * vp.height;
+    sBbox.left = std::min(sBbox.left, sx);
+    sBbox.right = std::max(sBbox.right, sx);
+    sBbox.top = std::min(sBbox.top, sy);
+    sBbox.bottom = std::max(sBbox.bottom, sy);
+  }
+}
+
 static u32 calculate_last_vtx_size(GXVtxFmt fmt) {
   u32 vtxSize = 0;
   const auto& vtxFmt = g_gxState.vtxFmts[fmt];
@@ -1824,6 +1954,9 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* da
   u32 totalVtxBytes = vtxCount * vtxSize;
   if (pos + totalVtxBytes > size)
     UNLIKELY { handle_draw_overrun(totalVtxBytes, data, pos, size); }
+
+  if (sBbox.armed)
+    UNLIKELY { bbox_add_vertices(data + pos, vtxCount, vtxSize, fmt); }
 
   // Native vertex fetch expands supported layouts to hardware attributes on the CPU
   // (advancing pos itself). Unsupported layouts fall through to the storage path.
@@ -1895,7 +2028,7 @@ static void handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndi
   // Fold this draw plus any immediately-following identical draw commands into one native
   // hardware draw (strip topology + primitive restart). Unsupported primitives/layouts fall
   // through to draw_prim (single native, else the storage/software path).
-  if (try_native_draw_run(cmd, prim, fmt, vtxCount, vtxSize, data, pos, size, bigEndian)) {
+  if (!sBbox.armed && try_native_draw_run(cmd, prim, fmt, vtxCount, vtxSize, data, pos, size, bigEndian)) {
     return;
   }
 
@@ -3079,6 +3212,37 @@ void handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian) {
     const int32_t height = static_cast<int32_t>(read_u32(data + pos, bigEndian));
     pos += 4;
     set_render_scissor({left, top, width, height});
+  } else if (subCmd == GX_AURORA_SET_PROJECTION_SCALE_X) {
+    CHECK(pos + 4 <= size, "GX_AURORA_SET_PROJECTION_SCALE_X read overrun");
+    const f32 scale = read_f32(data + pos, bigEndian);
+    pos += 4;
+    if (g_gxState.projScaleX != scale) {
+      g_gxState.projScaleX = scale;
+      g_gxState.uniformDirty++;
+      g_gxState.stateDirty = true;
+    }
+  } else if (subCmd == GX_AURORA_SET_PAPER) {
+    CHECK(pos + 10 <= size, "GX_AURORA_SET_PAPER read overrun");
+    const u8 edges = data[pos];
+    pos += 1;
+    const bool shadow = data[pos] != 0;
+    pos += 1;
+    const auto sdf = reinterpret_cast<const void*>(read_u64(data + pos, bigEndian));
+    pos += 8;
+    if (edges != g_gxState.paperEdges || shadow != g_gxState.paperShadow || sdf != g_gxState.paperSdf) {
+      g_gxState.paperEdges = edges;
+      g_gxState.paperShadow = shadow;
+      g_gxState.paperSdf = sdf;
+      u8 sdfMaps = 0;
+      for (u32 i = 0; i < MaxTextures; ++i) {
+        if (sdf != nullptr && g_gxState.loadedTextures[i].data == sdf) {
+          sdfMaps |= static_cast<u8>(1u << i);
+        }
+      }
+      g_gxState.paperSdfMaps = sdfMaps;
+      g_gxState.pipelineDirty++;
+      g_gxState.stateDirty = true;
+    }
   } else if (subCmd == GX_AURORA_LOAD_PROJECTION_FULL) {
     CHECK(pos + 64 <= size, "GX_AURORA_LOAD_PROJECTION_FULL read overrun");
     auto& proj = g_gxState.proj;
@@ -3138,6 +3302,14 @@ void handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian) {
     slot.texDataVersion = read_u32(data + pos, bigEndian);
     pos += 4;
     slot.set_no_cache(false); // Reset no-cache flag
+    const u8 bit = static_cast<u8>(1u << texMapId);
+    const u8 sdfMaps = g_gxState.paperSdf != nullptr && slot.data == g_gxState.paperSdf
+                           ? static_cast<u8>(g_gxState.paperSdfMaps | bit)
+                           : static_cast<u8>(g_gxState.paperSdfMaps & ~bit);
+    if (sdfMaps != g_gxState.paperSdfMaps) {
+      g_gxState.paperSdfMaps = sdfMaps;
+      g_gxState.pipelineDirty++;
+    }
     g_gxState.stateDirty = true;
   } else if (subCmd == GX_AURORA_LOAD_TLUT) {
     CHECK(pos + 23 <= size, "GX_AURORA_LOAD_TLUT read overrun");
@@ -3267,6 +3439,9 @@ void handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian) {
     CHECK(pos + totalVtxBytes <= size, "GX_AURORA_DRAW_INDEXED vertex data overrun");
     const u8* vtxData = data + pos;
     pos += totalVtxBytes;
+    if (sBbox.armed && indexCount != 0) {
+      bbox_add_vertices(vtxData, vtxCount, vtxSize, fmt);
+    }
     if (indexCount != 0) {
       if (!try_native_draw_indexed(fmt, vtxCount, vtxData, vtxSize, idxData, idxBytes, indexCount)) {
         const gfx::Range idxRange = gfx::push_indices(idxData, idxBytes, 4);
@@ -3290,3 +3465,45 @@ void handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian) {
 }
 
 } // namespace aurora::gx::fifo
+
+namespace aurora::gx {
+void bbox_reset() noexcept {
+  auto& b = fifo::sBbox;
+  b.armed = true;
+  b.unknown = false;
+  b.left = b.top = std::numeric_limits<float>::max();
+  b.right = b.bottom = -std::numeric_limits<float>::max();
+}
+
+void bbox_read(u16* left, u16* top, u16* right, u16* bottom) noexcept {
+  auto& b = fifo::sBbox;
+  if (b.armed) {
+    const auto& sc = g_gxState.logicalScissor;
+    const float x0 = static_cast<float>(sc.x);
+    const float y0 = static_cast<float>(sc.y);
+    const float x1 = static_cast<float>(sc.x + sc.width - 1);
+    const float y1 = static_cast<float>(sc.y + sc.height - 1);
+    if (b.unknown) {
+      b.result[0] = static_cast<u16>(std::max(x0, 0.f));
+      b.result[1] = static_cast<u16>(std::max(y0, 0.f));
+      b.result[2] = static_cast<u16>(std::max(x1, 0.f));
+      b.result[3] = static_cast<u16>(std::max(y1, 0.f));
+    } else if (b.right < b.left || b.right < x0 || b.left > x1 || b.bottom < y0 || b.top > y1) {
+      b.result[0] = 0x3FF;
+      b.result[1] = 0x3FF;
+      b.result[2] = 0;
+      b.result[3] = 0;
+    } else {
+      b.result[0] = static_cast<u16>(std::floor(std::clamp(b.left, x0, x1)));
+      b.result[1] = static_cast<u16>(std::floor(std::clamp(b.top, y0, y1)));
+      b.result[2] = static_cast<u16>(std::ceil(std::clamp(b.right, x0, x1)));
+      b.result[3] = static_cast<u16>(std::ceil(std::clamp(b.bottom, y0, y1)));
+    }
+    b.armed = false;
+  }
+  *left = b.result[0];
+  *top = b.result[1];
+  *right = b.result[2];
+  *bottom = b.result[3];
+}
+} // namespace aurora::gx

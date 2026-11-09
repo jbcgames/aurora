@@ -949,6 +949,10 @@ void handle_bp(u32 value) noexcept {
     return;
   }
 
+  if (regId == 0x55 || regId == 0x56) {
+    bbox_reset();
+  }
+
   auto& cache = g_gxState.bpRegCache;
   const u32 ssMask = cache[0xFE];
   cache[0xFE] = 0x00FFFFFF;

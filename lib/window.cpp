@@ -47,6 +47,7 @@ SDL_Window* g_window;
 SDL_Renderer* g_renderer;
 float g_frameBufferScale = 0.f;
 bool g_frameBufferAspectFit = false;
+float g_lockedAspect = 0.f;
 AuroraWindowSize g_windowSize;
 std::vector<AuroraEvent> g_events;
 std::deque<std::string> g_eventStrings;
@@ -528,8 +529,9 @@ AuroraWindowSize get_window_size() {
   if (g_frameBufferAspectFit) {
     const auto [baseW, baseH] = vi::configured_fb_size();
     if (baseW > 0 && baseH > 0) {
-      const auto [fitW, fitH] =
-          fit_frame_buffer_to_aspect(fb_w, fb_h, static_cast<float>(baseW) / static_cast<float>(baseH));
+      const float aspect =
+          g_lockedAspect > 0.f ? g_lockedAspect : static_cast<float>(baseW) / static_cast<float>(baseH);
+      const auto [fitW, fitH] = fit_frame_buffer_to_aspect(fb_w, fb_h, aspect);
       fb_w = fitW;
       fb_h = fitH;
     }
@@ -642,6 +644,14 @@ void set_frame_buffer_scale(float scale) {
 }
 
 float get_frame_buffer_scale() { return g_frameBufferScale; }
+
+void set_locked_aspect(float aspect) {
+  if (g_lockedAspect == aspect) {
+    return;
+  }
+  g_lockedAspect = aspect;
+  request_frame_buffer_resize();
+}
 
 void set_frame_buffer_aspect_fit(bool fit) {
   if (g_frameBufferAspectFit == fit) {

@@ -49,6 +49,8 @@ void GXSetTexCopyDst(u16 wd, u16 ht, GXTexFmt fmt, GXBool mipmap);
 void GXCopyTex(void* dest, GXBool clear);
 u16 GXGetNumXfbLines(u16 efbHeight, f32 yScale);
 f32 GXGetYScaleFactor(u16 efbHeight, u16 xfbHeight);
+void GXClearBoundingBox(void);
+void GXReadBoundingBox(u16* left, u16* top, u16* right, u16* bottom);
 
 #ifdef __cplusplus
 }

@@ -124,6 +124,7 @@ struct Shadow {
   int polygonOffset;
   float poFactor, poUnits;
   int primitiveRestart;
+  int alphaToCoverage;
   // Stencil
   int stencilTest;
   GLenum stencilFunc;
@@ -282,6 +283,9 @@ void apply_baked_state(const BakedState& state) {
 
   // Primitive restart (S6): only strips enable it; the pipeline's flag decides.
   set_cap(GL_PRIMITIVE_RESTART_FIXED_INDEX, s.primitiveRestart, state.primitiveRestart);
+
+  // Alpha to coverage
+  set_cap(GL_SAMPLE_ALPHA_TO_COVERAGE, s.alphaToCoverage, state.alphaToCoverage);
 
   // Stencil (RmlUi)
   set_cap(GL_STENCIL_TEST, s.stencilTest, state.stencilTest);

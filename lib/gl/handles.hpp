@@ -74,6 +74,7 @@ struct BakedState {
   // Topology
   PrimitiveTopology topology = PrimitiveTopology::TriangleList;
   bool primitiveRestart = false;
+  bool alphaToCoverage = false;
   // Stencil (RmlUi only)
   bool stencilTest = false;
   CompareFunction stencilCompare = CompareFunction::Always;

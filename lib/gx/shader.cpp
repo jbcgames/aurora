@@ -810,7 +810,8 @@ auto lighting_func(const ShaderConfig& config, const ColorChannelConfig& cc, u8 
     lightAttnFn = fmt::format(R"""(
           float cosraw = dot(ldir, light.dir);
           float cosine = (cosraw > 0.0) ? min(cosraw, 1.0) : 0.0;
-          float cos_attn = dot(light.cos_att, vec3(1.0, cosine, cosine * cosine));
+          float cos_attn = light.cos_att.x + (light.cos_att.y != 0.0 ? light.cos_att.y * cosine : 0.0) +
+                         (light.cos_att.z != 0.0 ? light.cos_att.z * cosine * cosine : 0.0);
           float dist_attn = dot(light.dist_att, vec3(1.0, dist, dist2));
           attn = max(0.0, cos_attn / dist_attn);)""");
   } else if (cc.attnFn == GX_AF_SPEC) {
@@ -1096,6 +1097,13 @@ GlslProgram emit_glsl(const ShaderConfig& config, const ShaderInfo& info) {
       vsBody += fmt::format("\n    vec4 tc{} = vec4({}, 1.0);", i, nbt_slice_local(NbtSlice::B));
     } else if (tcg.src == GX_TG_TANGENT) {
       vsBody += fmt::format("\n    vec4 tc{} = vec4({}, 1.0);", i, nbt_slice_local(NbtSlice::T));
+    } else if (tcg.src == GX_MAX_TEXGENSRC) {
+      static bool warned = false;
+      if (!warned) {
+        warned = true;
+        Log.warn("texcoord {} sampled but not generated (numTexGens too low): using (0, 0)", i);
+      }
+      vsBody += fmt::format("\n    vec4 tc{} = vec4(0.0, 0.0, 1.0, 1.0);", i);
     } else
       UNLIKELY FATAL("unhandled tcg src {}", underlying(tcg.src));
     if (tcg.type == GX_TG_MTX2x4 || tcg.type == GX_TG_MTX3x4) {
@@ -1334,6 +1342,12 @@ GlslProgram emit_glsl(const ShaderConfig& config, const ShaderInfo& info) {
     }
     fsPre += fmt::format("\n    vec4 sampled{0} = texture(tex{1}, {2}, ubuf.tex{1}_size_bias.z);", i,
                          underlying(stage.texMapId), uvIn);
+    if ((config.sdfMaps >> underlying(stage.texMapId)) & 1u) {
+      fsPre += fmt::format(
+          "\n    float sdf_w{0} = max(fwidth(sampled{0}.a), 1e-4);"
+          "\n    sampled{0} = vec4(clamp((sampled{0}.a - 0.5) / sdf_w{0} + 0.5, 0.0, 1.0));",
+          i);
+    }
   }
 
   if (info.usesPTTexMtx.any()) {
@@ -1391,6 +1405,9 @@ GlslProgram emit_glsl(const ShaderConfig& config, const ShaderInfo& info) {
     samplerDecls += fmt::format("\nuniform sampler2D tex{};", i);
   }
   fsBody += "\n    prev = tev_overflow_vec4f(prev);";
+  if (config.shadowFill) {
+    fsBody += "\n    prev = vec4(0.0, 0.0, 0.0, clamp(prev.a, 0.0, 1.0) * 0.45);";
+  }
   if (config.alphaCompare) {
     const auto comp0 = alpha_compare(config.alphaCompare.comp0, config.alphaCompare.ref0);
     const auto comp1 = alpha_compare(config.alphaCompare.comp1, config.alphaCompare.ref1);
@@ -1411,7 +1428,16 @@ GlslProgram emit_glsl(const ShaderConfig& config, const ShaderInfo& info) {
       break;
     }
     const auto discard = alpha_compare_not(pass);
-    if (discard.constant == 1) {
+    const float cutout = config.edgeAA != 0 ? paper_cutout_threshold(config.alphaCompare) : -1.f;
+    if (cutout >= 0.f) {
+      fsBody += fmt::format(
+          "\n    // Alpha compare, smooth edge"
+          "\n    float edge_w = max(fwidth(prev.a), 1.0 / 255.0);"
+          "\n    float edge_cov = clamp((prev.a - {:.6f}) / edge_w + 0.5, 0.0, 1.0);"
+          "\n    if (edge_cov <= 0.0) {{ discard; }}",
+          cutout);
+      fsBody += config.edgeAA == 1 ? "\n    prev.a = edge_cov;" : "\n    prev.a = prev.a * edge_cov;";
+    } else if (discard.constant == 1) {
       fsBody += "\n    // Alpha compare\n    discard;";
     } else if (discard.constant != 0) {
       fsBody +=

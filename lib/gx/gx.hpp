@@ -208,6 +208,39 @@ struct AlphaCompare {
   bool operator!=(const AlphaCompare& rhs) const { return !(*this == rhs); }
   explicit operator bool() const { return comp0 != GX_ALWAYS || comp1 != GX_ALWAYS; }
 };
+inline float paper_cutout_threshold(const AlphaCompare& ac) noexcept {
+  const auto one = [](GXCompare comp, u32 ref) -> float {
+    if (ref < 16 || ref > 240) {
+      return -1.f;
+    }
+    if (comp == GX_GEQUAL) {
+      return (static_cast<float>(ref) - 0.5f) / 255.f;
+    }
+    if (comp == GX_GREATER) {
+      return (static_cast<float>(ref) + 0.5f) / 255.f;
+    }
+    return -1.f;
+  };
+  if (ac.op == GX_AOP_AND) {
+    if (ac.comp1 == GX_ALWAYS) {
+      return one(ac.comp0, ac.ref0);
+    }
+    if (ac.comp0 == GX_ALWAYS) {
+      return one(ac.comp1, ac.ref1);
+    }
+    if (ac.comp0 == ac.comp1 && ac.ref0 == ac.ref1) {
+      return one(ac.comp0, ac.ref0);
+    }
+  } else if (ac.op == GX_AOP_OR) {
+    if (ac.comp1 == GX_NEVER) {
+      return one(ac.comp0, ac.ref0);
+    }
+    if (ac.comp0 == GX_NEVER) {
+      return one(ac.comp1, ac.ref1);
+    }
+  }
+  return -1.f;
+}
 static_assert(std::has_unique_object_representations_v<AlphaCompare>);
 struct IndTexMtxInfo {
   Mat3x2<float> mtx;
@@ -300,6 +333,7 @@ struct GXState {
   std::array<PnMtx, MaxPnMtx> pnMtx;
   u32 currentPnMtx;
   Mat4x4<float> proj;
+  float projScaleX = 1.f;
   GXProjectionType projType; // for GXGetProjectionv
   FogState fog;
   GXCullMode cullMode = GX_CULL_BACK;
@@ -328,6 +362,10 @@ struct GXState {
   std::array<TevStage, MaxTevStages> tevStages;
   std::array<gfx::TextureBind, MaxTextures> textures;
   std::array<GXTexObj_, MaxTextures> loadedTextures;
+  u8 paperEdges = 0;
+  bool paperShadow = false;
+  const void* paperSdf = nullptr;
+  u8 paperSdfMaps = 0;
   std::array<GXTlutObj_, MaxTluts> loadedTluts;
   AuroraViewportPolicy viewportPolicy = AURORA_VIEWPORT_FIT;
   gfx::Viewport logicalViewport{0.f, 0.f, 640.f, 480.f, 0.f, 1.f};
@@ -409,6 +447,8 @@ void initialize() noexcept;
 void shutdown() noexcept;
 void clear_static_texture_cache() noexcept;
 void clear_copy_texture_cache() noexcept;
+void bbox_reset() noexcept;
+void bbox_read(u16* left, u16* top, u16* right, u16* bottom) noexcept;
 void evict_copy_texture(const void* dest) noexcept;
 void evict_texture_object(u32 texObjId) noexcept;
 void evict_tlut_object(u32 tlutObjId) noexcept;
@@ -467,8 +507,10 @@ struct ShaderConfig {
   // "porcupine" (pnmtxidx no longer flows through the miscompiled storage byte-load)
   // and is the only vertex-fetch path that links on Mali (0 vertex SSBOs).
   u8 nativeVertexFetch : 1 = 0;
-  u8 pad1 : 5 = 0;
-  u8 pad2 = 0;
+  u8 edgeAA : 2 = 0;
+  u8 shadowFill : 1 = 0;
+  u8 pad1 : 2 = 0;
+  u8 sdfMaps = 0;
   std::array<AttrConfig, MaxVtxAttr> attrs;
   std::array<TevSwap, MaxTevSwap> tevSwapTable;
   std::array<TevStage, MaxTevStages> tevStages;

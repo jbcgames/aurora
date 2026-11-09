@@ -1,6 +1,7 @@
 #ifndef DOLPHIN_PPC_MATH_H
 #define DOLPHIN_PPC_MATH_H
 
+#include <float.h>
 #include <math.h>
 #include <stdint.h>
 
@@ -124,9 +125,19 @@ static inline double frsqrte(double val) {
     return result.f;
 }
 
-// One Newton-Raphson step
+// The console runs its FPU in non-IEEE mode (FPSCR[NI]), which flushes a denormal single to zero,
+// sign kept. Everything else (normals, zeros, infinities, NaNs) comes back as it is.
+static inline float ppc_flush_denormal(float x) {
+    return fabsf(x) < FLT_MIN ? copysignf(0.0f, x) : x;
+}
+
+// One Newton-Raphson step. A denormal x is flushed as on the console: left as it is, its estimate's
+// square in single precision overflows to infinity and the step gives -inf (so PSVECMag gave -inf
+// for a vector shorter than about 5e-20). For +-0, frsqrte gives +-inf and the step NaN, as there.
 static inline float ppc_rsqrte(float x) {
-    double rsqrt_d = frsqrte((double)x);
+    double rsqrt_d;
+    x = ppc_flush_denormal(x);
+    rsqrt_d = frsqrte((double)x);
     float nwork0 = (float)(rsqrt_d * rsqrt_d);
     float nwork1 = (float)(rsqrt_d * 0.5);
     nwork0 = fmaf(-nwork0, x, 3.0f);

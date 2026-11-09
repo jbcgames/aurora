@@ -812,8 +812,9 @@ s32 CARDUnmount(const s32 chan) {
   if (chan < 0 || chan >= 2) {
     return CARD_RESULT_FATAL_ERROR;
   }
-  // TODO:
-  return CARD_RESULT_NOCARD;
+  // Card images stay open; unmounting succeeds as on hardware (games check the
+  // result: TTYD treated NOCARD here as a failed save after writing the file).
+  return CARD_RESULT_READY;
 }
 
 s32 CARDGetCurrentMode(const s32 chan, u32* mode [[maybe_unused]]) {

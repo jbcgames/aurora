@@ -406,7 +406,12 @@ gfx::Range build_uniform(const ShaderInfo& info, u32 vtxStart, const BindGroupRa
       buf.append<u32>(line_texcoord_mask());
     }
   }
-  buf.append(g_gxState.proj);
+  auto proj = g_gxState.proj;
+  if (g_gxState.projScaleX != 1.f && !gfx::is_offscreen()) {
+    const float s = g_gxState.projScaleX;
+    proj.m0 = proj.m0 * s;
+  }
+  buf.append(proj);
 
   for (int i = 0; i < MaxPnMtx; i++) {
     buf.append(g_gxState.pnMtx[i].pos);

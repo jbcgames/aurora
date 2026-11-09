@@ -76,6 +76,41 @@ void GXSetProjectionFull(const void* mtx) {
   }
 }
 
+void GXSetProjectionScaleX(f32 scale) {
+  GX_WRITE_AURORA(GX_AURORA_SET_PROJECTION_SCALE_X);
+  GX_WRITE_F32(scale);
+}
+
+// aurora/paper.h: kept here, sent whole on each change
+#include "aurora/paper.h"
+static u8 s_paperEdges = 0;
+static u8 s_paperShadow = 0;
+static const void* s_paperSdf = nullptr;
+static void write_paper() {
+  GX_WRITE_AURORA(GX_AURORA_SET_PAPER);
+  GX_WRITE_U8(s_paperEdges);
+  GX_WRITE_U8(s_paperShadow);
+  GX_WRITE_U64(reinterpret_cast<u64>(s_paperSdf));
+}
+void aurora_set_paper_edges(int on) {
+  if (s_paperEdges != (on != 0)) {
+    s_paperEdges = on != 0;
+    write_paper();
+  }
+}
+void aurora_set_paper_distance_field(const void* texels) {
+  if (s_paperSdf != texels) {
+    s_paperSdf = texels;
+    write_paper();
+  }
+}
+void aurora_set_paper_shadow(int on) {
+  if (s_paperShadow != (on != 0)) {
+    s_paperShadow = on != 0;
+    write_paper();
+  }
+}
+
 void GX2SetPolygonOffset(f32 mFrontOffset, f32 mFrontScale, f32 mBackOffset, f32 mBackScale, f32 mClamp) {
   GX_WRITE_AURORA(GX2_SET_POLYGON_OFFSET);
   GX_WRITE_F32(mFrontOffset);

@@ -244,6 +244,13 @@ void GXCopyTex(void* dest, GXBool clear) {
 
 // TODO GXGetYScaleFactor
 // TODO GXGetNumXfbLines
-// TODO GXClearBoundingBox
-// TODO GXReadBoundingBox
+void GXClearBoundingBox() {
+  GX_WRITE_RAS_REG(0x550003FF);
+  GX_WRITE_RAS_REG(0x560003FF);
+}
+
+void GXReadBoundingBox(u16* left, u16* top, u16* right, u16* bottom) {
+  GXDrawDone();
+  aurora::gx::bbox_read(left, top, right, bottom);
+}
 }

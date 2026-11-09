@@ -43,6 +43,11 @@ void VIConfigurePan(u16 xOrg, u16 yOrg, u16 width, u16 height) {
   (void)height;
 }
 u32 VIGetTvFormat() { return 0; }
+void VILockAspectRatio(int width, int height) {
+  aurora::window::set_locked_aspect(width > 0 && height > 0 ? static_cast<float>(width) / static_cast<float>(height)
+                                                             : 0.f);
+}
+void VIUnlockAspectRatio() { aurora::window::set_locked_aspect(0.f); }
 void VIFlush() {}
 
 void VISetWindowTitle(const char* title) { aurora::window::set_title(title); }
