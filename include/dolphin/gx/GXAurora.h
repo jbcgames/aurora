@@ -419,6 +419,8 @@ void GXSetProbeTagAurora(u32 tag);
 
 void AuroraForgetMemory(const void* lo, const void* hi);
 void AuroraMoveMemory(const void* from, const void* to, u32 size);
+void AuroraSetSharpTextures(GXBool sharp);
+void AuroraSetPresentBackdrop(GXBool enabled);
 
 #if __cplusplus
 }

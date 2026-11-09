@@ -190,3 +190,15 @@ void AuroraMoveMemory(const void* from, const void* to, u32 size) {
   GX_WRITE_U64(reinterpret_cast<u64>(to));
   GX_WRITE_U64(static_cast<u64>(size));
 }
+
+#include "aurora/display.h"
+
+extern "C" {
+void GXSetProjectionTransform(f32 scaleX, f32 scaleY, f32 offsetX, f32 offsetY) {
+  (void)scaleX; (void)scaleY; (void)offsetX; (void)offsetY;
+}
+void AuroraSetTextureAnisotropy(u8 maxAniso) { (void)maxAniso; }
+void AuroraSetTextureLodBias(f32 bias) { (void)bias; }
+void AuroraSetSharpTextures(GXBool sharp) { (void)sharp; }
+void AuroraSetPresentBackdrop(GXBool enabled) { (void)enabled; }
+}

@@ -510,3 +510,32 @@ uint32_t aurora_pipeline_cache_describe_stuck(uint64_t minNs, char* buf, size_t 
   (void)minNs; if (buf && bufSize > 0) buf[0] = 0; return 0;
 }
 }
+
+#include "aurora/display.h"
+#include "aurora/hdr.h"
+#include "aurora/color.h"
+#include "aurora/picture.h"
+#include "aurora/upscale.h"
+
+extern "C" {
+void aurora_set_supersample(int factor) { (void)factor; }
+void aurora_set_post_filter(int mode) { (void)mode; }
+void aurora_set_vrr(bool enabled) { (void)enabled; }
+
+bool aurora_hdr_supported(void) { return false; }
+void aurora_set_hdr(bool enabled, float paperWhiteNits, float highlightBoost) {
+  (void)enabled; (void)paperWhiteNits; (void)highlightBoost;
+}
+bool aurora_hdr_active(void) { return false; }
+
+void aurora_set_color_matrix(const float* matrix) { (void)matrix; }
+
+void aurora_set_picture_effects(const AuroraPictureEffects* effects) { (void)effects; }
+int aurora_capture_picture(AuroraPictureCallback callback, void* user) {
+  (void)callback; (void)user;
+  return 0;
+}
+void AuroraSetTextureUpscale(unsigned factor, AuroraTextureUpscaler upscaler) {
+  (void)factor; (void)upscaler;
+}
+}
