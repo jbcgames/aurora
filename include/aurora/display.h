@@ -6,11 +6,12 @@
 
 #include <dolphin/types.h>
 
-#ifdef __cplusplus
-#include <cstdbool>
-extern "C" {
-#else
+#ifndef __cplusplus
 #include <stdbool.h>
+#endif
+
+#ifdef __cplusplus
+extern "C" {
 #endif
 
 /**

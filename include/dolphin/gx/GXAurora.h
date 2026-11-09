@@ -2,6 +2,7 @@
 #define DOLPHIN_GXAURORA_H
 
 #include <dolphin/types.h>
+#include <dolphin/gx/GXEnum.h>
 
 #if __cplusplus
 extern "C" {

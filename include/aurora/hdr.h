@@ -4,11 +4,12 @@
 /* HDR output (Paper Cut's port/patches/aurora): the SDR picture presented through a float16 extended-sRGB
  * swapchain at a chosen paper-white brightness, where the display and backend can show it. */
 
-#ifdef __cplusplus
-#include <cstdbool>
-extern "C" {
-#else
+#ifndef __cplusplus
 #include <stdbool.h>
+#endif
+
+#ifdef __cplusplus
+extern "C" {
 #endif
 
 /**
