@@ -86,6 +86,10 @@ extern "C" {
 
 #define GX_AURORA_END_OFFSCREEN 0x003A
 
+#define GX_AURORA_ALIAS_COPY_TEX 0x003B
+#define GX_AURORA_FORGET_MEMORY 0x0070
+#define GX_AURORA_MOVE_MEMORY 0x0071
+
 /**
  * Draw primitives with the vertex count derived from a byte length, as written by
  * GXBegin(prim, fmt, GX_AUTO). Must be followed by a u8 draw opcode (vtxfmt|prim),
@@ -412,6 +416,9 @@ typedef struct AuroraDrawProbe {
 typedef void (*AuroraDrawProbeFn)(const AuroraDrawProbe* probe);
 void AuroraSetDrawProbe(AuroraDrawProbeFn fn);
 void GXSetProbeTagAurora(u32 tag);
+
+void AuroraForgetMemory(const void* lo, const void* hi);
+void AuroraMoveMemory(const void* from, const void* to, u32 size);
 
 #if __cplusplus
 }

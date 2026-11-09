@@ -353,7 +353,7 @@ void GXLoadTlut(const GXTlutObj* obj_, u32 idx) {
 // TODO GXInvalidateTexRegion
 
 void GXInvalidateTexAll() {
-  // no-op?
+  aurora::gx::clear_static_texture_cache();
 }
 
 // TODO GXPreLoadEntireTexture

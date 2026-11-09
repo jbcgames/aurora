@@ -3389,6 +3389,25 @@ void handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian) {
     CHECK(pos + 8 <= size, "GX_AURORA_DESTROY_COPY_TEX read overrun");
     evict_copy_texture(reinterpret_cast<const void*>(read_u64(data + pos, bigEndian)));
     pos += 8;
+  } else if (subCmd == GX_AURORA_ALIAS_COPY_TEX) {
+    CHECK(pos + 16 <= size, "GX_AURORA_ALIAS_COPY_TEX read overrun");
+    const auto* src = reinterpret_cast<const void*>(read_u64(data + pos, bigEndian));
+    const auto* dest = reinterpret_cast<const void*>(read_u64(data + pos + 8, bigEndian));
+    alias_copy_texture(src, dest);
+    pos += 16;
+  } else if (subCmd == GX_AURORA_FORGET_MEMORY) {
+    CHECK(pos + 16 <= size, "GX_AURORA_FORGET_MEMORY read overrun");
+    const auto* lo = reinterpret_cast<const void*>(read_u64(data + pos, bigEndian));
+    const auto* hi = reinterpret_cast<const void*>(read_u64(data + pos + 8, bigEndian));
+    forget_memory(lo, hi);
+    pos += 16;
+  } else if (subCmd == GX_AURORA_MOVE_MEMORY) {
+    CHECK(pos + 24 <= size, "GX_AURORA_MOVE_MEMORY read overrun");
+    const auto* from = reinterpret_cast<const void*>(read_u64(data + pos, bigEndian));
+    const auto* to = reinterpret_cast<const void*>(read_u64(data + pos + 8, bigEndian));
+    const u64 sz = read_u64(data + pos + 16, bigEndian);
+    move_memory(from, to, static_cast<size_t>(sz));
+    pos += 24;
   } else if (subCmd == GX_AURORA_DRAW_SIZED) {
     CHECK(pos + 5 <= size, "GX_AURORA_DRAW_SIZED read overrun");
     u8 cmd = data[pos];

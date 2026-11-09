@@ -444,6 +444,10 @@ extern GXState g_gxState;
 struct ShaderInfo;
 
 void initialize() noexcept;
+// GXAliasCopyTex, AuroraForgetMemory, AuroraMoveMemory (texture.cpp)
+void alias_copy_texture(const void* src, const void* dest) noexcept;
+void forget_memory(const void* lo, const void* hi) noexcept;
+void move_memory(const void* from, const void* to, size_t size) noexcept;
 void shutdown() noexcept;
 void clear_static_texture_cache() noexcept;
 void clear_copy_texture_cache() noexcept;

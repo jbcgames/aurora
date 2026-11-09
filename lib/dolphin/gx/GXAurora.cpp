@@ -171,3 +171,22 @@ namespace aurora::gfx {
 struct ExtraLight;
 void set_extra_lights(const ExtraLight* lights, uint32_t count) { (void)lights; (void)count; }
 }
+
+void AuroraForgetMemory(const void* lo, const void* hi) {
+  if (lo == nullptr || hi <= lo) {
+    return;
+  }
+  GX_WRITE_AURORA(GX_AURORA_FORGET_MEMORY);
+  GX_WRITE_U64(reinterpret_cast<u64>(lo));
+  GX_WRITE_U64(reinterpret_cast<u64>(hi));
+}
+
+void AuroraMoveMemory(const void* from, const void* to, u32 size) {
+  if (from == nullptr || to == nullptr || from == to || size == 0) {
+    return;
+  }
+  GX_WRITE_AURORA(GX_AURORA_MOVE_MEMORY);
+  GX_WRITE_U64(reinterpret_cast<u64>(from));
+  GX_WRITE_U64(reinterpret_cast<u64>(to));
+  GX_WRITE_U64(static_cast<u64>(size));
+}

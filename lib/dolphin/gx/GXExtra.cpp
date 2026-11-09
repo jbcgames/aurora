@@ -21,6 +21,14 @@ void GXDestroyTlutObj(GXTlutObj* obj_) {
   obj->tlutObjId = 0;
 }
 
+void GXAliasCopyTex(const void* src, const void* dest) {
+  if (src != nullptr && dest != nullptr && src != dest) {
+    GX_WRITE_AURORA(GX_AURORA_ALIAS_COPY_TEX);
+    GX_WRITE_U64(reinterpret_cast<u64>(src));
+    GX_WRITE_U64(reinterpret_cast<u64>(dest));
+  }
+}
+
 void GXDestroyCopyTex(void* dest) {
   if (dest != nullptr) {
     GX_WRITE_AURORA(GX_AURORA_DESTROY_COPY_TEX);

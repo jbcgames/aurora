@@ -19,6 +19,8 @@ typedef struct {
 void GXDestroyTexObj(GXTexObj* obj);
 void GXDestroyTlutObj(GXTlutObj* obj);
 void GXDestroyCopyTex(void* dest);
+/* The copy texture at src also stands for dest (the game copied src's memory there). */
+void GXAliasCopyTex(const void* src, const void* dest);
 
 void GXColor4f32(float r, float g, float b, float a);
 
