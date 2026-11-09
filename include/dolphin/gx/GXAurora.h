@@ -427,6 +427,7 @@ void AuroraSetSharpTextures(GXBool sharp);
 void AuroraSetPresentBackdrop(GXBool enabled);
 void AuroraSetPresentArea(float left, float top, float right, float bottom);
 void AuroraSetDrawsBlocking(bool blocking);
+void AuroraFlushTextureCaches(void);
 
 typedef u32 AuroraReadbackStream;
 
