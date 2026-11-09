@@ -80,6 +80,7 @@ inline constexpr GLenum GL_STENCIL_TEST = 0x0B90;
 inline constexpr GLenum GL_SCISSOR_TEST = 0x0C11;
 inline constexpr GLenum GL_POLYGON_OFFSET_FILL = 0x8037;
 inline constexpr GLenum GL_PRIMITIVE_RESTART_FIXED_INDEX = 0x8D69;
+inline constexpr GLenum GL_SAMPLE_ALPHA_TO_COVERAGE = 0x809E;
 inline constexpr GLenum GL_DITHER = 0x0BD0;
 inline constexpr GLenum GL_RASTERIZER_DISCARD = 0x8C89;
 inline constexpr GLenum GL_DEBUG_OUTPUT = 0x92E0;
