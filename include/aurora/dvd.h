@@ -129,6 +129,15 @@ void aurora_dvd_overlay_files(const AuroraOverlayFile* files, size_t nFiles, s32
  */
 s32 aurora_dvd_base_entry_count();
 
+struct DVDFileInfo;
+
+typedef struct AuroraDvdOpenFile {
+  struct DVDFileInfo* fileInfo;
+  s32 entrynum;
+} AuroraDvdOpenFile;
+u32 aurora_dvd_open_files(AuroraDvdOpenFile* out, u32 max);
+void aurora_dvd_reopen_files(const AuroraDvdOpenFile* files, u32 count);
+
 #ifdef __cplusplus
 }
 #endif

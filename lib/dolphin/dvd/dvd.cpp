@@ -20,6 +20,7 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#include <unordered_map>
 
 #include "dvd.hpp"
 
@@ -45,6 +46,11 @@ namespace aurora::dvd::impl {
   bool s_overlayCallbacksSet = false;
   AuroraOverlayCallbacks s_overlayCallbacks;
   std::mutex s_fstLock;
+  struct OpenFile {
+    void* handle;
+    s32 entrynum;
+  };
+  std::unordered_map<DVDFileInfo*, OpenFile> s_openFiles;
 }
 
 namespace {
@@ -1106,6 +1112,10 @@ BOOL DVDFastOpen(s32 entrynum, DVDFileInfo* fileInfo) {
     fileInfo->cb.userData = new CommandDataNod(handle);
   }
 
+  {
+    std::lock_guard lock(s_fstLock);
+    s_openFiles[fileInfo] = {fileInfo->cb.userData, entrynum};
+  }
   atomic_store_release(fileInfo->cb.state, DVD_STATE_END);
   return TRUE;
 }
@@ -1123,12 +1133,57 @@ BOOL DVDClose(DVDFileInfo* fileInfo) {
     return FALSE;
   }
   s_worker.drain_command(&fileInfo->cb);
+  {
+    std::lock_guard lock(s_fstLock);
+    s_openFiles.erase(fileInfo);
+  }
   if (fileInfo->cb.userData != nullptr) {
     delete static_cast<CommandDataBase*>(fileInfo->cb.userData);
     fileInfo->cb.userData = nullptr;
   }
   atomic_store_release(fileInfo->cb.state, DVD_STATE_END);
   return TRUE;
+}
+
+u32 aurora_dvd_open_files(AuroraDvdOpenFile* out, u32 max) {
+  std::lock_guard lock(s_fstLock);
+  u32 n = 0;
+  for (const auto& [fileInfo, file] : s_openFiles) {
+    if (n < max && out != nullptr) {
+      out[n] = {fileInfo, file.entrynum};
+    }
+    ++n;
+  }
+  return n;
+}
+
+void aurora_dvd_reopen_files(const AuroraDvdOpenFile* files, u32 count) {
+  s_worker.wait_idle();
+  std::unordered_map<DVDFileInfo*, OpenFile> open;
+  {
+    std::lock_guard lock(s_fstLock);
+    open.swap(s_openFiles);
+  }
+  for (const auto& [fileInfo, file] : open) {
+    delete static_cast<CommandDataBase*>(file.handle);
+  }
+  for (u32 i = 0; i < count; ++i) {
+    DVDFileInfo* fileInfo = files[i].fileInfo;
+    const u32 startAddr = fileInfo->startAddr;
+    const u32 length = fileInfo->length;
+    const auto callback = fileInfo->callback;
+    const DVDCommandBlock cb = fileInfo->cb;
+    if (!DVDFastOpen(files[i].entrynum, fileInfo)) {
+      fileInfo->cb.userData = nullptr;
+      continue;
+    }
+    fileInfo->startAddr = startAddr;
+    fileInfo->length = length;
+    fileInfo->callback = callback;
+    const auto handle = fileInfo->cb.userData;
+    fileInfo->cb = cb;
+    fileInfo->cb.userData = handle;
+  }
 }
 
 BOOL DVDGetCurrentDir(char* path, u32 maxlen) {
