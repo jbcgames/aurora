@@ -423,6 +423,36 @@ void AuroraMoveMemory(const void* from, const void* to, u32 size);
 void AuroraSetSharpTextures(GXBool sharp);
 void AuroraSetPresentBackdrop(GXBool enabled);
 
+typedef u32 AuroraReadbackStream;
+
+typedef struct AuroraReadbackDest {
+  u64 key;
+  void* dest;
+  size_t size;
+  GXBool found;
+} AuroraReadbackDest;
+
+typedef struct AuroraReadbackCopySrc {
+  u64 key;
+  const void* src;
+} AuroraReadbackCopySrc;
+
+#define AURORA_READBACK_PEEK_ARGB 0
+#define AURORA_READBACK_PEEK_Z 1
+
+typedef struct AuroraReadbackPeekRequest {
+  u64 key;
+  u32 type;
+  u16 x;
+  u16 y;
+} AuroraReadbackPeekRequest;
+
+AuroraReadbackStream AuroraReadbackCreateStream(void);
+void AuroraReadbackDestroyStream(AuroraReadbackStream stream);
+GXBool AuroraReadbackCaptureCopies(AuroraReadbackStream stream, const AuroraReadbackCopySrc* srcs, u32 count);
+GXBool AuroraReadbackCapturePeeks(AuroraReadbackStream stream, const AuroraReadbackPeekRequest* peeks, u32 count);
+GXBool AuroraReadbackGet(AuroraReadbackStream stream, AuroraReadbackDest* dests, u32 count);
+
 #if __cplusplus
 }
 #endif

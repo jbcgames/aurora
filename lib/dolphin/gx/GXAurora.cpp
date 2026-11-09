@@ -202,3 +202,34 @@ void AuroraSetTextureLodBias(f32 bias) { (void)bias; }
 void AuroraSetSharpTextures(GXBool sharp) { (void)sharp; }
 void AuroraSetPresentBackdrop(GXBool enabled) { (void)enabled; }
 }
+
+extern "C" {
+AuroraReadbackStream AuroraReadbackCreateStream(void) {
+  static AuroraReadbackStream s_nextStream = 1;
+  return s_nextStream++;
+}
+
+void AuroraReadbackDestroyStream(AuroraReadbackStream stream) {
+  (void)stream;
+}
+
+GXBool AuroraReadbackCaptureCopies(AuroraReadbackStream stream, const AuroraReadbackCopySrc* srcs, u32 count) {
+  (void)stream; (void)srcs; (void)count;
+  return GX_FALSE;
+}
+
+GXBool AuroraReadbackCapturePeeks(AuroraReadbackStream stream, const AuroraReadbackPeekRequest* peeks, u32 count) {
+  (void)stream; (void)peeks; (void)count;
+  return GX_FALSE;
+}
+
+GXBool AuroraReadbackGet(AuroraReadbackStream stream, AuroraReadbackDest* dests, u32 count) {
+  (void)stream;
+  if (dests != nullptr) {
+    for (u32 i = 0; i < count; ++i) {
+      dests[i].found = GX_FALSE;
+    }
+  }
+  return GX_FALSE;
+}
+}
