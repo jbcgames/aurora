@@ -47,19 +47,38 @@ int __cntlzw(unsigned int val) {
 #endif
 }
 
+static inline u32 derive_tex_obj_id(const void* data, u16 width, u16 height, u32 format) noexcept {
+  if (data == nullptr) {
+    return next_tex_obj_id();
+  }
+  uintptr_t p = reinterpret_cast<uintptr_t>(data);
+  u32 h = static_cast<u32>(p ^ (p >> 12) ^ (p >> 24));
+  h ^= static_cast<u32>(width) | (static_cast<u32>(height) << 16);
+  h ^= (format * 0x9e3779b9u);
+  return (h == 0) ? 1 : h;
+}
+
+static inline u32 derive_tlut_obj_id(const void* data, GXTlutFmt format, u16 entries) noexcept {
+  if (data == nullptr) {
+    return next_tlut_obj_id();
+  }
+  uintptr_t p = reinterpret_cast<uintptr_t>(data);
+  u32 h = static_cast<u32>(p ^ (p >> 12) ^ (p >> 24));
+  h ^= static_cast<u32>(entries) ^ (static_cast<u32>(format) << 16);
+  return (h == 0) ? 1 : h;
+}
+
 void init_texobj_common(GXTexObj_& obj, const void* data, u16 width, u16 height, u32 format, GXTexWrapMode wrapS,
                         GXTexWrapMode wrapT, GXBool mipmap) {
-  if (obj.texObjId != 0) {
-    GX_WRITE_AURORA(GX_AURORA_DESTROY_TEXOBJ);
-    GX_WRITE_U32(obj.texObjId);
-  }
+  // Do NOT emit GX_AURORA_DESTROY_TEXOBJ here: GameCube code routinely initializes stack
+  // or reused GXTexObj structs where obj.texObjId holds garbage, causing accidental texture eviction.
   obj = {};
   obj.mWidth = width;
   obj.mHeight = height;
   obj.mFormat = format;
   obj.tlut = GX_TLUT0;
   obj.flags = 2;
-  obj.texObjId = next_tex_obj_id();
+  obj.texObjId = derive_tex_obj_id(data, width, height, format);
   obj.texDataVersion = 1;
 
   SET_REG_FIELD(0, obj.mode0, 2, 0, wrapS);
@@ -311,15 +330,12 @@ u32 GXGetTexBufferSize(u16 width, u16 height, u32 fmt, GXBool mips, u8 maxLod) {
 
 void GXInitTlutObj(GXTlutObj* obj_, const void* data, GXTlutFmt format, u16 entries) {
   auto* obj = reinterpret_cast<GXTlutObj_*>(obj_);
-  if (obj->tlutObjId != 0) {
-    GX_WRITE_AURORA(GX_AURORA_DESTROY_TLUT);
-    GX_WRITE_U32(obj->tlutObjId);
-  }
+  // Do NOT emit GX_AURORA_DESTROY_TLUT on initializers (uninitialized stack or TPL headers)
   memset(obj_, 0, sizeof(GXTlutObj));
   obj->data = data;
   obj->format = format;
   obj->numEntries = entries;
-  obj->tlutObjId = next_tlut_obj_id();
+  obj->tlutObjId = derive_tlut_obj_id(data, format, entries);
   obj->tlutDataVersion = 1;
 
   SET_REG_FIELD(0, obj->tlut, 2, 10, format);
@@ -353,7 +369,8 @@ void GXLoadTlut(const GXTlutObj* obj_, u32 idx) {
 // TODO GXInvalidateTexRegion
 
 void GXInvalidateTexAll() {
-  aurora::gx::clear_static_texture_cache();
+  // No-op: texture lifecycle and invalidation are tracked via texObjId/texDataVersion
+  // in GXInitTexObj and explicit AuroraForgetMemory/AuroraMoveMemory hooks.
 }
 
 // TODO GXPreLoadEntireTexture

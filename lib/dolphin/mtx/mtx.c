@@ -38,6 +38,68 @@ void C_MTXCopy(const Mtx src, Mtx dst) {
   }
 }
 
+#if defined(__aarch64__)
+#include <arm_neon.h>
+
+void C_MTXConcat(const Mtx a, const Mtx b, Mtx ab) {
+  const float32x4_t b0 = vld1q_f32(b[0]);
+  const float32x4_t b1 = vld1q_f32(b[1]);
+  const float32x4_t b2 = vld1q_f32(b[2]);
+
+  float32x4_t r0 = vmulq_n_f32(b0, a[0][0]);
+  r0 = vmlaq_n_f32(r0, b1, a[0][1]);
+  r0 = vmlaq_n_f32(r0, b2, a[0][2]);
+  r0 = vsetq_lane_f32(vgetq_lane_f32(r0, 3) + a[0][3], r0, 3);
+
+  float32x4_t r1 = vmulq_n_f32(b0, a[1][0]);
+  r1 = vmlaq_n_f32(r1, b1, a[1][1]);
+  r1 = vmlaq_n_f32(r1, b2, a[1][2]);
+  r1 = vsetq_lane_f32(vgetq_lane_f32(r1, 3) + a[1][3], r1, 3);
+
+  float32x4_t r2 = vmulq_n_f32(b0, a[2][0]);
+  r2 = vmlaq_n_f32(r2, b1, a[2][1]);
+  r2 = vmlaq_n_f32(r2, b2, a[2][2]);
+  r2 = vsetq_lane_f32(vgetq_lane_f32(r2, 3) + a[2][3], r2, 3);
+
+  vst1q_f32(ab[0], r0);
+  vst1q_f32(ab[1], r1);
+  vst1q_f32(ab[2], r2);
+}
+
+void C_MTXConcatArray(const Mtx a, const Mtx* srcBase, Mtx* dstBase, u32 count) {
+  const float a00 = a[0][0], a01 = a[0][1], a02 = a[0][2], a03 = a[0][3];
+  const float a10 = a[1][0], a11 = a[1][1], a12 = a[1][2], a13 = a[1][3];
+  const float a20 = a[2][0], a21 = a[2][1], a22 = a[2][2], a23 = a[2][3];
+
+  for (u32 i = 0; i < count; i++) {
+    const float32x4_t b0 = vld1q_f32((*srcBase)[0]);
+    const float32x4_t b1 = vld1q_f32((*srcBase)[1]);
+    const float32x4_t b2 = vld1q_f32((*srcBase)[2]);
+
+    float32x4_t r0 = vmulq_n_f32(b0, a00);
+    r0 = vmlaq_n_f32(r0, b1, a01);
+    r0 = vmlaq_n_f32(r0, b2, a02);
+    r0 = vsetq_lane_f32(vgetq_lane_f32(r0, 3) + a03, r0, 3);
+
+    float32x4_t r1 = vmulq_n_f32(b0, a10);
+    r1 = vmlaq_n_f32(r1, b1, a11);
+    r1 = vmlaq_n_f32(r1, b2, a12);
+    r1 = vsetq_lane_f32(vgetq_lane_f32(r1, 3) + a13, r1, 3);
+
+    float32x4_t r2 = vmulq_n_f32(b0, a20);
+    r2 = vmlaq_n_f32(r2, b1, a21);
+    r2 = vmlaq_n_f32(r2, b2, a22);
+    r2 = vsetq_lane_f32(vgetq_lane_f32(r2, 3) + a23, r2, 3);
+
+    vst1q_f32((*dstBase)[0], r0);
+    vst1q_f32((*dstBase)[1], r1);
+    vst1q_f32((*dstBase)[2], r2);
+
+    srcBase++;
+    dstBase++;
+  }
+}
+#else
 void C_MTXConcat(const Mtx a, const Mtx b, Mtx ab) {
   Mtx mTmp;
   MtxPtr m;
@@ -86,6 +148,7 @@ void C_MTXConcatArray(const Mtx a, const Mtx* srcBase, Mtx* dstBase, u32 count) 
     dstBase++;
   }
 }
+#endif
 
 void C_MTXTranspose(const Mtx src, Mtx xPose) {
   Mtx mTmp;

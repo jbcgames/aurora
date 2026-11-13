@@ -403,16 +403,22 @@ static std::string tev_op(GXTevOp op, std::string_view bias, std::string_view sc
         a, b, c, zero, d);
   }
   case GX_TEV_COMP_RGB8_GT:
-    return fmt::format("((round({0} * 255.0) > round({1} * 255.0)) ? {2} : {3}) + {4}", a, b, c, zero, d);
+    if (isAlpha) {
+      return fmt::format("((round({0} * 255.0) > round({1} * 255.0)) ? {2} : {3}) + {4}", a, b, c, zero, d);
+    }
+    return fmt::format("(mix({3}, {2}, greaterThan(round({0} * 255.0), round({1} * 255.0))) + {4})", a, b, c, zero, d);
   case GX_TEV_COMP_RGB8_EQ:
-    return fmt::format("((round({0} * 255.0) == round({1} * 255.0)) ? {2} : {3}) + {4}", a, b, c, zero, d);
+    if (isAlpha) {
+      return fmt::format("((round({0} * 255.0) == round({1} * 255.0)) ? {2} : {3}) + {4}", a, b, c, zero, d);
+    }
+    return fmt::format("(mix({3}, {2}, equal(round({0} * 255.0), round({1} * 255.0))) + {4})", a, b, c, zero, d);
   }
 }
 
 static std::string tev_color_op(GXTevOp op, std::string_view bias, std::string_view scale, bool clamp,
                                 std::string_view a, std::string_view b, std::string_view c, std::string_view d) {
   const auto overflow = [](std::string_view reg) { return fmt::format("tev_overflow_vec3f({})", reg); };
-  std::string expr = tev_op(op, bias, scale, overflow(a), overflow(b), overflow(c), d, "vec3(0)"sv);
+  std::string expr = tev_op(op, bias, scale, overflow(a), overflow(b), overflow(c), d, "vec3(0.0)"sv);
   return clamp ? fmt::format("clamp({}, vec3f(0.0), vec3f(1.0))", expr)
                : fmt::format("clamp({}, vec3f(-4.0), vec3f(4.0))", expr);
 }
@@ -931,7 +937,9 @@ GlslProgram emit_glsl(const ShaderConfig& config, const ShaderInfo& info) {
   }
 
   // ---- Vertex transform ----
-  if (config.attrs[GX_VA_PNMTXIDX].attrType == GX_NONE) {
+  if (!info.usesMultiPnMtx) {
+    vsBody += "\n    uint in_pnmtxidx = 0u;";
+  } else if (config.attrs[GX_VA_PNMTXIDX].attrType == GX_NONE) {
     vsBody += "\n    uint in_pnmtxidx = ubuf.current_pnmtx;";
   }
   vsBody += fmt::format(
@@ -960,10 +968,12 @@ GlslProgram emit_glsl(const ShaderConfig& config, const ShaderInfo& info) {
       "\n    vec3 in_binrm = cross(v_nrm_val, in_tangent);",
       vtx_attr(config, GX_VA_NRM));
 
+  const u32 pnMtxSlots = info.usesMultiPnMtx ? MaxPnMtx : 1;
+  const u32 texMtxSlots = info.usesTexMtx ? MaxTexMtx : 0;
   uniformFields += "\n    mat4 proj;";
-  uniformFields += fmt::format("\n    mat3x4 postex_mtx[{}];", MaxPnMtx + MaxTexMtx);
+  uniformFields += fmt::format("\n    mat3x4 postex_mtx[{}];", pnMtxSlots + texMtxSlots);
   if (info.usesNormals) {
-    uniformFields += fmt::format("\n    mat3x4 nrm_mtx[{}];", MaxPnMtx);
+    uniformFields += fmt::format("\n    mat3x4 nrm_mtx[{}];", pnMtxSlots);
   }
 
   // ---- TEV register writes (fragment) ----
@@ -1114,7 +1124,8 @@ GlslProgram emit_glsl(const ShaderConfig& config, const ShaderInfo& info) {
       } else if (tcg.mtx == GX_IDENTITY) {
         vsBody += fmt::format("\n    vec3 tc{0}_tmp = tc{0}.xyz;", i);
       } else {
-        const u32 texMtxIdx = tcg.mtx >= GX_TEXMTX0 ? MaxPnMtx + (tcg.mtx - GX_TEXMTX0) / 3 : tcg.mtx / 3;
+        const u32 pnMtxSlots = info.usesMultiPnMtx ? MaxPnMtx : 1;
+        const u32 texMtxIdx = tcg.mtx >= GX_TEXMTX0 ? pnMtxSlots + (tcg.mtx - GX_TEXMTX0) / 3 : tcg.mtx / 3;
         vsBody += fmt::format("\n    vec3 tc{0}_tmp = tc{0} * ubuf.postex_mtx[{1}];", i, texMtxIdx);
       }
       if (tcg.type == GX_TG_MTX2x4) {
@@ -1393,7 +1404,9 @@ GlslProgram emit_glsl(const ShaderConfig& config, const ShaderInfo& info) {
     }
     fsBody += "\n    prev = vec4(mix(prev.rgb, ubuf.fog.color.rgb, clamp(fogZ, 0.0, 1.0)), prev.a);";
   }
-  uniformFields += fmt::format("\n    vec4 texcoord_scale[{}];", MaxTexCoord);
+  if (info.sampledTexCoords.any()) {
+    uniformFields += fmt::format("\n    vec4 texcoord_scale[{}];", MaxTexCoord);
+  }
   if (info.usedIndTexMtxs.any()) {
     uniformFields += "\n    mat2x4 ind_mtx[3];";
   }

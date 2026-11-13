@@ -66,7 +66,7 @@ extern DVDLowCallback s_resetCoverCallback;
 extern bool s_initialized;
 extern bool s_overlayCallbacksSet;
 extern AuroraOverlayCallbacks s_overlayCallbacks;
-extern std::mutex s_fstLock;
+extern std::recursive_mutex s_fstLock;
 
 bool rebuildFST();
 bool nameEqualsIgnoreCase(std::string_view lhs, std::string_view rhs);

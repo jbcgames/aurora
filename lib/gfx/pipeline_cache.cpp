@@ -460,19 +460,26 @@ static void notify_pipeline_ready(bool queued) {
 }
 
 static PipelineRef g_lastPipelineRef = std::numeric_limits<PipelineRef>::max();
+static bool g_lastPipelineReady = false;
+static uint32_t g_pipelineCacheGeneration = 1;
 
 template <typename PipelineConfig>
 static PipelineRef find_pipeline_impl(ShaderType type, const PipelineConfig& config, NewPipelineCallback&& cb,
                                       PipelinePriority priority = PipelinePriority::Normal,
-                                      std::optional<uint32_t> firstFrameUsedOverride = std::nullopt) {
+                                      std::optional<uint32_t> firstFrameUsedOverride = std::nullopt,
+                                      bool* outReady = nullptr) {
   ZoneScoped;
 
   const PipelineRef hash = xxh3_hash(config, static_cast<HashType>(type));
   const bool blocking = priority == PipelinePriority::Blocking;
   if (!blocking && hash == g_lastPipelineRef) {
+    if (outReady != nullptr) {
+      *outReady = g_lastPipelineReady;
+    }
     return g_lastPipelineRef;
   }
   g_lastPipelineRef = hash;
+  g_lastPipelineReady = false;
   const uint32_t firstFrameUsed = firstFrameUsedOverride.value_or(current_frame());
   bool notifyWorker = false;
   bool persist = priority != PipelinePriority::Background;
@@ -599,8 +606,13 @@ static PipelineRef find_pipeline_impl(ShaderType type, const PipelineConfig& con
     }
   }
 
+  const bool steadyReady = pipelineReady && !cacheWrite;
+  g_lastPipelineReady = steadyReady;
   if (cacheWrite) {
     enqueue_pipeline_cache_write(std::move(*cacheWrite));
+  }
+  if (outReady != nullptr) {
+    *outReady = steadyReady;
   }
 
   return hash;
@@ -1217,6 +1229,13 @@ PipelineRef find_pipeline(ShaderType type, const gx::PipelineConfig& config, New
   return find_pipeline_impl(type, config, std::move(cb));
 }
 
+PipelineRef find_pipeline_status(ShaderType type, const gx::PipelineConfig& config, NewPipelineCallback&& cb,
+                                 bool& outReady) {
+  return find_pipeline_impl(type, config, std::move(cb), PipelinePriority::Normal, std::nullopt, &outReady);
+}
+
+uint32_t pipeline_cache_generation() noexcept { return g_pipelineCacheGeneration; }
+
 #ifdef AURORA_ENABLE_RMLUI
 template <>
 PipelineRef find_pipeline(ShaderType type, const rmlui::PipelineConfig& config, NewPipelineCallback&& cb) {
@@ -1268,6 +1287,9 @@ void shutdown_pipeline_cache() {
   g_pipelineQueue.clear();
   g_backgroundPipelineQueue.clear();
   g_pendingPipelines.clear();
+  g_lastPipelineRef = std::numeric_limits<PipelineRef>::max();
+  g_lastPipelineReady = false;
+  ++g_pipelineCacheGeneration;
 
   queuedPipelines = 0;
   createdPipelines = 0;

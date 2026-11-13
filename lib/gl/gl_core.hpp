@@ -437,6 +437,8 @@ struct GlProcTable {
   void (*DrawElements)(GLenum, GLsizei, GLenum, const void*) = nullptr;
   void (*DrawArraysInstanced)(GLenum, GLint, GLsizei, GLsizei) = nullptr;
   void (*DrawElementsInstanced)(GLenum, GLsizei, GLenum, const void*, GLsizei) = nullptr;
+  void (*DrawElementsBaseVertex)(GLenum, GLsizei, GLenum, const void*, GLint) = nullptr;
+  void (*DrawElementsInstancedBaseVertex)(GLenum, GLsizei, GLenum, const void*, GLsizei, GLint) = nullptr;
 
   // Sync / query
   GLsync (*FenceSync)(GLenum, GLbitfield) = nullptr;

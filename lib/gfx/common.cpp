@@ -136,8 +136,8 @@ constexpr DrawTypeId make_draw_type_id(uint32_t index, uint32_t generation) {
   return static_cast<DrawTypeId>(generation) << 32 | index;
 }
 
-constexpr uint32_t BindGroupCacheRetainFrames = 32;
-constexpr uint32_t BindGroupCacheSweepPeriod = 16;
+constexpr uint32_t BindGroupCacheRetainFrames = 256;
+constexpr uint32_t BindGroupCacheSweepPeriod = 64;
 } // namespace
 
 static absl::flat_hash_map<BindGroupRef, CachedBindGroup> g_cachedBindGroups;
@@ -198,6 +198,10 @@ struct FrameBufferSet {
   gl::GLsync fence = nullptr; // GPU-done marker for this set's last frame; waited before reuse
 };
 static std::array<FrameBufferSet, FrameSlotCount> g_frameBufferSets;
+static WorkerFrameTimings g_workerAccum;
+static WorkerFrameTimings g_lastWorkerTimings;
+static std::chrono::steady_clock::time_point g_workerLastEndDone{};
+static const bool s_logWorkerTimings = std::getenv("TTYD_TIMING_LOG") != nullptr;
 
 // Point the active per-frame ring aliases at slot `slot`'s owned buffer set. Worker thread only.
 static void select_frame_buffers(size_t slot) {
@@ -237,8 +241,12 @@ static void wait_frame_buffer_fence(size_t slot) {
 // unique mesh (by content hash) and referenced every subsequent frame.
 gl::Buffer g_nativeVertexCacheBuffer;
 gl::Buffer g_nativeIndexCacheBuffer;
-static constexpr uint64_t NativeGeomVertexCacheSize = 4ull * 1024 * 1024;
-static constexpr uint64_t NativeGeomIndexCacheSize = 1ull * 1024 * 1024;
+static constexpr uint64_t NativeGeomVertexCacheSize = 32ull * 1024 * 1024;
+static constexpr uint64_t NativeGeomIndexCacheSize = 8ull * 1024 * 1024;
+
+extern "C" void aurora_reset_geom_cache() {
+  request_native_geometry_cache_reset();
+}
 // Bump-allocator cursors; on exhaustion the whole cache is reset (deferred to a frame
 // boundary). The generation counter bumps on each reset so CPU-side content maps can
 // drop entries that point at now-recycled ranges.
@@ -1303,6 +1311,13 @@ PipelineRef pipeline_ref(const gx::PipelineConfig& config) {
   return find_pipeline(ShaderType::GX, config, [=] { return create_pipeline(config); });
 }
 
+template <>
+PipelineRef pipeline_ref_status(const gx::PipelineConfig& config, bool& outReady) {
+  return find_pipeline_status(ShaderType::GX, config, [=] { return create_pipeline(config); }, outReady);
+}
+
+uint32_t pipeline_cache_gen() noexcept { return pipeline_cache_generation(); }
+
 #ifdef AURORA_ENABLE_RMLUI
 template <>
 PipelineRef pipeline_ref(const rmlui::PipelineConfig& config) {
@@ -1342,11 +1357,12 @@ void initialize() {
     }
     select_frame_buffers(0);
     // The storage-fetch path is dead (native vertex fetch only); no g_storageBuffer.
-    // Native geom cache is a single shared buffer (all frames read the same hashed offsets, so it
-    // cannot be double-buffered) and is only ever appended at fresh offsets, so it stays on the
-    // glBufferSubData path -- no persistent-map reuse hazard to fence.
-    g_nativeVertexCacheBuffer = gl::create_buffer(gl::GL_ARRAY_BUFFER, NativeGeomVertexCacheSize, true);
-    g_nativeIndexCacheBuffer = gl::create_buffer(gl::GL_ELEMENT_ARRAY_BUFFER, NativeGeomIndexCacheSize, true);
+    // Native geom cache is a single shared buffer (all frames read the same hashed offsets) and is
+    // only ever appended at monotonically increasing offsets until a synchronized cache reset.
+    // Keep it persistent-coherent mapped so uploads are zero-copy memcpy without glBufferSubData
+    // triggering full-buffer implicit GPU pipeline stalls on Mali.
+    g_nativeVertexCacheBuffer = gl::create_buffer(gl::GL_ARRAY_BUFFER, NativeGeomVertexCacheSize, true, /*persistent=*/true);
+    g_nativeIndexCacheBuffer = gl::create_buffer(gl::GL_ELEMENT_ARRAY_BUFFER, NativeGeomIndexCacheSize, true, /*persistent=*/true);
     clear::init_program();
     webgpu::create_frame_targets();
   });
@@ -1467,9 +1483,13 @@ bool begin_frame() {
   g_passSnapshotPools[frameSlot].used = 0;
 
   if (s_nativeGeomCacheResetPending) {
-    // Deferred cache reset: every frame that referenced the old cached ranges has already
-    // been submitted; recycling the cache regions from offset 0 cannot race the GPU's reads
-    // of the old contents. Bump the generation so CPU-side content maps drop stale entries.
+    // Wait for all in-flight frame slots on the GPU before recycling persistent cache offsets from 0.
+    render_worker::enqueue_work([] {
+      for (size_t i = 0; i < FrameSlotCount; ++i) {
+        wait_frame_buffer_fence(i);
+      }
+    });
+    render_worker::synchronize();
     s_nativeGeomCacheResetPending = false;
     s_nativeVertexCacheOffset = 0;
     s_nativeIndexCacheOffset = 0;
@@ -1497,11 +1517,30 @@ bool begin_frame() {
   push_command(CommandType::SetViewport, Command::Data{.setViewport = g_cachedViewport});
   push_command(CommandType::SetScissor, Command::Data{.setScissor = g_cachedScissor});
   begin_pipeline_frame();
-  render_worker::enqueue_begin_frame(frame.frameId, [frameSlot] {
+  static const bool s_logWorker = std::getenv("TTYD_TIMING_LOG") != nullptr;
+  render_worker::enqueue_begin_frame(frame.frameId, [frameSlot, fid = frame.frameId] {
     // Reusing this slot's persistent ring buffers: wait until the GPU finished the frame that last
     // used them before the worker starts memcpy'ing new data into the coherent mapping (immutable
     // storage has no implicit orphaning). Then make this slot's set the active ring for the frame.
+    const auto t0 = s_logWorker ? PresentClock::now() : PresentClock::time_point{};
+    if (s_logWorker && g_workerLastEndDone.time_since_epoch().count() != 0) {
+      g_workerAccum.gapBeforeBeginMs = std::chrono::duration<double, std::milli>(t0 - g_workerLastEndDone).count();
+    } else {
+      g_workerAccum.gapBeforeBeginMs = 0.0;
+    }
     wait_frame_buffer_fence(frameSlot);
+    if (s_logWorker) {
+      g_workerAccum.fbWaitMs = std::chrono::duration<double, std::milli>(PresentClock::now() - t0).count();
+      g_workerAccum.opsUploadMs = 0.0;
+      g_workerAccum.opsRenderMs = 0.0;
+      g_workerAccum.endQWaitMs = 0.0;
+      g_workerAccum.preCbMs = 0.0;
+      g_workerAccum.endCbMs = 0.0;
+      g_workerAccum.endFenceMs = 0.0;
+      g_workerAccum.frameId = fid;
+      g_workerAccum.opCount = 0;
+      g_workerAccum.drawCount = 0;
+    }
     select_frame_buffers(frameSlot);
     webgpu::gpu_prof::frame_begin();
   });
@@ -1577,8 +1616,10 @@ void end_frame(EndFrameCallback callback) {
   // Snapshot the GL textures whose last handle dropped during this frame's record.
   // They are destroyed inside the end-of-frame item below -- FIFO-after every pass
   // that could still reference their raw ids (see ~TextureRef).
-  render_worker::enqueue_end_frame(frameId, [frameSlot, callback = std::move(callback),
+  const auto t_endEnq = s_logWorkerTimings ? PresentClock::now() : PresentClock::time_point{};
+  render_worker::enqueue_end_frame(frameId, [frameSlot, t_endEnq, callback = std::move(callback),
                                              deferredDestroys = take_deferred_texture_destroys()]() mutable {
+    const auto t_endStart = s_logWorkerTimings ? PresentClock::now() : PresentClock::time_point{};
     for (auto& tex : deferredDestroys) {
       gl::destroy_texture(tex);
     }
@@ -1600,9 +1641,11 @@ void end_frame(EndFrameCallback callback) {
     g_stats.lastTextureUploadSize = stats.lastTextureUploadSize;
     // GL present: aurora's command list already sequenced the frame; there is no command
     // buffer to submit. The callback (aurora.cpp) issues the present GL and swaps.
+    const auto tcb0 = s_logWorkerTimings ? PresentClock::now() : PresentClock::time_point{};
     if (callback) {
       callback();
     }
+    const auto tcb1 = s_logWorkerTimings ? PresentClock::now() : PresentClock::time_point{};
     // Fence this slot's persistent buffer set: it stays "busy" until the GPU finishes everything
     // issued this frame (its GX draws read the vertex/uniform/index mappings). The next frame that
     // reuses this slot waits this fence before overwriting the mappings (see wait_frame_buffer_fence).
@@ -1614,13 +1657,27 @@ void end_frame(EndFrameCallback callback) {
       }
       set.fence = gl::gl.FenceSync(gl::GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
     }
+    const auto tcb2 = s_logWorkerTimings ? PresentClock::now() : PresentClock::time_point{};
     g_frameSlots.release(frameSlot);
     expire_cached_bind_groups();
     process_events();
+    if (s_logWorkerTimings) {
+      const auto tcb3 = PresentClock::now();
+      g_workerAccum.endQWaitMs = std::chrono::duration<double, std::milli>(t_endStart - t_endEnq).count();
+      g_workerAccum.preCbMs = std::chrono::duration<double, std::milli>(tcb0 - t_endStart).count();
+      g_workerAccum.endCbMs = std::chrono::duration<double, std::milli>(tcb1 - tcb0).count();
+      g_workerAccum.endFenceMs = std::chrono::duration<double, std::milli>(tcb2 - tcb1).count();
+      g_workerAccum.postCbMs = std::chrono::duration<double, std::milli>(tcb3 - tcb2).count();
+      g_workerAccum.drawCount = stats.drawCallCount;
+      g_lastWorkerTimings = g_workerAccum;
+      g_workerLastEndDone = tcb3;
+    }
   });
 }
 
 uint32_t current_frame() noexcept { return g_frameIndex; }
+
+WorkerFrameTimings last_worker_timings() noexcept { return g_lastWorkerTimings; }
 
 static void expire_cached_bind_groups() {
   std::lock_guard lock{g_bindGroupCacheMutex};
@@ -1722,7 +1779,9 @@ static void blit_texture_region(const gl::Texture& src, gl::Origin3D srcOrigin, 
 }
 
 static void encode_op(FramePacket& frame, const FrameOp& op) {
+  const auto t0 = s_logWorkerTimings ? PresentClock::now() : PresentClock::time_point{};
   upload_op_data(frame, op);
+  const auto t1 = s_logWorkerTimings ? PresentClock::now() : PresentClock::time_point{};
   switch (op.type) {
   case FrameOpType::RenderPass:
     if (op.renderPass != nullptr) {
@@ -1740,6 +1799,12 @@ static void encode_op(FramePacket& frame, const FrameOp& op) {
       execute_encoder_task(*op.encoderTask);
     }
     break;
+  }
+  if (s_logWorkerTimings) {
+    const auto t2 = PresentClock::now();
+    g_workerAccum.opsUploadMs += std::chrono::duration<double, std::milli>(t1 - t0).count();
+    g_workerAccum.opsRenderMs += std::chrono::duration<double, std::milli>(t2 - t1).count();
+    ++g_workerAccum.opCount;
   }
 }
 
@@ -2068,10 +2133,21 @@ bool bind_pipeline(PipelineRef ref, gl::PassEncoder& pass) {
   return true;
 }
 
+static inline size_t align_up_any(size_t value, size_t alignment) noexcept {
+  if (alignment <= 1) {
+    return value;
+  }
+  if ((alignment & (alignment - 1)) == 0) {
+    return AURORA_ALIGN(value, alignment);
+  }
+  const size_t rem = value % alignment;
+  return rem == 0 ? value : value + (alignment - rem);
+}
+
 static Range push(ByteBuffer& target, const uint8_t* data, size_t length, size_t alignment) {
-  if (alignment != 0) {
+  if (alignment > 1) {
     const size_t begin = target.size();
-    const size_t alignedBegin = AURORA_ALIGN(begin, alignment);
+    const size_t alignedBegin = align_up_any(begin, alignment);
     if (alignedBegin > begin) {
       target.append_zeroes(alignedBegin - begin);
     }
@@ -2134,14 +2210,21 @@ static bool ensure_native_geom_cache_buffers() {
 // Bump-allocate `length` bytes from a persistent cache buffer and upload the data on the
 // render worker (FIFO-ordered after prior submits, so it never races a prior frame's reads).
 static std::pair<Range, bool> push_native_cached(const gl::Buffer& buffer, uint32_t& cursor, uint64_t limit,
-                                                 const uint8_t* data, size_t length) {
-  const uint32_t offset = static_cast<uint32_t>(AURORA_ALIGN(cursor, 4));
+                                                 const uint8_t* data, size_t length, size_t alignment) {
+  const uint32_t offset = static_cast<uint32_t>(align_up_any(cursor, alignment));
   const size_t alignedSize = AURORA_ALIGN(length, 4);
   if (static_cast<uint64_t>(offset) + alignedSize > limit) {
     return {{}, false};
   }
-  // The GL upload must run on the render worker (it owns the context). The copy keeps the
-  // data alive until the worker executes the glBufferSubData.
+  if (buffer.mapped != nullptr) {
+    if (length > 0) {
+      std::memcpy(static_cast<uint8_t*>(buffer.mapped) + offset, data, length);
+      std::atomic_thread_fence(std::memory_order_release);
+    }
+    cursor = offset + static_cast<uint32_t>(alignedSize);
+    return {Range{offset, static_cast<uint32_t>(length)}, true};
+  }
+  // Fallback when GL_EXT_buffer_storage is unavailable: glBufferSubData must run on the worker.
   std::vector<uint8_t> copy(alignedSize);
   memcpy(copy.data(), data, length);
   render_worker::enqueue_work(
@@ -2150,19 +2233,39 @@ static std::pair<Range, bool> push_native_cached(const gl::Buffer& buffer, uint3
   return {Range{offset, static_cast<uint32_t>(length)}, true};
 }
 
-std::pair<Range, bool> push_native_cached_verts(const uint8_t* data, size_t length) {
+bool can_push_native_cached(size_t vertBytes, size_t idxBytes, size_t vertAlignment) noexcept {
+  if (!ensure_native_geom_cache_buffers()) {
+    return false;
+  }
+  const uint32_t vOffset = static_cast<uint32_t>(align_up_any(s_nativeVertexCacheOffset, vertAlignment));
+  const size_t vAligned = AURORA_ALIGN(vertBytes, 4);
+  if (static_cast<uint64_t>(vOffset) + vAligned > NativeGeomVertexCacheSize) {
+    return false;
+  }
+  if (idxBytes > 0) {
+    const uint32_t iOffset = static_cast<uint32_t>(AURORA_ALIGN(s_nativeIndexCacheOffset, 4));
+    const size_t iAligned = AURORA_ALIGN(idxBytes, 4);
+    if (static_cast<uint64_t>(iOffset) + iAligned > NativeGeomIndexCacheSize) {
+      return false;
+    }
+  }
+  return true;
+}
+
+std::pair<Range, bool> push_native_cached_verts(const uint8_t* data, size_t length, size_t alignment) {
   if (!ensure_native_geom_cache_buffers()) {
     return {{}, false};
   }
   return push_native_cached(g_nativeVertexCacheBuffer, s_nativeVertexCacheOffset, NativeGeomVertexCacheSize, data,
-                            length);
+                            length, alignment);
 }
 
 std::pair<Range, bool> push_native_cached_indices(const uint8_t* data, size_t length) {
   if (!ensure_native_geom_cache_buffers()) {
     return {{}, false};
   }
-  return push_native_cached(g_nativeIndexCacheBuffer, s_nativeIndexCacheOffset, NativeGeomIndexCacheSize, data, length);
+  return push_native_cached(g_nativeIndexCacheBuffer, s_nativeIndexCacheOffset, NativeGeomIndexCacheSize, data, length,
+                            4);
 }
 
 void request_native_geometry_cache_reset() noexcept { s_nativeGeomCacheResetPending = true; }
@@ -2174,6 +2277,14 @@ Range push_uniform(const uint8_t* data, size_t length) {
     return {};
   }
   return push(current_frame_packet().uniforms, data, length, webgpu::g_uniformBufferOffsetAlignment);
+}
+
+const uint8_t* uniform_data_at(uint32_t offset) noexcept {
+  if (g_recordingFrame == nullptr) {
+    return nullptr;
+  }
+  const auto& uniforms = current_frame_packet().uniforms;
+  return offset < uniforms.size() ? uniforms.data() + offset : nullptr;
 }
 
 Range push_storage(const uint8_t* data, size_t length) {
@@ -2225,7 +2336,10 @@ const gl::BindingSet& find_bind_group(BindGroupRef id) {
 
   std::lock_guard lock{g_bindGroupCacheMutex};
   const auto it = g_cachedBindGroups.find(id);
-  CHECK(it != g_cachedBindGroups.end(), "get_bind_group: failed to locate {:x}", id);
+  if (it == g_cachedBindGroups.end()) UNLIKELY {
+    static const gl::BindingSet kEmptyBindingSet{};
+    return kEmptyBindingSet;
+  }
   s_fastBindGroups[slot].id = id;
   s_fastBindGroups[slot].set = it->second.bindGroup;
   return s_fastBindGroups[slot].set;

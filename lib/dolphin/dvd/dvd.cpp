@@ -7,6 +7,13 @@
 #include <SDL3/SDL_iostream.h>
 #include <tracy/Tracy.hpp>
 
+#if defined(__linux__)
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <cerrno>
+#endif
+
 #include <atomic>
 #include <condition_variable>
 #include <cstddef>
@@ -28,6 +35,8 @@
 
 using namespace aurora::dvd::impl;
 
+extern "C" BOOL portThreadIsMain(void);
+
 namespace aurora::dvd::impl {
   NodHandle* s_partition = nullptr;
   std::vector<FSTEntry> s_fstEntries;
@@ -45,7 +54,7 @@ namespace aurora::dvd::impl {
   bool s_initialized = false;
   bool s_overlayCallbacksSet = false;
   AuroraOverlayCallbacks s_overlayCallbacks;
-  std::mutex s_fstLock;
+  std::recursive_mutex s_fstLock;
   struct OpenFile {
     void* handle;
     s32 entrynum;
@@ -128,6 +137,51 @@ bool isValidFstIndex(FstIndex entry) {
 bool isAligned(const void* addr, uintptr_t align) {
   return (reinterpret_cast<uintptr_t>(addr) & (align - 1)) == 0;
 }
+
+#if defined(__linux__)
+struct LinuxFileStream {
+  int fd = -1;
+  int64_t size = 0;
+};
+
+static int64_t linuxStreamReadAt(void* userData, uint64_t offset, void* out, size_t len) {
+  auto* fs = static_cast<LinuxFileStream*>(userData);
+  if (fs == nullptr || fs->fd < 0 || out == nullptr) {
+    return -1;
+  }
+  size_t total = 0;
+  auto* dst = static_cast<uint8_t*>(out);
+  while (total < len) {
+    const ssize_t n = pread64(fs->fd, dst + total, len - total, static_cast<off64_t>(offset + total));
+    if (n < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      return -1;
+    }
+    if (n == 0) {
+      break;
+    }
+    total += static_cast<size_t>(n);
+  }
+  return static_cast<int64_t>(total);
+}
+
+static int64_t linuxStreamLen(void* userData) {
+  auto* fs = static_cast<LinuxFileStream*>(userData);
+  return (fs != nullptr) ? fs->size : -1;
+}
+
+static void linuxStreamClose(void* userData) {
+  auto* fs = static_cast<LinuxFileStream*>(userData);
+  if (fs != nullptr) {
+    if (fs->fd >= 0) {
+      close(fs->fd);
+    }
+    delete fs;
+  }
+}
+#endif
 
 int64_t sdlStreamReadAt(void* userData, uint64_t offset, void* out, size_t len) {
   auto* io = static_cast<SDL_IOStream*>(userData);
@@ -324,8 +378,12 @@ bool isCommandBlockIdle(const DVDCommandBlock* block) {
 }
 
 CommandDataBase* getCommandHandle(DVDCommandBlock* block) {
-  if (block != nullptr && block->userData != nullptr) {
-    return static_cast<CommandDataBase*>(block->userData);
+  if (block != nullptr) {
+    std::lock_guard lock(s_fstLock);
+    auto it = s_openFiles.find(reinterpret_cast<DVDFileInfo*>(block));
+    if (it != s_openFiles.end() && it->second.handle != nullptr) {
+      return static_cast<CommandDataBase*>(it->second.handle);
+    }
   }
   return s_disc;
 }
@@ -490,19 +548,42 @@ public:
     if (std::this_thread::get_id() == m_thread.get_id()) {
       return;
     }
-    std::unique_lock lk{m_mutex};
-    m_doneCv.wait(lk, [&] { return !m_running || (m_queue.empty() && m_activeBlock == nullptr); });
+    while (true) {
+      {
+        std::unique_lock lk{m_mutex};
+        if (!m_running || (m_queue.empty() && m_activeBlock == nullptr)) {
+          return;
+        }
+        if (portThreadIsMain()) {
+          m_doneCv.wait_for(lk, std::chrono::milliseconds{1}, [&] {
+            return !m_running || (m_queue.empty() && m_activeBlock == nullptr);
+          });
+          continue;
+        }
+      }
+      OSYieldThread();
+    }
   }
 
   void wait(const DVDCommandBlock* block) {
-    if (block == nullptr) {
+    if (block == nullptr || std::this_thread::get_id() == m_thread.get_id()) {
       return;
     }
-    std::unique_lock lk{m_mutex};
-    m_doneCv.wait(lk, [&] {
+    while (true) {
       const s32 state = atomic_load_acquire(block->state);
-      return !m_running || (m_activeBlock != block && state != DVD_STATE_BUSY && state != DVD_STATE_WAITING);
-    });
+      if (!m_running || (m_activeBlock != block && state != DVD_STATE_BUSY && state != DVD_STATE_WAITING)) {
+        return;
+      }
+      if (!portThreadIsMain()) {
+        OSYieldThread();
+      } else {
+        std::unique_lock lk{m_mutex};
+        m_doneCv.wait_for(lk, std::chrono::milliseconds{1}, [&] {
+          const s32 st = atomic_load_acquire(block->state);
+          return !m_running || (m_activeBlock != block && st != DVD_STATE_BUSY && st != DVD_STATE_WAITING);
+        });
+      }
+    }
   }
 
 private:
@@ -669,6 +750,64 @@ bool aurora_dvd_open(const char* disc_path) {
 
   s_worker.stop();
   clearState();
+
+#if defined(__linux__)
+  int fd = open(disc_path, O_RDONLY | O_CLOEXEC);
+  if (fd >= 0) {
+    struct stat st{};
+    if (fstat(fd, &st) == 0) {
+      posix_fadvise(fd, 0, 0, POSIX_FADV_WILLNEED);
+      auto* fs = new LinuxFileStream{fd, static_cast<int64_t>(st.st_size)};
+      const NodDiscStream stream{
+          .user_data = fs,
+          .read_at = linuxStreamReadAt,
+          .stream_len = linuxStreamLen,
+          .close = linuxStreamClose,
+      };
+      const NodDiscOptions options{
+          .preloader_threads = 0,
+      };
+
+      NodHandle* discHandle = nullptr;
+      NodResult result = nod_disc_open_stream(&stream, &options, &discHandle);
+      if (result != NOD_RESULT_OK || discHandle == nullptr) {
+        clearState();
+        return false;
+      }
+
+      s_disc = new CommandDataNod(discHandle);
+
+      result = nod_disc_open_partition_kind(s_disc->handle, NOD_PARTITION_KIND_DATA, nullptr, &s_partition);
+      if (result != NOD_RESULT_OK || s_partition == nullptr) {
+        clearState();
+        return false;
+      }
+
+      NodDiscHeader header{};
+      if (nod_disc_header(s_disc->handle, &header) == NOD_RESULT_OK) {
+        std::memcpy(s_diskID.gameName, header.game_id, sizeof(s_diskID.gameName));
+        std::memcpy(s_diskID.company, header.game_id + sizeof(s_diskID.gameName), sizeof(s_diskID.company));
+        s_diskID.diskNumber = header.disc_num;
+        s_diskID.gameVersion = header.disc_version;
+        s_diskID.streaming = header.audio_streaming;
+        s_diskID.streamingBufSize = header.audio_stream_buf_size;
+
+        std::memcpy(aurora::g_gameName, s_diskID.gameName, sizeof(s_diskID.gameName));
+      }
+
+      if (!rebuildFST()) {
+        clearState();
+        return false;
+      }
+
+      s_worker.start();
+      s_initialized = true;
+      return true;
+    } else {
+      close(fd);
+    }
+  }
+#endif
 
   SDL_IOStream* io = SDL_IOFromFile(disc_path, "rb");
   if (io == nullptr) {
@@ -1095,13 +1234,14 @@ BOOL DVDFastOpen(s32 entrynum, DVDFileInfo* fileInfo) {
   fileInfo->startAddr = 0;
   fileInfo->length = entry.nextOrLength;
 
+  void* cmdHandle = nullptr;
   if (entry.isOverlay) {
     const auto handle = s_overlayCallbacks.open(entry.overlayData);
     if (!handle) {
       return FALSE;
     }
 
-    fileInfo->cb.userData = new CommandDataOverlay(handle);
+    cmdHandle = new CommandDataOverlay(handle);
   } else {
     NodHandle* handle = nullptr;
     NodResult result = nod_partition_open_file(s_partition, entry.origEntryNum, &handle);
@@ -1109,13 +1249,10 @@ BOOL DVDFastOpen(s32 entrynum, DVDFileInfo* fileInfo) {
       return FALSE;
     }
 
-    fileInfo->cb.userData = new CommandDataNod(handle);
+    cmdHandle = new CommandDataNod(handle);
   }
 
-  {
-    std::lock_guard lock(s_fstLock);
-    s_openFiles[fileInfo] = {fileInfo->cb.userData, entrynum};
-  }
+  s_openFiles[fileInfo] = {cmdHandle, entrynum};
   atomic_store_release(fileInfo->cb.state, DVD_STATE_END);
   return TRUE;
 }
@@ -1133,13 +1270,17 @@ BOOL DVDClose(DVDFileInfo* fileInfo) {
     return FALSE;
   }
   s_worker.drain_command(&fileInfo->cb);
+  CommandDataBase* handleToDelete = nullptr;
   {
     std::lock_guard lock(s_fstLock);
-    s_openFiles.erase(fileInfo);
+    auto it = s_openFiles.find(fileInfo);
+    if (it != s_openFiles.end()) {
+      handleToDelete = static_cast<CommandDataBase*>(it->second.handle);
+      s_openFiles.erase(it);
+    }
   }
-  if (fileInfo->cb.userData != nullptr) {
-    delete static_cast<CommandDataBase*>(fileInfo->cb.userData);
-    fileInfo->cb.userData = nullptr;
+  if (handleToDelete != nullptr) {
+    delete handleToDelete;
   }
   atomic_store_release(fileInfo->cb.state, DVD_STATE_END);
   return TRUE;
@@ -1174,15 +1315,12 @@ void aurora_dvd_reopen_files(const AuroraDvdOpenFile* files, u32 count) {
     const auto callback = fileInfo->callback;
     const DVDCommandBlock cb = fileInfo->cb;
     if (!DVDFastOpen(files[i].entrynum, fileInfo)) {
-      fileInfo->cb.userData = nullptr;
       continue;
     }
     fileInfo->startAddr = startAddr;
     fileInfo->length = length;
     fileInfo->callback = callback;
-    const auto handle = fileInfo->cb.userData;
     fileInfo->cb = cb;
-    fileInfo->cb.userData = handle;
   }
 }
 
@@ -1360,8 +1498,14 @@ void* DVDGetFSTLocation(void) {
 
 BOOL DVDPrepareStreamAsync(DVDFileInfo* fileInfo, u32 length, u32 offset, DVDCallback callback) {
   ASSERTMSGLINE(0x46C, fileInfo, "DVDPrepareStreamAsync(): NULL file info was specified");
-  if (fileInfo == nullptr || fileInfo->cb.userData == nullptr) {
+  if (fileInfo == nullptr) {
     return FALSE;
+  }
+  {
+    std::lock_guard lock(s_fstLock);
+    if (s_openFiles.find(fileInfo) == s_openFiles.end()) {
+      return FALSE;
+    }
   }
   if (length == 0) {
     length = fileInfo->length - offset;

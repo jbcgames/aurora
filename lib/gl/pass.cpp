@@ -79,6 +79,10 @@ absl::flat_hash_map<uint32_t, GLuint> g_vaoCache;
 struct GxVaoLayout {
   GLuint vao = 0;
   uint32_t stride = 0;
+  GLuint ibufId = 0;
+  GLuint fallbackVao = 0;
+  GLuint fallbackIbufId = 0;
+  uint64_t fallbackBaseOffset = UINT64_MAX;
 };
 absl::flat_hash_map<uint64_t, GxVaoLayout> g_gxVaoCache;
 
@@ -100,7 +104,23 @@ static GLuint s_lastVbuf = 0;
 static uint64_t s_lastBaseOffset = UINT64_MAX;
 static GLuint s_lastIbuf = 0;
 
-void bind_gx_layout_fallback(uint32_t mask, const Buffer& vbuf, uint64_t baseOffset, const Buffer& ibuf, uint32_t stride) {
+void bind_gx_layout_fallback(GxVaoLayout& layout, uint32_t mask, const Buffer& vbuf, uint64_t baseOffset,
+                             const Buffer& ibuf) {
+  if (layout.fallbackVao == 0) {
+    gl.GenVertexArrays(1, &layout.fallbackVao);
+    bind_vertex_array(layout.fallbackVao);
+    GLuint location = 0;
+    for (int i = 0; i < canon::kCount; ++i) {
+      if ((mask & (1u << i)) != 0) {
+        gl.EnableVertexAttribArray(location++);
+      }
+    }
+  } else {
+    bind_vertex_array(layout.fallbackVao);
+  }
+  if (layout.fallbackBaseOffset == baseOffset && layout.fallbackIbufId == ibuf.id) {
+    return;
+  }
   gl.BindBuffer(GL_ARRAY_BUFFER, vbuf.id);
   uint32_t offset = 0;
   GLuint location = 0;
@@ -111,18 +131,22 @@ void bind_gx_layout_fallback(uint32_t mask, const Buffer& vbuf, uint64_t baseOff
     const auto spec = attr_spec(i);
     const auto* ptr = reinterpret_cast<const void*>(static_cast<uintptr_t>(baseOffset + offset));
     if (spec.integer) {
-      gl.VertexAttribIPointer(location, spec.comps, spec.type, static_cast<GLsizei>(stride), ptr);
+      gl.VertexAttribIPointer(location, spec.comps, spec.type, static_cast<GLsizei>(layout.stride), ptr);
     } else {
       gl.VertexAttribPointer(location, spec.comps, spec.type, spec.normalized ? GL_TRUE : GL_FALSE,
-                             static_cast<GLsizei>(stride), ptr);
+                             static_cast<GLsizei>(layout.stride), ptr);
     }
     offset += spec.size;
     ++location;
   }
-  gl.BindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibuf.id);
+  if (ibuf.id != 0 && layout.fallbackIbufId != ibuf.id) {
+    gl.BindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibuf.id);
+    layout.fallbackIbufId = ibuf.id;
+  }
+  layout.fallbackBaseOffset = baseOffset;
 }
 
-const GxVaoLayout& get_or_create_gx_layout(uint32_t mask, const Buffer& vbuf, const Buffer& ibuf) {
+GxVaoLayout& get_or_create_gx_layout(uint32_t mask, const Buffer& vbuf, const Buffer& ibuf) {
   const uint64_t key = (static_cast<uint64_t>(vbuf.id) << 32) | mask;
   auto it = g_gxVaoCache.find(key);
   if (it != g_gxVaoCache.end()) {
@@ -159,16 +183,12 @@ const GxVaoLayout& get_or_create_gx_layout(uint32_t mask, const Buffer& vbuf, co
     offset += spec.size;
     ++location;
   }
-  gl.BindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibuf.id);
+  if (ibuf.id != 0) {
+    gl.BindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibuf.id);
+  }
 
-  auto res = g_gxVaoCache.emplace(key, GxVaoLayout{vao, stride});
+  auto res = g_gxVaoCache.emplace(key, GxVaoLayout{.vao = vao, .stride = stride, .ibufId = ibuf.id});
   return res.first->second;
-}
-
-void bind_gx_layout(uint32_t mask, const Buffer& vbuf, uint64_t baseOffset, const Buffer& ibuf) {
-  const auto& layout = get_or_create_gx_layout(mask, vbuf, ibuf);
-  bind_vertex_array(layout.vao);
-  bind_gx_layout_fallback(mask, vbuf, baseOffset, ibuf, layout.stride);
 }
 
 // RmlUi geometry VAO: interleaved Rml::Vertex records (stride 20) with position
@@ -204,6 +224,9 @@ void reset_pass_vao_cache() noexcept {
   for (const auto& [_, layout] : g_gxVaoCache) {
     if (layout.vao != 0) {
       gl.DeleteVertexArrays(1, &layout.vao);
+    }
+    if (layout.fallbackVao != 0) {
+      gl.DeleteVertexArrays(1, &layout.fallbackVao);
     }
   }
   g_gxVaoCache.clear();
@@ -298,12 +321,12 @@ void PassEncoder::Draw(uint32_t vertexCount, uint32_t instanceCount, uint32_t fi
   if (m_pipeline.vertexLayout == kRmlGeometryVertexLayout) {
     bind_rml_layout(m_vertexBuffer, m_vertexOffset, m_indexBuffer);
   } else if (m_pipeline.vertexLayout != 0) {
-    const auto& layout = get_or_create_gx_layout(m_pipeline.vertexLayout, m_vertexBuffer, m_indexBuffer);
-    bind_vertex_array(layout.vao);
+    auto& layout = get_or_create_gx_layout(m_pipeline.vertexLayout, m_vertexBuffer, m_indexBuffer);
     if (__builtin_expect(layout.stride > 0 && (m_vertexOffset % layout.stride == 0), 1)) {
+      bind_vertex_array(layout.vao);
       firstVertex += static_cast<uint32_t>(m_vertexOffset / layout.stride);
     } else {
-      bind_gx_layout_fallback(m_pipeline.vertexLayout, m_vertexBuffer, m_vertexOffset, m_indexBuffer, layout.stride);
+      bind_gx_layout_fallback(layout, m_pipeline.vertexLayout, m_vertexBuffer, m_vertexOffset, m_indexBuffer);
     }
   } else {
     // Attribute-less draw (clear / present / RmlUi fullscreen triangle via gl_VertexID).
@@ -325,21 +348,40 @@ void PassEncoder::DrawIndexed(uint32_t indexCount, uint32_t instanceCount, uint3
   if (!m_hasPipeline || m_pipeline.program == 0 || indexCount == 0) {
     return;
   }
-  if (m_pipeline.vertexLayout == kRmlGeometryVertexLayout) {
-    bind_rml_layout(m_vertexBuffer, m_vertexOffset, m_indexBuffer);
-  } else {
-    const auto& layout = get_or_create_gx_layout(m_pipeline.vertexLayout, m_vertexBuffer, m_indexBuffer);
-    bind_vertex_array(layout.vao);
-    if (m_vertexOffset != 0) {
-      bind_gx_layout_fallback(m_pipeline.vertexLayout, m_vertexBuffer, m_vertexOffset, m_indexBuffer, layout.stride);
-    }
-  }
   const GLenum mode = topology_gl(m_pipeline.state.topology);
   const bool u32 = m_indexFormat == IndexFormat::Uint32;
   const GLenum idxType = u32 ? GL_UNSIGNED_INT : GL_UNSIGNED_SHORT;
   // glDrawElements' last arg is a byte offset into the element buffer bound in the VAO.
   const uintptr_t idxBytes = m_indexOffset + static_cast<uintptr_t>(firstIndex) * (u32 ? 4u : 2u);
   const auto* idxPtr = reinterpret_cast<const void*>(idxBytes);
+
+  if (m_pipeline.vertexLayout == kRmlGeometryVertexLayout) {
+    bind_rml_layout(m_vertexBuffer, m_vertexOffset, m_indexBuffer);
+  } else {
+    auto& layout = get_or_create_gx_layout(m_pipeline.vertexLayout, m_vertexBuffer, m_indexBuffer);
+    const bool aligned = layout.stride > 0 && (m_vertexOffset % layout.stride == 0);
+    const bool canBaseVertex = aligned && (m_vertexOffset == 0 ||
+        (instanceCount > 1 ? gl.DrawElementsInstancedBaseVertex != nullptr : gl.DrawElementsBaseVertex != nullptr));
+    if (__builtin_expect(canBaseVertex, 1)) {
+      bind_vertex_array(layout.vao);
+      if (m_indexBuffer.id != 0 && layout.ibufId != m_indexBuffer.id) {
+        gl.BindBuffer(GL_ELEMENT_ARRAY_BUFFER, m_indexBuffer.id);
+        layout.ibufId = m_indexBuffer.id;
+      }
+      const GLint baseVert = m_vertexOffset == 0 ? 0 : static_cast<GLint>(m_vertexOffset / layout.stride);
+      if (baseVert != 0) {
+        if (instanceCount > 1) {
+          gl.DrawElementsInstancedBaseVertex(mode, static_cast<GLsizei>(indexCount), idxType, idxPtr,
+                                             static_cast<GLsizei>(instanceCount), baseVert);
+        } else {
+          gl.DrawElementsBaseVertex(mode, static_cast<GLsizei>(indexCount), idxType, idxPtr, baseVert);
+        }
+        return;
+      }
+    } else {
+      bind_gx_layout_fallback(layout, m_pipeline.vertexLayout, m_vertexBuffer, m_vertexOffset, m_indexBuffer);
+    }
+  }
   if (instanceCount > 1) {
     gl.DrawElementsInstanced(mode, static_cast<GLsizei>(indexCount), idxType, idxPtr,
                              static_cast<GLsizei>(instanceCount));

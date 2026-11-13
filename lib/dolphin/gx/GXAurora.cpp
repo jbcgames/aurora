@@ -191,6 +191,10 @@ void AuroraMoveMemory(const void* from, const void* to, u32 size) {
   GX_WRITE_U64(static_cast<u64>(size));
 }
 
+void AuroraInvalidateDiscArrays(void) {
+  GX_WRITE_AURORA(GX_AURORA_INVAL_DISC_ARRAYS);
+}
+
 #include "aurora/display.h"
 
 extern "C" {

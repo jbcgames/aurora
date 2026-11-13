@@ -282,6 +282,7 @@ void bp_efb_copy(u8, u32 value) noexcept {
 void bp_tlut_load(u8, u32 value) noexcept {
   const auto idx = reg_get(value, 10, 0);
   if (idx < MaxTluts) {
+    g_gxState.textureDirty++;
     auto& slot = g_gxState.loadedTluts[idx];
     slot.loadTlut0 = g_gxState.bpRegCache[0x64];
     slot.numEntries = static_cast<u16>(reg_get(value, 10, 10) + 1);

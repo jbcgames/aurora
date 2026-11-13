@@ -93,6 +93,7 @@ extern "C" {
 #define GX_AURORA_ALIAS_COPY_TEX 0x003B
 #define GX_AURORA_FORGET_MEMORY 0x0070
 #define GX_AURORA_MOVE_MEMORY 0x0071
+#define GX_AURORA_INVAL_DISC_ARRAYS 0x0072
 
 /**
  * Draw primitives with the vertex count derived from a byte length, as written by
@@ -423,6 +424,7 @@ void GXSetProbeTagAurora(u32 tag);
 
 void AuroraForgetMemory(const void* lo, const void* hi);
 void AuroraMoveMemory(const void* from, const void* to, u32 size);
+void AuroraInvalidateDiscArrays(void);
 void AuroraSetSharpTextures(GXBool sharp);
 void AuroraSetPresentBackdrop(GXBool enabled);
 void AuroraSetPresentArea(float left, float top, float right, float bottom);

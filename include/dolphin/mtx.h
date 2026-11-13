@@ -228,6 +228,46 @@ void C_MTXLightOrtho(Mtx m, f32 t, f32 b, f32 l, f32 r, f32 scaleS, f32 scaleT, 
 #define MTXLightPerspective C_MTXLightPerspective
 #define MTXLightOrtho C_MTXLightOrtho
 
+#ifndef DOLPHIN_MTX_NO_INLINE_VEC
+static inline void C_VECAdd(const Vec* a, const Vec* b, Vec* ab) {
+    ab->x = a->x + b->x;
+    ab->y = a->y + b->y;
+    ab->z = a->z + b->z;
+}
+static inline void C_VECSubtract(const Vec* a, const Vec* b, Vec* a_b) {
+    a_b->x = a->x - b->x;
+    a_b->y = a->y - b->y;
+    a_b->z = a->z - b->z;
+}
+static inline void C_VECScale(const Vec* src, Vec* dst, f32 scale) {
+    dst->x = src->x * scale;
+    dst->y = src->y * scale;
+    dst->z = src->z * scale;
+}
+static inline f32 C_VECSquareMag(const Vec* v) {
+    return v->x * v->x + v->y * v->y + v->z * v->z;
+}
+static inline f32 C_VECDotProduct(const Vec* a, const Vec* b) {
+    return a->x * b->x + a->y * b->y + a->z * b->z;
+}
+static inline f32 C_VECSquareDistance(const Vec* a, const Vec* b) {
+    f32 dx = a->x - b->x;
+    f32 dy = a->y - b->y;
+    f32 dz = a->z - b->z;
+    return dx * dx + dy * dy + dz * dz;
+}
+f32 C_VECDistance(const Vec* a, const Vec* b);
+static inline void C_VECCrossProduct(const Vec* a, const Vec* b, Vec* axb) {
+    f32 x = (a->y * b->z) - (a->z * b->y);
+    f32 y = (a->z * b->x) - (a->x * b->z);
+    f32 z = (a->x * b->y) - (a->y * b->x);
+    axb->x = x;
+    axb->y = y;
+    axb->z = z;
+}
+void C_VECNormalize(const Vec* src, Vec* unit);
+f32 C_VECMag(const Vec* v);
+#else
 void C_VECAdd(const Vec* a, const Vec* b, Vec* ab);
 void C_VECSubtract(const Vec* a, const Vec* b, Vec* a_b);
 void C_VECScale(const Vec* src, Vec* dst, f32 scale);
@@ -238,6 +278,7 @@ f32 C_VECDotProduct(const Vec* a, const Vec* b);
 void C_VECCrossProduct(const Vec* a, const Vec* b, Vec* axb);
 f32 C_VECSquareDistance(const Vec* a, const Vec* b);
 f32 C_VECDistance(const Vec* a, const Vec* b);
+#endif
 void C_VECReflect(const Vec* src, const Vec* normal, Vec* dst);
 void C_VECHalfAngle(const Vec* a, const Vec* b, Vec* half);
 

@@ -4,7 +4,11 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <mutex>
+#include <vector>
+#include <unistd.h>
 
 #include <SDL3/SDL_video.h>
 #include <magic_enum.hpp>
@@ -12,6 +16,7 @@
 
 #include "../gfx/common.hpp"
 #include "../gl/gl_core.hpp"
+#include "../gl/program.hpp"
 #include "../internal.hpp"
 #include "../window.hpp"
 #include "gpu.hpp"
@@ -73,6 +78,7 @@ std::array<Slot, SlotCount> g_slots;
 std::mutex g_mutex;
 std::condition_variable g_slotFreed;  // main -> worker
 std::condition_variable g_frameReady; // worker -> main
+double g_lastRevSyncMs = 0.0;
 uint32_t g_nextSlot = 0;
 int32_t g_framesOwed = 0;     // end_frames enqueued but not yet presented/dropped
 bool g_hasReadyFrame = false;
@@ -91,12 +97,47 @@ void destroy_sync(void*& sync) {
 // fence).
 void* create_fence() {
   gl::gl.Flush();
-  // On Mali Bifrost (G31/G52), eglCreateSyncKHR / eglClientWaitSyncKHR between shared contexts
-  // blocks inside libmali on an internal mutex while waiting for KMSDRM flips, deadlocking
-  // the driver (especially during heavy texture asset uploads).
-  // With triple-buffering and glFlush(), GPU command stream ordering is fully guaranteed
-  // without risking kernel/driver mutex deadlocks.
+#if defined(__aarch64__) || defined(__arm__)
+  if (gl::gl.eglCreateSyncKHR == nullptr) {
+    return nullptr;
+  }
+  void* sync = gl::gl.eglCreateSyncKHR(g_display, gl::EGL_SYNC_FENCE_KHR, nullptr);
+  return sync;
+#else
   return nullptr;
+#endif
+}
+
+static gl::GLuint g_blitProgram = 0;
+
+static void ensure_blit_program() {
+  if (g_blitProgram != 0) {
+    return;
+  }
+  constexpr char vert[] = R"(#version 300 es
+out vec2 v_uv;
+void main() {
+  const vec2 positions[3] = vec2[3](vec2(-1.0, -1.0), vec2(3.0, -1.0), vec2(-1.0, 3.0));
+  const vec2 uvs[3] = vec2[3](vec2(0.0, 0.0), vec2(2.0, 0.0), vec2(0.0, 2.0));
+  gl_Position = vec4(positions[gl_VertexID], 0.0, 1.0);
+  v_uv = uvs[gl_VertexID];
+}
+)";
+  constexpr char frag[] = R"(#version 300 es
+precision highp float;
+uniform sampler2D tex;
+in vec2 v_uv;
+out vec4 out_color;
+void main() { out_color = texture(tex, v_uv); }
+)";
+  g_blitProgram = gl::compile_program(vert, frag, "Shim Blit Shader");
+  if (g_blitProgram != 0) {
+    gl::gl.UseProgram(g_blitProgram);
+    const gl::GLint loc = gl::gl.GetUniformLocation(g_blitProgram, "tex");
+    if (loc >= 0) {
+      gl::gl.Uniform1i(loc, 0);
+    }
+  }
 }
 
 // Main thread, shim context current: allocate the shim-side texture + read FBO and bridge it as an
@@ -240,23 +281,67 @@ void blit_and_swap(Slot& slot) {
   int drawableHeight = static_cast<int>(g_height);
   SDL_GetWindowSizeInPixels(window, &drawableWidth, &drawableHeight);
 
-  // Wait, on the GPU, for the worker to finish compositing this slot. This does not block the CPU.
-  if (slot.fwdSync != nullptr && gl::gl.eglWaitSyncKHR != nullptr) {
-    gl::gl.eglWaitSyncKHR(g_display, slot.fwdSync, 0);
+  // Wait for the worker to finish compositing this slot on GPU.
+  if (slot.fwdSync != nullptr) {
+    if (gl::gl.eglClientWaitSyncKHR != nullptr) {
+      gl::gl.eglClientWaitSyncKHR(g_display, slot.fwdSync, 1u /* EGL_SYNC_FLUSH_COMMANDS_BIT_KHR */, RevSyncWaitTimeoutNs);
+    } else if (gl::gl.eglWaitSyncKHR != nullptr) {
+      gl::gl.eglWaitSyncKHR(g_display, slot.fwdSync, 0);
+    }
   }
 
-  gl::gl.BindFramebuffer(gl::GL_READ_FRAMEBUFFER, slot.shimReadFbo);
-  gl::gl.BindFramebuffer(gl::GL_DRAW_FRAMEBUFFER, 0);
-  gl::gl.Disable(gl::GL_SCISSOR_TEST);
-  // No Y-flip (S1c): the worker composited the frame GL-native (row 0 = bottom) into the slot and
-  // the default framebuffer is also bottom-left origin, so a straight blit is upright.
-  gl::gl.BlitFramebuffer(0, 0, static_cast<gl::GLint>(g_width), static_cast<gl::GLint>(g_height), 0, 0, drawableWidth,
-                         drawableHeight, gl::GL_COLOR_BUFFER_BIT, gl::GL_LINEAR);
-  gl::gl.BindFramebuffer(gl::GL_READ_FRAMEBUFFER, 0);
+  // Clear stale GL errors
+  while (gl::gl.GetError() != gl::GL_NO_ERROR) {}
 
-#if TARGET_PC
-  gl::gl.Finish();
-#endif
+  ensure_blit_program();
+  if (g_blitProgram != 0) {
+    gl::gl.BindFramebuffer(gl::GL_FRAMEBUFFER, 0);
+    gl::gl.Viewport(0, 0, drawableWidth, drawableHeight);
+    gl::gl.Disable(gl::GL_SCISSOR_TEST);
+    gl::gl.Disable(gl::GL_BLEND);
+    gl::gl.ColorMask(gl::GL_TRUE, gl::GL_TRUE, gl::GL_TRUE, gl::GL_TRUE);
+    gl::gl.UseProgram(g_blitProgram);
+    gl::gl.ActiveTexture(gl::GL_TEXTURE0);
+    gl::gl.BindTexture(gl::GL_TEXTURE_2D, slot.shimTexture);
+    gl::gl.BindVertexArray(0);
+    gl::gl.DrawArrays(gl::GL_TRIANGLES, 0, 3);
+    gl::gl.BindTexture(gl::GL_TEXTURE_2D, 0);
+  } else {
+    gl::gl.BindFramebuffer(gl::GL_READ_FRAMEBUFFER, slot.shimReadFbo);
+    gl::gl.BindFramebuffer(gl::GL_DRAW_FRAMEBUFFER, 0);
+    gl::gl.Disable(gl::GL_SCISSOR_TEST);
+    gl::gl.BlitFramebuffer(0, 0, static_cast<gl::GLint>(g_width), static_cast<gl::GLint>(g_height), 0, 0, drawableWidth,
+                           drawableHeight, gl::GL_COLOR_BUFFER_BIT, gl::GL_LINEAR);
+    gl::gl.BindFramebuffer(gl::GL_READ_FRAMEBUFFER, 0);
+  }
+
+  gl::gl.Flush();
+
+  // Autonomous screenshot trigger
+  if (access("/tmp/ttyd_screenshot.req", F_OK) == 0) {
+    unlink("/tmp/ttyd_screenshot.req");
+    const int sw = drawableWidth > 0 ? drawableWidth : 640;
+    const int sh = drawableHeight > 0 ? drawableHeight : 480;
+    std::vector<uint8_t> px(sw * sh * 4);
+    gl::gl.BindFramebuffer(gl::GL_FRAMEBUFFER, 0);
+    gl::gl.ReadPixels(0, 0, sw, sh, gl::GL_RGBA, gl::GL_UNSIGNED_BYTE, px.data());
+    FILE* fp = fopen("/tmp/screenshot.ppm", "wb");
+    if (fp) {
+      fprintf(fp, "P6\n%d %d\n255\n", sw, sh);
+      std::vector<uint8_t> row(sw * 3);
+      for (int y = sh - 1; y >= 0; --y) {
+        const uint8_t* sRow = px.data() + y * sw * 4;
+        for (int x = 0; x < sw; ++x) {
+          row[x * 3 + 0] = sRow[x * 4 + 0];
+          row[x * 3 + 1] = sRow[x * 4 + 1];
+          row[x * 3 + 2] = sRow[x * 4 + 2];
+        }
+        fwrite(row.data(), 1, sw * 3, fp);
+      }
+      fclose(fp);
+      (void)system("ffmpeg -y -f image2 -i /tmp/screenshot.ppm /tmp/screenshot.png >/dev/null 2>&1 && touch /tmp/ttyd_screenshot.done &");
+    }
+  }
 
   if (g_sdl2SwapWindow != nullptr && g_sdl2Window != nullptr) {
     g_sdl2SwapWindow(g_sdl2Window);
@@ -398,17 +483,32 @@ std::optional<AcquiredFrame> acquire() {
     // Wait for the main thread to finish scanning this slot out.
     // If the main thread is busy doing FIFO drain and texture operations, wait up to 100ms.
     // If it times out and there is a ready slot waiting, recycle it so work can proceed.
-    if (!g_slotFreed.wait_for(lock, std::chrono::milliseconds{100},
+    if (!g_slotFreed.wait_for(lock, std::chrono::milliseconds{1000},
                               [&] { return g_aborting || g_slots[slotIndex].state == SlotState::Free; })) {
       if (g_aborting) {
         return std::nullopt;
       }
-      Log.warn("[sdl2shim-efb] slot {} acquire timed out; forcing free on slot", slotIndex);
-      if (g_hasReadyFrame && g_readySlot == slotIndex) {
-        g_hasReadyFrame = false;
-        if (g_framesOwed > 0) --g_framesOwed;
+      // If slotIndex is busy (being presented), pick another free slot from the triple buffer
+      uint32_t chosenSlot = SlotCount;
+      for (uint32_t i = 0; i < SlotCount; ++i) {
+        if (g_slots[i].state == SlotState::Free) {
+          chosenSlot = i;
+          break;
+        }
       }
-      destroy_sync(g_slots[slotIndex].fwdSync);
+      if (chosenSlot < SlotCount) {
+        g_slots[chosenSlot].state = SlotState::Rendering;
+        g_nextSlot = (chosenSlot + 1) % SlotCount;
+        lock.unlock();
+        Slot& slot = g_slots[chosenSlot];
+        if (slot.revSync != nullptr && gl::gl.eglClientWaitSyncKHR != nullptr) {
+          gl::gl.eglClientWaitSyncKHR(g_display, slot.revSync, 0, RevSyncWaitTimeoutNs);
+          destroy_sync(slot.revSync);
+        }
+        return AcquiredFrame{.slot = chosenSlot, .fbo = slot.workerFbo};
+      }
+      Log.warn("[sdl2shim-efb] all slots busy, waiting for free slot");
+      g_slotFreed.wait(lock, [&] { return g_aborting || g_slots[slotIndex].state == SlotState::Free; });
     }
     if (g_aborting) {
       return std::nullopt;
@@ -427,12 +527,16 @@ std::optional<AcquiredFrame> acquire() {
   // steady state the fence retired a frame ago and this returns immediately; on timeout we render
   // anyway (one torn frame, loudly).
   if (slot.revSync != nullptr && gl::gl.eglClientWaitSyncKHR != nullptr) {
+    const auto tr0 = std::chrono::steady_clock::now();
     const int32_t waited = gl::gl.eglClientWaitSyncKHR(g_display, slot.revSync, 0, RevSyncWaitTimeoutNs);
+    g_lastRevSyncMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tr0).count();
     if (waited != gl::EGL_CONDITION_SATISFIED_KHR) {
       Log.warn("[sdl2shim-efb] slot {} reverse-fence wait returned 0x{:x}; rendering into it anyway", slotIndex,
                waited);
     }
     destroy_sync(slot.revSync);
+  } else {
+    g_lastRevSyncMs = 0.0;
   }
   g_nextSlot = (slotIndex + 1) % SlotCount;
   return AcquiredFrame{.slot = slotIndex, .fbo = slot.workerFbo};
@@ -442,9 +546,13 @@ void publish(uint32_t slot) {
   if (!g_active || slot >= SlotCount) {
     return;
   }
-  // Flush worker rendering commands before handing slot to main thread blit
-  gl::gl.Flush();
+#if defined(__aarch64__) || defined(__arm__)
+  // Fence the worker's just-composited frame so the shim context can order its blit behind it.
+  g_slots[slot].fwdSync = create_fence();
+#else
+  gl::gl.Finish();
   g_slots[slot].fwdSync = nullptr;
+#endif
 
   // The main thread consumes the previous frame before enqueueing the work that produces this one,
   // so the mailbox is always empty here. If that invariant ever breaks, drop the stale frame rather
@@ -503,6 +611,8 @@ void flush_present() {
     return;
   }
   ZoneScopedN("EFB flush present");
+  static const bool s_logPres = std::getenv("TTYD_TIMING_LOG") != nullptr;
+  const auto tp0 = s_logPres ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
   uint32_t slotIndex = 0;
   {
@@ -526,11 +636,24 @@ void flush_present() {
       --g_framesOwed;
     }
   }
+  const auto tp_wait = s_logPres ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
   Slot& slot = g_slots[slotIndex];
   const bool presentable = window::is_presentable();
+  auto tp_fwd = tp_wait;
+  auto tp_swap = tp_wait;
   if (presentable) {
+    if (s_logPres && slot.fwdSync != nullptr) {
+      if (gl::gl.eglClientWaitSyncKHR != nullptr) {
+        gl::gl.eglClientWaitSyncKHR(g_display, slot.fwdSync, 1u, RevSyncWaitTimeoutNs);
+      } else if (gl::gl.eglWaitSyncKHR != nullptr) {
+        gl::gl.eglWaitSyncKHR(g_display, slot.fwdSync, 0);
+      }
+      destroy_sync(slot.fwdSync);
+      tp_fwd = std::chrono::steady_clock::now();
+    }
     blit_and_swap(slot);
+    tp_swap = std::chrono::steady_clock::now();
   }
   destroy_sync(slot.fwdSync);
 
@@ -545,6 +668,19 @@ void flush_present() {
 
   if (presentable) {
     gfx::after_present();
+  }
+  if (s_logPres) {
+    const auto tp_end = std::chrono::steady_clock::now();
+    const double msTotal = std::chrono::duration<double, std::milli>(tp_end - tp0).count();
+    if (msTotal > 25.0) {
+      const double msWait = std::chrono::duration<double, std::milli>(tp_wait - tp0).count();
+      const double msFwd = std::chrono::duration<double, std::milli>(tp_fwd - tp_wait).count();
+      const double msSwap = std::chrono::duration<double, std::milli>(tp_swap - tp_fwd).count();
+      const double msPost = std::chrono::duration<double, std::milli>(tp_end - tp_swap).count();
+      const auto wt = gfx::last_worker_timings();
+      std::fprintf(stdout, "[PRES-SPIKE] total %.1fms (wait_worker %.1fms [f%llu gap %.1f fb %.1f up %.1f ren %.1f qwait %.1f pre %.1f cb %.1f(rev %.1f) fen %.1f post %.1f ops:%u d:%u], fwd_sync %.1fms, blit_swap %.1fms, post %.1fms)\n",
+                   msTotal, msWait, static_cast<unsigned long long>(wt.frameId), wt.gapBeforeBeginMs, wt.fbWaitMs, wt.opsUploadMs, wt.opsRenderMs, wt.endQWaitMs, wt.preCbMs, wt.endCbMs, g_lastRevSyncMs, wt.endFenceMs, wt.postCbMs, wt.opCount, wt.drawCount, msFwd, msSwap, msPost);
+    }
   }
 }
 

@@ -28,6 +28,10 @@ void end_pipeline_frame();
 template <typename Config>
 PipelineRef find_pipeline(ShaderType type, const Config& config, NewPipelineCallback&& cb);
 
+PipelineRef find_pipeline_status(ShaderType type, const gx::PipelineConfig& config, NewPipelineCallback&& cb,
+                                 bool& outReady);
+uint32_t pipeline_cache_generation() noexcept;
+
 bool get_pipeline(PipelineRef ref, gl::Pipeline& pipeline);
 
 } // namespace aurora::gfx

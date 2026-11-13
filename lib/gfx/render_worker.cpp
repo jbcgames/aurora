@@ -3,15 +3,17 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 
 #include <tracy/Tracy.hpp>
 
 namespace aurora::gfx::render_worker {
 namespace {
-constexpr size_t QueueCapacity = 256;
+constexpr size_t QueueCapacity = 2048;
 // Nothing runs on a timeout, and enqueue/close notify the CV.
-// A 1ms timeout woke the worker 1000 times a second while idle, stealing CPU time on Cortex-A35.
-constexpr auto IdlePumpInterval = std::chrono::milliseconds{250};
+// A 16ms timeout bounds worst-case worker stall to a single frame without busy-waiting.
+constexpr auto IdlePumpInterval = std::chrono::milliseconds{16};
 
 BoundedQueue g_queue{QueueCapacity};
 std::thread g_thread;
@@ -47,9 +49,23 @@ void worker_main() {
       continue;
     }
 
+    static const bool s_logWorker = std::getenv("TTYD_TIMING_LOG") != nullptr;
+    const auto t0 = s_logWorker ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (item->work) {
       ZoneScopedN("QueueItem work");
       item->work();
+    }
+    if (s_logWorker) {
+      const auto t1 = std::chrono::steady_clock::now();
+      const double qw = item->enqueuedAt.time_since_epoch().count() != 0
+                            ? std::chrono::duration<double, std::milli>(t0 - item->enqueuedAt).count()
+                            : 0.0;
+      const double wk = std::chrono::duration<double, std::milli>(t1 - t0).count();
+      if (qw > 25.0 || wk > 25.0) {
+        std::fprintf(stdout, "[WORKER-SLOW] type=%d f=%llu p=%u q=%zu qwait=%.1fms work=%.1fms\n",
+                     static_cast<int>(item->type), static_cast<unsigned long long>(item->frameId),
+                     item->passIndex, g_queue.size(), qw, wk);
+      }
     }
     complete_sync(item->sync);
     g_pendingItems.fetch_sub(1, std::memory_order_acq_rel);
@@ -79,6 +95,10 @@ void enqueue(QueueItem item) {
     return;
   }
 
+  static const bool s_logWorker = std::getenv("TTYD_TIMING_LOG") != nullptr;
+  if (s_logWorker) {
+    item.enqueuedAt = std::chrono::steady_clock::now();
+  }
   g_pendingItems.fetch_add(1, std::memory_order_acq_rel);
   if (!g_queue.push(std::move(item))) {
     g_pendingItems.fetch_sub(1, std::memory_order_acq_rel);
@@ -267,7 +287,7 @@ void synchronize() {
   });
   std::unique_lock lock{sync->mutex};
   while (!sync->complete && g_running.load(std::memory_order_acquire)) {
-    if (!sync->cv.wait_for(lock, std::chrono::milliseconds{50}, [&] { return sync->complete; })) {
+    if (!sync->cv.wait_for(lock, std::chrono::milliseconds{10}, [&] { return sync->complete; })) {
       g_queue.wake_worker();
     }
   }

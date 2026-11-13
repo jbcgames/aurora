@@ -228,6 +228,20 @@ bool load(ProcAddressFn getProc) {
   REQ(DrawElements, "glDrawElements")
   OPT(DrawArraysInstanced, "glDrawArraysInstanced")
   OPT(DrawElementsInstanced, "glDrawElementsInstanced")
+  OPT(DrawElementsBaseVertex, "glDrawElementsBaseVertex")
+  if (gl.DrawElementsBaseVertex == nullptr) {
+    OPT(DrawElementsBaseVertex, "glDrawElementsBaseVertexEXT")
+  }
+  if (gl.DrawElementsBaseVertex == nullptr) {
+    OPT(DrawElementsBaseVertex, "glDrawElementsBaseVertexOES")
+  }
+  OPT(DrawElementsInstancedBaseVertex, "glDrawElementsInstancedBaseVertex")
+  if (gl.DrawElementsInstancedBaseVertex == nullptr) {
+    OPT(DrawElementsInstancedBaseVertex, "glDrawElementsInstancedBaseVertexEXT")
+  }
+  if (gl.DrawElementsInstancedBaseVertex == nullptr) {
+    OPT(DrawElementsInstancedBaseVertex, "glDrawElementsInstancedBaseVertexOES")
+  }
 
   // Sync / query
   REQ(FenceSync, "glFenceSync")

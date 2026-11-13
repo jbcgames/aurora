@@ -489,24 +489,32 @@ void present_frame(uint32_t targetFbo) noexcept {
   // the caller composites the UI overlay + imgui, then swaps (desktop) or publishes the slot
   // (device). targetFbo is 0 (window default framebuffer) on desktop, or the acquired EFB slot's
   // worker FBO on the SDL2-shim device path.
-  gl::gl.BindFramebuffer(gl::GL_FRAMEBUFFER, targetFbo);
-  gl::gl.Disable(gl::GL_SCISSOR_TEST);
-  gl::gl.ColorMask(gl::GL_TRUE, gl::GL_TRUE, gl::GL_TRUE, gl::GL_TRUE);
-  gl::gl.ClearColor(0.f, 0.f, 0.f, 1.f);
-  gl::gl.Clear(gl::GL_COLOR_BUFFER_BIT);
-
   const auto& source = present_source();
   const uint32_t surfaceWidth = present_surface_width();
   const uint32_t surfaceHeight = present_surface_height();
   if (source.texture.id != 0 && surfaceWidth > 0 && surfaceHeight > 0) {
     const auto viewport = calculate_present_viewport(surfaceWidth, surfaceHeight, source.size.width, source.size.height);
-    const gl::GLuint readFbo = gl::get_framebuffer(source.texture);
-    gl::gl.BindFramebuffer(gl::GL_READ_FRAMEBUFFER, readFbo);
-    gl::gl.BindFramebuffer(gl::GL_DRAW_FRAMEBUFFER, targetFbo);
     const auto dstX0 = static_cast<gl::GLint>(viewport.left);
     const auto dstY0 = static_cast<gl::GLint>(viewport.top);
     const auto dstX1 = dstX0 + static_cast<gl::GLint>(viewport.width);
     const auto dstY1 = dstY0 + static_cast<gl::GLint>(viewport.height);
+
+    gl::gl.BindFramebuffer(gl::GL_FRAMEBUFFER, targetFbo);
+    // Only clear if the blit does not fully cover the target FBO, avoiding black flash and Mali bandwidth waste
+    const bool coversFull = (dstX0 <= 0 && dstY0 <= 0 &&
+                             dstX1 >= static_cast<gl::GLint>(surfaceWidth) &&
+                             dstY1 >= static_cast<gl::GLint>(surfaceHeight));
+    if (!coversFull) {
+      gl::gl.Disable(gl::GL_SCISSOR_TEST);
+      gl::gl.ColorMask(gl::GL_TRUE, gl::GL_TRUE, gl::GL_TRUE, gl::GL_TRUE);
+      gl::gl.ClearColor(0.f, 0.f, 0.f, 1.f);
+      gl::gl.Clear(gl::GL_COLOR_BUFFER_BIT);
+    }
+
+    const gl::GLuint readFbo = gl::get_framebuffer(source.texture);
+    gl::gl.BindFramebuffer(gl::GL_READ_FRAMEBUFFER, readFbo);
+    gl::gl.BindFramebuffer(gl::GL_DRAW_FRAMEBUFFER, targetFbo);
+    gl::gl.Disable(gl::GL_SCISSOR_TEST);
     gl::gl.BlitFramebuffer(0, 0, static_cast<gl::GLint>(source.size.width), static_cast<gl::GLint>(source.size.height),
                            dstX0, dstY0, dstX1, dstY1, gl::GL_COLOR_BUFFER_BIT, gl::GL_LINEAR);
     if (gl::gl.GetError() != gl::GL_NO_ERROR) {

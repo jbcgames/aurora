@@ -36,6 +36,7 @@ struct QueueItem {
   uint32_t passIndex = 0;
   WorkCallback work;
   std::shared_ptr<SyncState> sync;
+  std::chrono::steady_clock::time_point enqueuedAt{};
 };
 
 class BoundedQueue {

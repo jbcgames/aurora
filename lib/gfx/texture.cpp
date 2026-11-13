@@ -66,11 +66,6 @@ std::vector<gl::Texture> take_deferred_texture_destroys() noexcept {
 TextureHandle new_static_texture_2d(uint32_t width, uint32_t height, uint32_t mips, u32 format, ArrayRef<uint8_t> data,
                                     bool tlut, const char* label) noexcept {
   ZoneScoped;
-  static uint32_t s_uploadDbgCount = 0;
-  if (++s_uploadDbgCount <= 25 || s_uploadDbgCount % 60 == 0) {
-    std::printf("[TEX-NEW] #%u %s %ux%u format=%u bytes=%zu\n", s_uploadDbgCount, label ? label : "unnamed", width, height, format, data.size());
-    std::fflush(stdout);
-  }
 
   auto handle = new_dynamic_texture_2d(width, height, mips, format, label);
   auto& ref = *handle;

@@ -84,6 +84,21 @@ void after_submit() noexcept;
 void gpu_synchronize();
 void after_present() noexcept;
 float calculate_fps() noexcept;
+struct WorkerFrameTimings {
+  double gapBeforeBeginMs = 0.0;
+  double fbWaitMs = 0.0;
+  double opsUploadMs = 0.0;
+  double opsRenderMs = 0.0;
+  double endQWaitMs = 0.0;
+  double preCbMs = 0.0;
+  double endCbMs = 0.0;
+  double endFenceMs = 0.0;
+  double postCbMs = 0.0;
+  uint64_t frameId = 0;
+  uint32_t opCount = 0;
+  uint32_t drawCount = 0;
+};
+WorkerFrameTimings last_worker_timings() noexcept;
 void resolve_pass_into(TextureHandle texture, ClipRect rect, bool clearColor, bool clearAlpha, bool clearDepth,
                        Vec4<float> clearColorValue, float clearDepthValue, GXTexFmt resolveFormat = GX_TF_RGBA8);
 
@@ -146,7 +161,8 @@ static Range push_indices(ArrayRef<T> data, size_t alignment) {
 // success; {_, false} when the cache is exhausted (caller should fall back to the
 // per-frame ring and request a reset). Ranges are consumed by native-fetch draws with
 // DrawData::cachedGeometry set, which bind these buffers instead of the per-frame rings.
-std::pair<Range, bool> push_native_cached_verts(const uint8_t* data, size_t length);
+bool can_push_native_cached(size_t vertBytes, size_t idxBytes, size_t vertAlignment = 4) noexcept;
+std::pair<Range, bool> push_native_cached_verts(const uint8_t* data, size_t length, size_t alignment = 4);
 std::pair<Range, bool> push_native_cached_indices(const uint8_t* data, size_t length);
 // Deferred reset of the native geometry cache; takes effect at the next begin_frame
 // (safe point: all prior frames referencing cached ranges have been submitted). Bumps
@@ -154,6 +170,7 @@ std::pair<Range, bool> push_native_cached_indices(const uint8_t* data, size_t le
 void request_native_geometry_cache_reset() noexcept;
 uint32_t native_geom_cache_generation() noexcept;
 Range push_uniform(const uint8_t* data, size_t length);
+const uint8_t* uniform_data_at(uint32_t offset) noexcept;
 template <typename T>
 static Range push_uniform(const T& data) {
   return push_uniform(reinterpret_cast<const uint8_t*>(&data), sizeof(T));
@@ -178,6 +195,9 @@ DrawData* get_last_draw_command();
 
 template <typename PipelineConfig>
 PipelineRef pipeline_ref(const PipelineConfig& config);
+template <typename PipelineConfig>
+PipelineRef pipeline_ref_status(const PipelineConfig& config, bool& outReady);
+uint32_t pipeline_cache_gen() noexcept;
 bool bind_pipeline(PipelineRef ref, gl::PassEncoder& pass);
 
 // The cached bind group is a POD gl::BindingSet (up to 8 texture+sampler pairs, or

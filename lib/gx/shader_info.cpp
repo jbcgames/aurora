@@ -200,8 +200,10 @@ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
     }
   }
 
-  // MaxPnMtx position matrices + MaxTexMtx texture matrices (must match shader.cpp postex_mtx[MaxPnMtx + MaxTexMtx]).
-  info.uniformSize += sizeof(Mat3x4<float>) * (MaxPnMtx + MaxTexMtx);
+  // Matrix usage will be resolved below once all sampledTexCoords (including indirect/emboss) are known.
+  if (config.attrs[GX_VA_PNMTXIDX].attrType != GX_NONE) {
+    info.usesMultiPnMtx = true;
+  }
 
   for (int i = 0; i < config.tevStageCount; ++i) {
     const auto& stage = config.tevStages[i];
@@ -270,6 +272,28 @@ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
     }
   }
 
+  for (int i = 0; i < info.sampledTexCoords.size(); ++i) {
+    if (!info.sampledTexCoords.test(i)) {
+      continue;
+    }
+    const auto& tcg = config.tcgs[i];
+    if (tcg.type == GX_TG_MTX2x4 || tcg.type == GX_TG_MTX3x4) {
+      if (info.indexAttr.test(GX_VA_TEX0MTXIDX + i)) {
+        info.usesMultiPnMtx = true;
+        info.usesTexMtx = true;
+      } else if (tcg.mtx != GX_IDENTITY) {
+        if (tcg.mtx >= GX_TEXMTX0) {
+          info.usesTexMtx = true;
+        } else {
+          info.usesMultiPnMtx = true;
+        }
+      }
+    }
+  }
+  const u32 pnMtxSlots = info.usesMultiPnMtx ? MaxPnMtx : 1;
+  const u32 texMtxSlots = info.usesTexMtx ? MaxTexMtx : 0;
+  info.uniformSize += sizeof(Mat3x4<float>) * (pnMtxSlots + texMtxSlots);
+
   info.uniformSize += info.loadsTevReg.count() * sizeof(Vec4<float>);
   for (int i = 0; i < info.sampledColorChannels.size(); ++i) {
     if (info.sampledColorChannels.test(i)) {
@@ -282,10 +306,10 @@ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
   }
   // Normal matrices (nrm_mtx) are read only by lit shaders (lighting_func, per-pixel normal
   // output, emboss bump) and the normal-visualization debug path. Unlit draws never reference
-  // them, so gate the 480B palette here (lightingEnabled is fully resolved by this point).
+  // them, so gate the palette here (lightingEnabled is fully resolved by this point).
   info.usesNormals = info.lightingEnabled || EnableNormalVisualization;
   if (info.usesNormals) {
-    info.uniformSize += sizeof(Mat3x4<float>) * MaxPnMtx;
+    info.uniformSize += sizeof(Mat3x4<float>) * pnMtxSlots;
   }
   if (info.lightingEnabled) {
     // Lights + light state for all channels
@@ -326,7 +350,9 @@ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
     info.usesFog = true;
     info.uniformSize += sizeof(Fog);
   }
-  info.uniformSize += MaxTexCoord * sizeof(Vec4<float>);
+  if (info.sampledTexCoords.any()) {
+    info.uniformSize += MaxTexCoord * sizeof(Vec4<float>);
+  }
   if (info.usedIndTexMtxs.any()) {
     info.uniformSize += MaxIndTexMtxs * sizeof(Mat2x4<float>);
   }
@@ -384,7 +410,7 @@ gfx::Range build_uniform(const ShaderInfo& info, u32 vtxStart, const BindGroupRa
   buf.reserve_extra(info.uniformSize);
 
   buf.append(0u);
-  buf.append(g_gxState.currentPnMtx);
+  buf.append(info.usesMultiPnMtx ? g_gxState.currentPnMtx : 0u);
   buf.append<f32>(g_gxState.renderViewport.width);
   buf.append<f32>(g_gxState.renderViewport.height);
   buf.append<f32>(g_gxState.logicalViewport.width);
@@ -413,17 +439,25 @@ gfx::Range build_uniform(const ShaderInfo& info, u32 vtxStart, const BindGroupRa
   }
   buf.append(proj);
 
-  for (int i = 0; i < MaxPnMtx; i++) {
-    buf.append(g_gxState.pnMtx[i].pos);
+  if (info.usesMultiPnMtx) {
+    for (int i = 0; i < MaxPnMtx; i++) {
+      buf.append(g_gxState.pnMtx[i].pos);
+    }
+  } else {
+    buf.append(g_gxState.pnMtx[std::min<u32>(g_gxState.currentPnMtx, MaxPnMtx - 1)].pos);
   }
 
-  for (int i = 0; i < MaxTexMtx; i++) {
-    buf.append(g_gxState.texMtxs[i]);
+  if (info.usesTexMtx) {
+    buf.append(g_gxState.texMtxs);
   }
 
   if (info.usesNormals) {
-    for (int i = 0; i < MaxPnMtx; i++) {
-      buf.append(g_gxState.pnMtx[i].nrm);
+    if (info.usesMultiPnMtx) {
+      for (int i = 0; i < MaxPnMtx; i++) {
+        buf.append(g_gxState.pnMtx[i].nrm);
+      }
+    } else {
+      buf.append(g_gxState.pnMtx[std::min<u32>(g_gxState.currentPnMtx, MaxPnMtx - 1)].nrm);
     }
   }
 
@@ -468,18 +502,18 @@ gfx::Range build_uniform(const ShaderInfo& info, u32 vtxStart, const BindGroupRa
     }
   }
   if (info.usesPTTexMtx.any()) {
-    for (int i = 0; i < info.usesPTTexMtx.size(); ++i) {
-      buf.append(g_gxState.ptTexMtxs[i]);
-    }
+    buf.append(g_gxState.ptTexMtxs);
   }
   if (info.usesFog) {
     const auto& state = g_gxState.fog;
     Fog fog{.color = state.color, .a = state.a, .b = state.b, .c = state.c};
     buf.append(fog);
   }
-  for (const auto& scale : g_gxState.texCoordScales) {
-    buf.append(
-        Vec4{static_cast<f32>(scale.scaleS) + 1.0f, static_cast<f32>(scale.scaleT) + 1.0f, 0.0f, 0.0f});
+  if (info.sampledTexCoords.any()) {
+    for (const auto& scale : g_gxState.texCoordScales) {
+      buf.append(
+          Vec4{static_cast<f32>(scale.scaleS) + 1.0f, static_cast<f32>(scale.scaleT) + 1.0f, 0.0f, 0.0f});
+    }
   }
   if (info.usedIndTexMtxs.any()) {
     for (int i = 0; i < MaxIndTexMtxs; ++i) {
@@ -497,6 +531,31 @@ gfx::Range build_uniform(const ShaderInfo& info, u32 vtxStart, const BindGroupRa
     buf.append(texture_size_bias(tex));
   }
   g_gxState.stateDirty = false;
+
+  struct UniformDedupEntry {
+    u32 frame = UINT32_MAX;
+    u32 size = 0;
+    u64 hash = 0;
+    u32 offset = 0;
+  };
+  static constexpr size_t kUniformDedupSize = 1024;
+  static std::array<UniformDedupEntry, kUniformDedupSize> s_uniformDedup{};
+  const u32 curFrame = gfx::current_frame();
+  const u32 uSize = static_cast<u32>(buf.size());
+  if (curFrame != UINT32_MAX && uSize > 0) {
+    const u64 uHash = XXH3_64bits(buf.data(), uSize);
+    const size_t slot = (uHash ^ (uHash >> 10)) & (kUniformDedupSize - 1);
+    auto& e = s_uniformDedup[slot];
+    if (e.frame == curFrame && e.size == uSize && e.hash == uHash) {
+      const u8* existing = gfx::uniform_data_at(e.offset);
+      if (existing != nullptr && std::memcmp(existing, buf.data(), uSize) == 0) {
+        return {e.offset, uSize};
+      }
+    }
+    const gfx::Range pushed = gfx::push_uniform(buf.data(), uSize);
+    e = {curFrame, uSize, uHash, pushed.offset};
+    return pushed;
+  }
 
   return gfx::push_uniform(buf.data(), buf.size());
 }

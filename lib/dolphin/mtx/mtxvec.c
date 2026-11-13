@@ -1,6 +1,31 @@
 #include <assert.h>
 #include <dolphin/mtx.h>
 
+#if defined(__aarch64__)
+#include <arm_neon.h>
+
+void C_MTXMultVec(const Mtx m, const Vec* src, Vec* dst) {
+  const float sx = src->x, sy = src->y, sz = src->z;
+  dst->x = m[0][3] + (m[0][0] * sx + m[0][1] * sy + m[0][2] * sz);
+  dst->y = m[1][3] + (m[1][0] * sx + m[1][1] * sy + m[1][2] * sz);
+  dst->z = m[2][3] + (m[2][0] * sx + m[2][1] * sy + m[2][2] * sz);
+}
+
+void C_MTXMultVecArray(const Mtx m, const Vec* srcBase, Vec* dstBase, u32 count) {
+  const float m00 = m[0][0], m01 = m[0][1], m02 = m[0][2], m03 = m[0][3];
+  const float m10 = m[1][0], m11 = m[1][1], m12 = m[1][2], m13 = m[1][3];
+  const float m20 = m[2][0], m21 = m[2][1], m22 = m[2][2], m23 = m[2][3];
+
+  for (u32 i = 0; i < count; i++) {
+    const float sx = srcBase->x, sy = srcBase->y, sz = srcBase->z;
+    dstBase->x = m03 + (m00 * sx + m01 * sy + m02 * sz);
+    dstBase->y = m13 + (m10 * sx + m11 * sy + m12 * sz);
+    dstBase->z = m23 + (m20 * sx + m21 * sy + m22 * sz);
+    srcBase++;
+    dstBase++;
+  }
+}
+#else
 void C_MTXMultVec(const Mtx m, const Vec* src, Vec* dst) {
   Vec vTmp;
 
@@ -36,6 +61,7 @@ void C_MTXMultVecArray(const Mtx m, const Vec* srcBase, Vec* dstBase, u32 count)
     dstBase++;
   }
 }
+#endif
 
 void C_MTXMultVecSR(const Mtx m, const Vec* src, Vec* dst) {
   Vec vTmp;

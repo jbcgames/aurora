@@ -32,6 +32,7 @@ const AuroraStats* aurora_get_stats();
 float aurora_get_fps();
 
 void aurora_enable_vsync(bool enabled);
+void aurora_reset_geom_cache(void);
 
 #ifdef __cplusplus
 }

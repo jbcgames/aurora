@@ -1,3 +1,4 @@
+#define DOLPHIN_MTX_NO_INLINE_VEC
 #include <assert.h>
 #include <math.h>
 #include <dolphin/mtx.h>

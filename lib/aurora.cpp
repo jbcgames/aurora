@@ -340,8 +340,9 @@ void end_frame() noexcept {
   });
 
   auto t3 = std::chrono::steady_clock::now();
+  static const bool s_logTiming = std::getenv("TTYD_TIMING_LOG") != nullptr;
   static int s_aurora_prof = 0;
-  if (++s_aurora_prof >= 30) {
+  if (s_logTiming && ++s_aurora_prof >= 30) {
     s_aurora_prof = 0;
     const double d_drain = std::chrono::duration<double, std::milli>(t1 - t0).count();
     const double d_finish = std::chrono::duration<double, std::milli>(t2 - t1).count();

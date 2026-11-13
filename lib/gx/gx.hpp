@@ -429,7 +429,8 @@ struct GXState {
     regs[0xFE] = 0x00FFFFFF;
     return regs;
   }();
-  std::array<u32, 0x1A> xfRegCache;
+  std::array<u32, 0x60> xfRegCache{};
+  std::array<bool, 0x60> xfRegValid{};
 
   // GX2 state
   f32 frontOffset = 0.0f;
@@ -451,6 +452,7 @@ void move_memory(const void* from, const void* to, size_t size) noexcept;
 void shutdown() noexcept;
 void clear_static_texture_cache() noexcept;
 void clear_copy_texture_cache() noexcept;
+void invalidate_copy_caches(const void* dest) noexcept;
 void bbox_reset() noexcept;
 void bbox_read(u16* left, u16* top, u16* right, u16* bottom) noexcept;
 void evict_copy_texture(const void* dest) noexcept;
@@ -551,14 +553,19 @@ struct ShaderInfo {
   bool usesFog : 1 = false;
   bool lightingEnabled : 1 = false;
   // True iff the shader reads the normal-matrix palette (nrm_mtx): any lit channel, emboss bump,
-  // or the normal-visualization debug path. Gates the 480B nrm_mtx upload for unlit draws.
+  // or the normal-visualization debug path. Gates the nrm_mtx upload for unlit draws.
   bool usesNormals : 1 = false;
+  // True iff vertex shaders or texgens can index multiple pnMtx slots (else only current_pnmtx).
+  bool usesMultiPnMtx : 1 = false;
+  // True iff any sampled texgen indexes into GX_TEXMTX0..9.
+  bool usesTexMtx : 1 = false;
   u8 lineMode : 2 = 0;
 };
 struct BindGroupRanges {
   std::array<gfx::Range, MaxIndexAttr> vaRanges{};
 };
-void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXVtxFmt fmt) noexcept;
+void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXVtxFmt fmt,
+                              bool fillAttrs = true) noexcept;
 // GL: build_pipeline links the program + bakes fixed-function state (Phase 3). build_shader
 // compiles a GLSL program and returns its GL name (0 = failure).
 gl::Pipeline build_pipeline(const PipelineConfig& config, uint32_t program, const char* label) noexcept;

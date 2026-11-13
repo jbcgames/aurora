@@ -83,6 +83,7 @@ void copy_tex(const void* dest, GXBool clear) noexcept {
   ++handle.revision;
   handle.lastUsedFrame = gfx::current_frame();
   g_gxState.copyTextures[dest] = handle;
+  invalidate_copy_caches(dest);
   g_gxState.textureDirty++;
   g_gxState.stateDirty = true;
 }
