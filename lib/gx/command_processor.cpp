@@ -3370,11 +3370,15 @@ static std::array<StaticDlFastSet, kStaticDlFastSets> s_staticDlFast{};
 static std::vector<StaticDlDraw> s_staticDlCapturedDraws;
 static u32 s_staticDlCapturedFmtMask = 0;
 
-static inline const StaticDlDraw& get_static_dl_draw(u32 refIdx) noexcept {
+static inline StaticDlDraw& get_static_dl_draw_mut(u32 refIdx) noexcept {
   if ((refIdx & kStaticDrawExtraBit) == 0) {
     return s_staticDlPool[refIdx].draw0;
   }
   return s_staticDlExtraDraws[refIdx & ~kStaticDrawExtraBit];
+}
+
+static inline const StaticDlDraw& get_static_dl_draw(u32 refIdx) noexcept {
+  return get_static_dl_draw_mut(refIdx);
 }
 
 static inline size_t static_dl_fast_set(const void* dlData) noexcept {
@@ -3538,6 +3542,25 @@ static const NativeGeomEntry* push_and_cache_native_geom(const NativeGeomKey& ke
                                                           u8 vtxStride, const u8* idxData, size_t idxBytes,
                                                           u32 numIndices, bool mirrorCpu, size_t maxMirrorEntryBytes,
                                                           gfx::Range& outVertRange, gfx::Range& outIdxRange) {
+  if (const auto existIt = s_nativeGeomCache.find(key); existIt != s_nativeGeomCache.end()) UNLIKELY {
+    auto& existing = existIt->second;
+    if (mirrorCpu && existing.cpuVerts.empty() && vtxPtr != nullptr && vtxBytes > 0) {
+      const size_t entryBytes = vtxBytes + idxBytes;
+      if (entryBytes <= maxMirrorEntryBytes &&
+          s_nativeGeomCpuMirrorBytes + entryBytes <= kMaxNativeGeomCpuMirrorTotalBytes) {
+        existing.cpuVerts.assign(vtxPtr, vtxPtr + vtxBytes);
+        if (idxData != nullptr && idxBytes > 0) {
+          const size_t idxCount = idxBytes / sizeof(u16);
+          existing.cpuIndices.resize(idxCount);
+          std::memcpy(existing.cpuIndices.data(), idxData, idxBytes);
+        }
+        s_nativeGeomCpuMirrorBytes += entryBytes;
+      }
+    }
+    outVertRange = existing.vertRange;
+    outIdxRange = existing.idxRange;
+    return &existing;
+  }
   const size_t vertAlign = vtxStride > 4 ? static_cast<size_t>(vtxStride) : 4u;
   if (!gfx::can_push_native_cached(vtxBytes, idxBytes, vertAlign)) {
     return nullptr;
@@ -4176,12 +4199,20 @@ static void flush_pending_pnmtx_batch() {
     if (is_timing_enabled()) UNLIKELY ++s_drainTiming.bat_single;
     const auto& item0 = b.items[0];
     if ((item0.flags & kItemStaticPool) != 0) {
-      const StaticDlDraw& sd = get_static_dl_draw(item0.refIdx);
+      StaticDlDraw& sd = get_static_dl_draw_mut(item0.refIdx);
       const NativeGeomEntry* ge = sd.cachedEntry;
       if (ge == nullptr || sd.cachedPtrEpoch != s_nativeGeomPtrEpoch) UNLIKELY {
         const auto cit = s_nativeGeomCache.find(sd.key);
-        CHECK(cit != s_nativeGeomCache.end(), "PendingPnMtxBatch: missing single static entry");
+        if (cit == s_nativeGeomCache.end()) UNLIKELY {
+          b.items.clear();
+          b.extras.clear();
+          b.scratchVerts.clear();
+          b.scratchIdxs.clear();
+          return;
+        }
         ge = &cit->second;
+        sd.cachedEntry = ge;
+        sd.cachedPtrEpoch = s_nativeGeomPtrEpoch;
       }
       emit_native_draw_command(s_lastPipeline, ge->vertRange, ge->idxRange, s_lastUniformRange, item0.vtxCount,
                                ge->indexCount, s_lastBindGroups, b.dstAlpha, /*cachedGeometry=*/true,
@@ -4203,7 +4234,7 @@ static void flush_pending_pnmtx_batch() {
           }
         } else {
           native_geom_resolve_ranges(ex0.key, vtxPtr, ex0.scratchVtxBytes, b.nativeStride, idxPtr, idxBytes,
-                                     ex0.numIndices, ex0.vertRange, ex0.idxRange, cached0, /*mirrorCpu=*/false);
+                                     ex0.numIndices, ex0.vertRange, ex0.idxRange, cached0, /*mirrorCpu=*/true);
         }
       }
       emit_native_draw_command(s_lastPipeline, ex0.vertRange, ex0.idxRange, s_lastUniformRange, item0.vtxCount,
@@ -4335,10 +4366,12 @@ static void flush_pending_pnmtx_batch() {
   }
 
   DrainScopeTimer _t_merge(s_drainTiming.ms_flush_merge);
-  s_nativeVtxBuf.clear();
+  static ByteBuffer s_mergedVtxBuf;
+  static ByteBuffer s_mergedIdxBuf;
+  s_mergedVtxBuf.clear();
   const size_t mergedVtxTotalBytes = static_cast<size_t>(b.totalVtxCount) * mergedStride;
-  s_nativeVtxBuf.reserve_extra(mergedVtxTotalBytes);
-  s_nativeIdxBuf.clear();
+  s_mergedVtxBuf.reserve_extra(mergedVtxTotalBytes);
+  s_mergedIdxBuf.clear();
 
   u16 vtxBase = 0;
   for (size_t s = 0; s < b.items.size(); ++s) {
@@ -4354,71 +4387,96 @@ static void flush_pending_pnmtx_batch() {
       const NativeGeomEntry* ge = nullptr;
       const NativeGeomKey* keyPtr = nullptr;
       if (itStatic) {
-        const StaticDlDraw& sd = get_static_dl_draw(it.refIdx);
+        StaticDlDraw& sd = get_static_dl_draw_mut(it.refIdx);
         keyPtr = &sd.key;
         if (sd.cachedPtrEpoch == s_nativeGeomPtrEpoch) {
           ge = sd.cachedEntry;
         }
+        if (ge == nullptr) UNLIKELY {
+          const auto cit = s_nativeGeomCache.find(*keyPtr);
+          if (cit != s_nativeGeomCache.end()) {
+            ge = &cit->second;
+            sd.cachedEntry = ge;
+            sd.cachedPtrEpoch = s_nativeGeomPtrEpoch;
+          }
+        }
       } else {
-        const PendingPnMtxExtra& ex = b.extras[it.refIdx];
+        PendingPnMtxExtra& ex = b.extras[it.refIdx];
         keyPtr = &ex.key;
         if (ex.cachedPtrEpoch == s_nativeGeomPtrEpoch) {
           ge = ex.cachedEntry;
         }
+        if (ge == nullptr) UNLIKELY {
+          const auto cit = s_nativeGeomCache.find(*keyPtr);
+          if (cit != s_nativeGeomCache.end()) {
+            ge = &cit->second;
+            ex.cachedEntry = ge;
+            ex.cachedPtrEpoch = s_nativeGeomPtrEpoch;
+          }
+        }
       }
-      if (ge == nullptr) UNLIKELY {
-        const auto cit = s_nativeGeomCache.find(*keyPtr);
-        CHECK(cit != s_nativeGeomCache.end(), "PendingPnMtxBatch: missing cached entry");
-        ge = &cit->second;
+      const size_t needVtxBytes = static_cast<size_t>(it.vtxCount) * b.nativeStride;
+      if (ge != nullptr && ge->cpuVerts.size() >= needVtxBytes) LIKELY {
+        srcVerts = ge->cpuVerts.data();
+        srcIdxs = ge->cpuIndices.data();
+        srcIdxCount = static_cast<u32>(ge->cpuIndices.size());
       }
-      CHECK(!ge->cpuVerts.empty(), "PendingPnMtxBatch: missing cpuVerts mirror");
-      srcVerts = ge->cpuVerts.data();
-      srcIdxs = ge->cpuIndices.data();
-      srcIdxCount = static_cast<u32>(ge->cpuIndices.size());
     } else {
       const PendingPnMtxExtra& ex = b.extras[it.refIdx];
-      srcVerts = b.scratchVerts.data() + ex.scratchVtxOff;
-      srcIdxs = itIndexed ? (b.scratchIdxs.data() + ex.scratchIdxOff) : nullptr;
-      srcIdxCount = ex.scratchIdxCount;
+      const size_t needVtxBytes = static_cast<size_t>(it.vtxCount) * b.nativeStride;
+      if (static_cast<size_t>(ex.scratchVtxOff) + needVtxBytes <= b.scratchVerts.size()) LIKELY {
+        srcVerts = b.scratchVerts.data() + ex.scratchVtxOff;
+      }
+      srcIdxs = (itIndexed && static_cast<size_t>(ex.scratchIdxOff) + ex.scratchIdxCount <= b.scratchIdxs.size())
+                    ? (b.scratchIdxs.data() + ex.scratchIdxOff)
+                    : nullptr;
+      srcIdxCount = srcIdxs != nullptr ? ex.scratchIdxCount : 0u;
     }
 
     const u32 slotVal = static_cast<u32>(it.slotIdx) | (static_cast<u32>(it.texSlot) << 4u);
-    for (u16 v = 0; v < it.vtxCount; ++v) {
-      s_nativeVtxBuf.append<u32>(slotVal);
-      const u8* vp = srcVerts + static_cast<size_t>(v) * b.nativeStride;
-      s_nativeVtxBuf.append(vp, b.nativeStride);
+    if (srcVerts != nullptr) LIKELY {
+      for (u16 v = 0; v < it.vtxCount; ++v) {
+        s_mergedVtxBuf.append<u32>(slotVal);
+        const u8* vp = srcVerts + static_cast<size_t>(v) * b.nativeStride;
+        s_mergedVtxBuf.append(vp, b.nativeStride);
+      }
+    } else {
+      for (u16 v = 0; v < it.vtxCount; ++v) {
+        s_mergedVtxBuf.append<u32>(slotVal);
+        s_mergedVtxBuf.append_zeroes(b.nativeStride);
+      }
     }
 
     if (anyIndexed) {
       if (outStrip) {
         if (s > 0) {
-          s_nativeIdxBuf.append<u16>(0xFFFFu);
+          s_mergedIdxBuf.append<u16>(0xFFFFu);
           ++mergedNumIndices;
         }
-        if (itIndexed) {
+        if (itIndexed && srcIdxs != nullptr) {
           for (u32 ii = 0; ii < srcIdxCount; ++ii) {
             const u16 idx = srcIdxs[ii];
-            s_nativeIdxBuf.append<u16>(idx == 0xFFFFu ? 0xFFFFu : static_cast<u16>(idx + vtxBase));
+            s_mergedIdxBuf.append<u16>(idx == 0xFFFFu ? 0xFFFFu : static_cast<u16>(idx + vtxBase));
           }
           mergedNumIndices += srcIdxCount;
         } else {
           for (u16 v = 0; v < it.vtxCount; ++v) {
-            s_nativeIdxBuf.append<u16>(static_cast<u16>(vtxBase + v));
+            s_mergedIdxBuf.append<u16>(static_cast<u16>(vtxBase + v));
           }
           mergedNumIndices += it.vtxCount;
         }
       } else if (itStrip) {
         mergedNumIndices += append_unrolled_strip_indices(
-            s_nativeIdxBuf, itIndexed ? srcIdxs : nullptr, srcIdxCount, it.vtxCount, vtxBase);
+            s_mergedIdxBuf, (itIndexed && srcIdxs != nullptr) ? srcIdxs : nullptr, srcIdxCount, it.vtxCount, vtxBase);
       } else {
-        if (itIndexed) {
+        if (itIndexed && srcIdxs != nullptr) {
           for (u32 ii = 0; ii < srcIdxCount; ++ii) {
-            s_nativeIdxBuf.append<u16>(static_cast<u16>(srcIdxs[ii] + vtxBase));
+            s_mergedIdxBuf.append<u16>(static_cast<u16>(srcIdxs[ii] + vtxBase));
           }
           mergedNumIndices += srcIdxCount;
         } else {
           for (u16 v = 0; v < it.vtxCount; ++v) {
-            s_nativeIdxBuf.append<u16>(static_cast<u16>(vtxBase + v));
+            s_mergedIdxBuf.append<u16>(static_cast<u16>(vtxBase + v));
           }
           mergedNumIndices += it.vtxCount;
         }
@@ -4427,20 +4485,20 @@ static void flush_pending_pnmtx_batch() {
     vtxBase = static_cast<u16>(vtxBase + it.vtxCount);
   }
 
-  const u8* idxPtr = anyIndexed ? s_nativeIdxBuf.data() : nullptr;
-  const size_t idxBytes = anyIndexed ? s_nativeIdxBuf.size() : 0u;
+  const u8* idxPtr = anyIndexed ? s_mergedIdxBuf.data() : nullptr;
+  const size_t idxBytes = anyIndexed ? s_mergedIdxBuf.size() : 0u;
   if (b.allCached) {
-    native_geom_resolve_ranges(mergedKey, s_nativeVtxBuf.data(), s_nativeVtxBuf.size(), mergedStride, idxPtr, idxBytes,
+    native_geom_resolve_ranges(mergedKey, s_mergedVtxBuf.data(), s_mergedVtxBuf.size(), mergedStride, idxPtr, idxBytes,
                                mergedNumIndices, mergedVertRange, mergedIdxRange, mergedCached, /*mirrorCpu=*/false);
   } else {
     const size_t vertAlign = mergedStride > 4 ? static_cast<size_t>(mergedStride) : 4u;
     ++s_geomCacheRingPushes;
-    mergedVertRange = gfx::push_verts(s_nativeVtxBuf.data(), s_nativeVtxBuf.size(), vertAlign);
+    mergedVertRange = gfx::push_verts(s_mergedVtxBuf.data(), s_mergedVtxBuf.size(), vertAlign);
     if (idxPtr != nullptr && idxBytes > 0) {
       mergedIdxRange = gfx::push_indices(idxPtr, idxBytes, 4);
     }
   }
-  s_nativeIdxBuf.clear();
+  s_mergedIdxBuf.clear();
 
   if (needListPipeMemo) {
     s_lastConfig.triangleStripTopology = 0u;
@@ -4570,9 +4628,9 @@ static inline bool try_fit_pnmtx_tex_and_mtx(PendingPnMtxBatch& b, u32 mtxIdx, c
 static inline void record_pnmtx_item(PendingPnMtxBatch& b, u16 vtxCount, u32 slotIdx, u32 texSlot,
                                      bool cached, bool indexed, bool stripTopology, bool promoTried,
                                      u32 staticPoolRefIdx, const NativeGeomKey& key,
-                                     const NativeGeomEntry* cachedEntry, const gfx::Range& vertRange,
-                                     const gfx::Range& idxRange, u32 numIndices, const u8* vtxPtr,
-                                     size_t vtxBytes, const u8* idxPtr, size_t idxBytes) {
+                                     const NativeGeomEntry* cachedEntry, u32 cachedEntryEpoch,
+                                     const gfx::Range& vertRange, const gfx::Range& idxRange, u32 numIndices,
+                                     const u8* vtxPtr, size_t vtxBytes, const u8* idxPtr, size_t idxBytes) {
   PendingPnMtxItem& item = b.items.emplace_back();
   item.vtxCount = vtxCount;
   item.slotIdx = static_cast<u8>(slotIdx);
@@ -4588,7 +4646,7 @@ static inline void record_pnmtx_item(PendingPnMtxBatch& b, u16 vtxCount, u32 slo
   PendingPnMtxExtra& ex = b.extras.emplace_back();
   ex.key = key;
   ex.cachedEntry = cachedEntry;
-  ex.cachedPtrEpoch = cached ? s_nativeGeomPtrEpoch : 0u;
+  ex.cachedPtrEpoch = cached ? cachedEntryEpoch : 0u;
   ex.vertRange = vertRange;
   ex.idxRange = idxRange;
   ex.numIndices = numIndices;
@@ -4633,10 +4691,13 @@ static void submit_native_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
   }
 
   bool cached = (cachedEntry != nullptr);
-  bool hasCpuMirror = cached && !cachedEntry->cpuVerts.empty();
+  u32 cachedEntryEpoch = cached ? s_nativeGeomPtrEpoch : 0u;
   gfx::Range cachedVertRange = cached ? cachedEntry->vertRange : gfx::Range{};
   gfx::Range cachedIdxRange = cached ? cachedEntry->idxRange : gfx::Range{};
   u32 effectiveNumIndices = cached ? cachedEntry->indexCount : numIndices;
+  const size_t minMirrorVtxBytes = static_cast<size_t>(vtxCount) * nativeStride;
+  bool hasCpuMirror = cached && cachedEntry->cpuVerts.size() >= minMirrorVtxBytes &&
+                      (!indexed || cachedEntry->cpuIndices.size() >= effectiveNumIndices);
 
   const bool baseEligible = kEnablePnMtxBatch && vtxCount <= 0xFFFEu &&
                             nativeAttrs[GX_VA_PNMTXIDX].attrType == GX_NONE;
@@ -4650,7 +4711,10 @@ static void submit_native_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
                                 cachedVertRange, cachedIdxRange, /*mirrorCpu=*/true, &promotedEntry)) {
       cached = true;
       cachedEntry = promotedEntry;
-      hasCpuMirror = (promotedEntry != nullptr && !promotedEntry->cpuVerts.empty());
+      cachedEntryEpoch = s_nativeGeomPtrEpoch;
+      effectiveNumIndices = promotedEntry != nullptr ? promotedEntry->indexCount : numIndices;
+      hasCpuMirror = (promotedEntry != nullptr && promotedEntry->cpuVerts.size() >= minMirrorVtxBytes &&
+                      (!indexed || promotedEntry->cpuIndices.size() >= effectiveNumIndices));
     }
   }
 
@@ -4743,8 +4807,8 @@ static void submit_native_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
         const bool itemIndexed = cached ? (effectiveNumIndices != 0) : indexed;
         const u32 refId = (cached && hasCpuMirror) ? staticPoolRefIdx : UINT32_MAX;
         record_pnmtx_item(b, vtxCount, slotIdx, texSlot, cached, itemIndexed, stripTopology, promoTried,
-                          refId, key, cachedEntry, cachedVertRange, cachedIdxRange, effectiveNumIndices,
-                          vtxPtr, vtxBytes, idxPtr, idxBytes);
+                          refId, key, cachedEntry, cachedEntryEpoch, cachedVertRange, cachedIdxRange,
+                          effectiveNumIndices, vtxPtr, vtxBytes, idxPtr, idxBytes);
         if (!cached) {
           b.allCached = false;
         } else if (b.allCached) {
@@ -4783,6 +4847,23 @@ static void submit_native_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
   }
 
   flush_pending_pnmtx_batch();
+  if (cached && cachedEntryEpoch != s_nativeGeomPtrEpoch) UNLIKELY {
+    const auto cit = s_nativeGeomCache.find(key);
+    if (cit != s_nativeGeomCache.end()) {
+      cachedEntry = &cit->second;
+      cachedEntryEpoch = s_nativeGeomPtrEpoch;
+      cachedVertRange = cachedEntry->vertRange;
+      cachedIdxRange = cachedEntry->idxRange;
+      effectiveNumIndices = cachedEntry->indexCount;
+      hasCpuMirror = cachedEntry->cpuVerts.size() >= minMirrorVtxBytes &&
+                     (!indexed || cachedEntry->cpuIndices.size() >= effectiveNumIndices);
+    } else {
+      cached = false;
+      cachedEntry = nullptr;
+      cachedEntryEpoch = 0u;
+      hasCpuMirror = false;
+    }
+  }
 
   resolve_single_native_draw_state(prim, fmt, nativeAttrs, nativeStride, stripTopology, preCfgPopulated,
                                    preConfigSame, preBgPopulated);
@@ -4799,7 +4880,7 @@ static void submit_native_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
         }
       } else {
         native_geom_resolve_ranges(key, vtxPtr, vtxBytes, nativeStride, idxPtr, idxBytes, effectiveNumIndices,
-                                   cachedVertRange, cachedIdxRange, cached, /*mirrorCpu=*/false);
+                                   cachedVertRange, cachedIdxRange, cached, /*mirrorCpu=*/true);
       }
     }
     emit_native_draw_command(s_lastPipeline, cachedVertRange, cachedIdxRange, s_lastUniformRange, vtxCount,
@@ -4866,8 +4947,8 @@ static void submit_native_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
   const bool item0Indexed = cached ? (effectiveNumIndices != 0) : indexed;
   const u32 refId = (cached && hasCpuMirror) ? staticPoolRefIdx : UINT32_MAX;
   record_pnmtx_item(b, vtxCount, 0u, 0u, cached, item0Indexed, stripTopology, promoTried,
-                    refId, key, cachedEntry, cachedVertRange, cachedIdxRange, effectiveNumIndices,
-                    vtxPtr, vtxBytes, idxPtr, idxBytes);
+                    refId, key, cachedEntry, cachedEntryEpoch, cachedVertRange, cachedIdxRange,
+                    effectiveNumIndices, vtxPtr, vtxBytes, idxPtr, idxBytes);
 }
 
 // Expand `vtxCount` raw FIFO vertices and push a native draw, serving steady-state
@@ -5260,7 +5341,9 @@ static bool replay_static_dl_entry(u32 poolIdx, StaticDlEntry& entry) {
         d.cachedEntry = &git->second;
         d.cachedPtrEpoch = ptrEpoch;
       }
-      allMirror &= !d.cachedEntry->cpuVerts.empty();
+      const size_t minVtxBytes = static_cast<size_t>(d.vtxCount) * d.nativeStride;
+      allMirror &= (d.cachedEntry->cpuVerts.size() >= minVtxBytes) &&
+                   (!d.indexed() || d.cachedEntry->cpuIndices.size() >= d.cachedEntry->indexCount);
     }
     if (allCached) {
       entry.cachedAllPtrEpoch = ptrEpoch;
@@ -5284,7 +5367,7 @@ static bool replay_static_dl_entry(u32 poolIdx, StaticDlEntry& entry) {
   const u32 extraStart = entry.extraStart;
   for (u32 i = 0; i < drawCount; ++i) {
     const u32 refIdx = (i == 0) ? poolIdx : (kStaticDrawExtraBit | (extraStart + (i - 1u)));
-    const StaticDlDraw& d =
+    StaticDlDraw& d =
         (i == 0) ? s_staticDlPool[poolIdx].draw0 : s_staticDlExtraDraws[extraStart + (i - 1u)];
     ++s_geomCacheHits;
     bool preBg = false;
@@ -5297,8 +5380,12 @@ static bool replay_static_dl_entry(u32 poolIdx, StaticDlEntry& entry) {
     const NativeGeomEntry* ge = d.cachedEntry;
     if (ge == nullptr || d.cachedPtrEpoch != s_nativeGeomPtrEpoch) UNLIKELY {
       const auto cit = s_nativeGeomCache.find(d.key);
-      CHECK(cit != s_nativeGeomCache.end(), "replay_static_dl_entry: missing cached entry");
+      if (cit == s_nativeGeomCache.end()) UNLIKELY {
+        return false;
+      }
       ge = &cit->second;
+      d.cachedEntry = ge;
+      d.cachedPtrEpoch = s_nativeGeomPtrEpoch;
     }
     submit_native_gx_draw(d.gxPrim(), d.gxFmt(), d.vtxCount, s_attrLayoutPool[d.attrLayoutId].attrs,
                           d.attrLayoutId, d.nativeStride, d.key, ge, nullptr, 0, nullptr, 0, ge->indexCount,
@@ -5360,7 +5447,9 @@ static void store_static_dl_entry(const void* cacheKey, const void* dlData, u32 
       d.cachedEntry = &git->second;
       d.cachedPtrEpoch = finalEpoch;
     }
-    allMirror &= !d.cachedEntry->cpuVerts.empty();
+    const size_t minVtxBytes = static_cast<size_t>(d.vtxCount) * d.nativeStride;
+    allMirror &= (d.cachedEntry->cpuVerts.size() >= minVtxBytes) &&
+                 (!d.indexed() || d.cachedEntry->cpuIndices.size() >= d.cachedEntry->indexCount);
   }
 
   const u16 vtxStateId = intern_dl_vtx_state(current_vtx_desc_bits(), s_gxDiscArrayInvalidateGen,
