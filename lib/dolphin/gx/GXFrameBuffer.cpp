@@ -6,6 +6,7 @@
 #include "../../window.hpp"
 #include "../../gfx/clear.hpp"
 #include "../../webgpu/gpu.hpp"
+#include "../../gx/fifo.hpp"
 #include "../vi/vi_internal.hpp"
 
 #include <algorithm>
@@ -83,6 +84,7 @@ void copy_tex(const void* dest, GXBool clear) noexcept {
   ++handle.revision;
   handle.lastUsedFrame = gfx::current_frame();
   g_gxState.copyTextures[dest] = handle;
+  note_copy_textures_changed();
   invalidate_copy_caches(dest);
   g_gxState.textureDirty++;
   g_gxState.stateDirty = true;
@@ -249,6 +251,7 @@ void GXCopyTex(void* dest, GXBool clear) {
   SET_REG_FIELD(0, __gx->cpTex, 1, 14, 0);
   SET_REG_FIELD(0, __gx->cpTex, 8, 24, 0x52);
   GX_WRITE_RAS_REG(__gx->cpTex);
+  __gx_shadow_invalidate_tex();
 }
 
 // TODO GXGetYScaleFactor
@@ -259,6 +262,8 @@ void GXClearBoundingBox() {
 }
 
 void GXReadBoundingBox(u16* left, u16* top, u16* right, u16* bottom) {
+  GXFlush();
+  aurora::gx::fifo::drain();
   GXDrawDone();
   aurora::gx::bbox_read(left, top, right, bottom);
 }

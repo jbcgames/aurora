@@ -147,6 +147,16 @@ static std::vector<uint32_t> g_freeDrawTypeSlots;
 static std::vector<RuntimeEncoderTaskType> g_runtimeEncoderTaskTypes;
 static std::vector<uint32_t> g_freeEncoderTaskTypeSlots;
 static std::mutex g_bindGroupCacheMutex;
+static std::atomic<uint32_t> g_bindGroupCacheGen{1};
+
+static inline void bump_bind_group_cache_gen() noexcept {
+  const uint32_t next = g_bindGroupCacheGen.load(std::memory_order_relaxed) + 1;
+  g_bindGroupCacheGen.store(next == 0 ? 1 : next, std::memory_order_release);
+}
+
+uint32_t bind_group_cache_gen() noexcept {
+  return g_bindGroupCacheGen.load(std::memory_order_acquire);
+}
 static std::mutex g_samplerCacheMutex;
 static std::mutex g_runtimeDrawTypeMutex;
 
@@ -829,12 +839,14 @@ void resolve_pass_into(TextureHandle texture, ClipRect rect, bool clearColor, bo
   prevPass.resolveTarget = std::move(texture);
   prevPass.resolveRect = rect;
   prevPass.resolveFormat = resolveFormat;
-  // Push UV transform uniform for tex_copy_conv (crop region in UV space)
+  // Push UV transform uniform for tex_copy_conv (crop region in UV space).
+  // copySourceView has OpenGL bottom-left origin (v=1 is GX top y=0), whereas
+  // tex_copy_conv samples uv_offset.y at GX bottom and uv_offset.y+uv_scale.y at GX top.
   const auto srcW = static_cast<float>(prevPass.targetSize.width);
   const auto srcH = static_cast<float>(prevPass.targetSize.height);
   const std::array uvTransform{
       static_cast<float>(rect.x) / srcW,
-      static_cast<float>(rect.y) / srcH,
+      (srcH - static_cast<float>(rect.y + rect.height)) / srcH,
       static_cast<float>(rect.width) / srcW,
       static_cast<float>(rect.height) / srcH,
   };
@@ -903,6 +915,7 @@ void clear_caches() noexcept {
   g_offscreenCache.clear();
   std::lock_guard lock{g_bindGroupCacheMutex};
   g_cachedBindGroups.clear();
+  bump_bind_group_cache_gen();
 }
 
 uint32_t color_format() noexcept {
@@ -1413,6 +1426,7 @@ void shutdown() {
   {
     std::lock_guard lock{g_bindGroupCacheMutex};
     g_cachedBindGroups.clear();
+    bump_bind_group_cache_gen();
   }
   {
     std::lock_guard lock{g_samplerCacheMutex};
@@ -1472,7 +1486,22 @@ static size_t acquire_frame_slot() {
 bool begin_frame() {
   ZoneScoped;
   // pace_frame_start();
+  static double s_slotAcc = 0.0;
+  static double s_slotMax = 0.0;
+  static uint32_t s_slotFrames = 0;
+  const auto tSlot0 = s_logWorkerTimings ? PresentClock::now() : PresentClock::time_point{};
   const size_t frameSlot = acquire_frame_slot();
+  if (s_logWorkerTimings) {
+    const double dt = std::chrono::duration<double, std::milli>(PresentClock::now() - tSlot0).count();
+    s_slotAcc += dt;
+    if (dt > s_slotMax) s_slotMax = dt;
+    if (++s_slotFrames >= 30) {
+      std::fprintf(stdout, "[AURORA-SLOT-30f] avg=%.2fms max=%.2fms\n", s_slotAcc / 30.0, s_slotMax);
+      s_slotAcc = 0.0;
+      s_slotMax = 0.0;
+      s_slotFrames = 0;
+    }
+  }
 
   auto& frame = g_framePackets[frameSlot];
   frame.reset();
@@ -1686,12 +1715,17 @@ static void expire_cached_bind_groups() {
   }
 
   ZoneScoped;
+  bool erased = false;
   for (auto it = g_cachedBindGroups.begin(); it != g_cachedBindGroups.end();) {
     if (g_frameIndex - it->second.lastUsedFrame > BindGroupCacheRetainFrames) {
       g_cachedBindGroups.erase(it++);
+      erased = true;
     } else {
       ++it;
     }
+  }
+  if (erased) {
+    bump_bind_group_cache_gen();
   }
 }
 
@@ -2270,6 +2304,7 @@ std::pair<Range, bool> push_native_cached_indices(const uint8_t* data, size_t le
 
 void request_native_geometry_cache_reset() noexcept { s_nativeGeomCacheResetPending = true; }
 uint32_t native_geom_cache_generation() noexcept { return s_nativeGeomCacheGeneration; }
+bool in_frame() noexcept { return g_recordingFrame != nullptr; }
 
 Range push_uniform(const uint8_t* data, size_t length) {
   ZoneScoped;
@@ -2313,25 +2348,66 @@ Range push_texture_data(const uint8_t* data, u32 bytesPerRow, u32 rowsPerImage) 
 BindGroupRef bind_group_ref(const gl::BindingSet& bindingSet) {
   // Hash the POD binding set (callers zero-init it, so trailing padding is deterministic).
   const auto id = xxh3_hash_s(&bindingSet, sizeof(bindingSet));
+  struct MainBindGroupEntry {
+    BindGroupRef id = 0;
+    uint32_t gen = 0;
+    uint32_t lastFrame = 0;
+  };
+  thread_local static MainBindGroupEntry s_mainBindGroups[512]{};
+
+  const uint32_t gen = g_bindGroupCacheGen.load(std::memory_order_acquire);
+  const uint32_t frame = g_frameIndex;
+  const size_t slot = static_cast<size_t>(id ^ (id >> 9)) & 511u;
+  MainBindGroupEntry& entry = s_mainBindGroups[slot];
+  if (frame != UINT32_MAX && entry.gen == gen && entry.id == id && entry.lastFrame <= frame &&
+      (frame - entry.lastFrame) < 32u) {
+    return id;
+  }
+
   std::lock_guard lock{g_bindGroupCacheMutex};
   const auto it = g_cachedBindGroups.find(id);
   if (it == g_cachedBindGroups.end()) {
-    g_cachedBindGroups.emplace(id, CachedBindGroup{.bindGroup = bindingSet, .lastUsedFrame = g_frameIndex});
+    g_cachedBindGroups.emplace(id, CachedBindGroup{.bindGroup = bindingSet, .lastUsedFrame = frame});
   } else {
-    it->second.lastUsedFrame = g_frameIndex;
+    it->second.lastUsedFrame = frame;
+  }
+  if (frame != UINT32_MAX) {
+    entry.id = id;
+    entry.gen = g_bindGroupCacheGen.load(std::memory_order_acquire);
+    entry.lastFrame = frame;
   }
   return id;
 }
 
-const gl::BindingSet& find_bind_group(BindGroupRef id) {
-  thread_local static struct FastBindGroupEntry {
-    BindGroupRef id = 0;
-    gl::BindingSet set{};
-  } s_fastBindGroups[16]{};
+bool touch_bind_group(BindGroupRef id) noexcept {
+  if (id == 0) {
+    return false;
+  }
+  const uint32_t frame = g_frameIndex;
+  std::lock_guard lock{g_bindGroupCacheMutex};
+  const auto it = g_cachedBindGroups.find(id);
+  if (it == g_cachedBindGroups.end()) {
+    return false;
+  }
+  if (frame != UINT32_MAX) {
+    it->second.lastUsedFrame = frame;
+  }
+  return true;
+}
 
-  const size_t slot = (id ^ (id >> 4)) & 15;
-  if (s_fastBindGroups[slot].id == id) {
-    return s_fastBindGroups[slot].set;
+const gl::BindingSet& find_bind_group(BindGroupRef id) {
+  struct FastBindGroupEntry {
+    BindGroupRef id = 0;
+    uint32_t gen = 0;
+    gl::BindingSet set{};
+  };
+  thread_local static FastBindGroupEntry s_fastBindGroups[512]{};
+
+  const uint32_t gen = g_bindGroupCacheGen.load(std::memory_order_acquire);
+  const size_t slot = static_cast<size_t>(id ^ (id >> 9)) & 511u;
+  FastBindGroupEntry& entry = s_fastBindGroups[slot];
+  if (entry.gen == gen && entry.id == id) {
+    return entry.set;
   }
 
   std::lock_guard lock{g_bindGroupCacheMutex};
@@ -2340,9 +2416,10 @@ const gl::BindingSet& find_bind_group(BindGroupRef id) {
     static const gl::BindingSet kEmptyBindingSet{};
     return kEmptyBindingSet;
   }
-  s_fastBindGroups[slot].id = id;
-  s_fastBindGroups[slot].set = it->second.bindGroup;
-  return s_fastBindGroups[slot].set;
+  entry.id = id;
+  entry.gen = g_bindGroupCacheGen.load(std::memory_order_acquire);
+  entry.set = it->second.bindGroup;
+  return entry.set;
 }
 
 gl::Texture create_gl_texture(gl::TextureFormat format, gl::Extent3D size, uint32_t mips, bool renderable) {

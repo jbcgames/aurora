@@ -5,6 +5,10 @@
 #include "shader_info.hpp"
 #include "tracy/Tracy.hpp"
 
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+
 namespace aurora::gx {
 static Module Log("aurora::gx");
 
@@ -27,30 +31,29 @@ gl::Pipeline create_pipeline(const PipelineConfig& config) {
 }
 
 void render(const DrawData& data, gl::PassEncoder& pass) {
+  static const bool s_detail = std::getenv("TTYD_TIMING_DETAIL") != nullptr;
+  using Clock = std::chrono::steady_clock;
+  static double s_msPipe = 0, s_msUni = 0, s_msTex = 0, s_msBuf = 0, s_msDraw = 0;
+  static uint32_t s_draws = 0;
+  const auto t0 = s_detail ? Clock::now() : Clock::time_point{};
   if (!gfx::bind_pipeline(data.pipeline, pass)) {
     return;
   }
+  const auto t1 = s_detail ? Clock::now() : Clock::time_point{};
 
-  // Group 1: the GX uniform block, bound with a per-draw dynamic offset
-  // (glBindBufferRange in Phase 3).
-  gl::BindingSet uniformSet{};
-  uniformSet.buffers[0] = gl::BindingSet::BufferBinding{
-      .buffer = gfx::g_uniformBuffer.id,
-      .binding = 0,
-      .offset = 0,
-      .size = static_cast<uint32_t>(data.uniformRange.size),
-      .dynamic = true,
-  };
-  uniformSet.bufferCount = 1;
-  const std::array offsets{data.uniformRange.offset};
-  pass.SetBindGroup(1, uniformSet, offsets.size(), offsets.data());
+  // Group 1: the GX uniform block, bound directly with its per-draw range.
+  pass.SetUniformBuffer0(gfx::g_uniformBuffer.id, data.uniformRange.offset,
+                         static_cast<uint32_t>(data.uniformRange.size));
+  const auto t2 = s_detail ? Clock::now() : Clock::time_point{};
   static gfx::BindGroupRef s_lastTextureBindGroup{};
-  if (data.bindGroups.textureBindGroup != s_lastTextureBindGroup) {
-    if (data.bindGroups.textureBindGroup) {
-      pass.SetBindGroup(2, gfx::find_bind_group(data.bindGroups.textureBindGroup));
-    }
+  static uint64_t s_lastTexturePassId = 0;
+  if (data.bindGroups.textureBindGroup &&
+      (data.bindGroups.textureBindGroup != s_lastTextureBindGroup || pass.id() != s_lastTexturePassId)) {
+    pass.SetBindGroup(2, gfx::find_bind_group(data.bindGroups.textureBindGroup));
     s_lastTextureBindGroup = data.bindGroups.textureBindGroup;
+    s_lastTexturePassId = pass.id();
   }
+  const auto t3 = s_detail ? Clock::now() : Clock::time_point{};
   if (data.nativeVertexFetch) {
     // Native draws read from a real vertex buffer instead of the group-0 SSBOs. Cached
     // geometry lives in the persistent cross-frame cache buffer; everything else in the
@@ -64,10 +67,30 @@ void render(const DrawData& data, gl::PassEncoder& pass) {
     const gl::Color color{0.f, 0.f, 0.f, data.dstAlpha / 255.f};
     pass.SetBlendConstant(&color);
   }
+  const auto t4 = s_detail ? Clock::now() : Clock::time_point{};
   if (data.indexCount == 0) {
     pass.Draw(data.vtxCount, data.instanceCount);
   } else {
     pass.DrawIndexed(data.indexCount, data.instanceCount);
+  }
+  if (s_detail) {
+    const auto t5 = Clock::now();
+    s_msPipe += std::chrono::duration<double, std::milli>(t1 - t0).count();
+    s_msUni += std::chrono::duration<double, std::milli>(t2 - t1).count();
+    s_msTex += std::chrono::duration<double, std::milli>(t3 - t2).count();
+    s_msBuf += std::chrono::duration<double, std::milli>(t4 - t3).count();
+    s_msDraw += std::chrono::duration<double, std::milli>(t5 - t4).count();
+    if (++s_draws >= 4700) {
+      const double f = 10.0 / s_draws; // per 10-frame scale ~470 draws -> per-frame ms normalized to 470 draws
+      const double perFrame = 470.0 / s_draws;
+      std::fprintf(stdout,
+                   "[REN-DETAIL/470d] pipe=%.2fms uni=%.2fms tex=%.2fms buf=%.2fms draw=%.2fms tot=%.2fms\n",
+                   s_msPipe * perFrame, s_msUni * perFrame, s_msTex * perFrame, s_msBuf * perFrame, s_msDraw * perFrame,
+                   (s_msPipe + s_msUni + s_msTex + s_msBuf + s_msDraw) * perFrame);
+      (void)f;
+      s_msPipe = s_msUni = s_msTex = s_msBuf = s_msDraw = 0.0;
+      s_draws = 0;
+    }
   }
 }
 } // namespace aurora::gx

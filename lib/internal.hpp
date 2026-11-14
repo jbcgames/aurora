@@ -317,6 +317,12 @@ public:
 
   void clear() { m_length = 0; }
   void reserve_extra(size_t size) { resize(m_length + size, true); }
+  [[nodiscard]] uint8_t* alloc_write(size_t size) {
+    resize(m_length + size, false);
+    uint8_t* ptr = m_data + m_length;
+    m_length += size;
+    return ptr;
+  }
 
   ByteBuffer clone() const {
     ByteBuffer clone{m_length};

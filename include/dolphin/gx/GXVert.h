@@ -77,6 +77,11 @@ void GXTexCoord1s8(s8 s);
 void GXTexCoord1x16(u16 index);
 void GXTexCoord1x8(u8 index);
 
+void GXEmitAnimTriFan16_1Tex(u8 vtxFmt, u16 count, const void* posIdx, const void* nrmIdx, const void* clr0Idx,
+                             const void* texIdx);
+void GXEmitAnimTriFan16_NTex(u8 vtxFmt, u16 count, const void* posIdx, const void* nrmIdx, const void* clr0Idx,
+                             const void* const* texIdxPtrs, u32 numTex);
+
 extern void GXEnd(void);
 
 #else

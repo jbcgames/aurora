@@ -202,8 +202,21 @@ struct LastResolvedMeta {
   u32 mipCount = 0;
   u32 mode0 = 0;
   u32 mode1 = 0;
+  GXState::TexMetric metric{};
 };
 static std::array<LastResolvedMeta, MaxTextures> s_lastResolvedMeta{};
+static u32 s_resolvedBindGroupGen = 1;
+static u32 s_copyTextureGen = 1;
+
+static inline GXState::TexMetric compute_tex_metric(const gfx::TextureBind& tex) noexcept {
+  return {
+      .width = static_cast<f32>(tex.texObj.width()),
+      .height = static_cast<f32>(tex.texObj.height()),
+      .lodBias = tex.texObj.lod_bias(),
+      .texWidth = tex.ref ? tex.ref->size.width : 0u,
+      .arbitraryMips = tex.ref && tex.ref->hasArbitraryMips,
+  };
+}
 
 std::atomic_bool s_staticTextureCacheClearPending = false;
 
@@ -213,6 +226,7 @@ void invalidate_fast_tex_id(u32 texObjId) noexcept {
   if (texObjId == 0) {
     return;
   }
+  ++s_resolvedBindGroupGen;
   const size_t slot = fast_tex_slot(texObjId);
   if (s_fastResolvedTextures[slot].texObjId == texObjId) {
     s_fastResolvedTextures[slot] = {};
@@ -228,6 +242,7 @@ void invalidate_data_caches(const void* data) noexcept {
   if (data == nullptr) {
     return;
   }
+  ++s_resolvedBindGroupGen;
   for (auto it = s_textureObjectCaches.begin(); it != s_textureObjectCaches.end();) {
     if (it->second.data == data) {
       clear_texture_dependency(it->first, it->second.tlutObjId);
@@ -255,6 +270,7 @@ void invalidate_data_caches(const void* data) noexcept {
 }
 
 void invalidate_tlut_dependents(u32 tlutObjId, const void* tlutData = nullptr) noexcept {
+  ++s_resolvedBindGroupGen;
   for (auto& fast : s_fastResolvedTextures) {
     if ((tlutObjId != 0 && fast.tlutObjId == tlutObjId) ||
         (tlutData != nullptr && fast.tlutData == tlutData)) {
@@ -282,6 +298,7 @@ void invalidate_tlut_dependents(u32 tlutObjId, const void* tlutData = nullptr) n
 
 template <typename Pred>
 void invalidate_caches_if(const Pred& in) noexcept {
+  ++s_resolvedBindGroupGen;
   for (auto it = s_textureObjectCaches.begin(); it != s_textureObjectCaches.end();) {
     if (in(it->second.data)) {
       clear_texture_dependency(it->first, it->second.tlutObjId);
@@ -309,6 +326,7 @@ void invalidate_caches_if(const Pred& in) noexcept {
 }
 
 void do_clear_static_texture_cache() noexcept {
+  ++s_resolvedBindGroupGen;
   s_lastResolvedMeta.fill({});
   s_fastResolvedTextures.fill({});
   s_fastResolvedPtrTextures.fill({});
@@ -687,6 +705,7 @@ void set_render_scissor(const gfx::ClipRect& scissor) noexcept {
 const gfx::TextureBind& get_texture(GXTexMapID id) noexcept { return g_gxState.textures[static_cast<size_t>(id)]; }
 
 void evict_texture_object(u32 texObjId) noexcept {
+  ++s_resolvedBindGroupGen;
   const void* evictedData = nullptr;
   if (const auto it = s_textureObjectCaches.find(texObjId); it != s_textureObjectCaches.end()) {
     evictedData = it->second.data;
@@ -708,6 +727,7 @@ void evict_texture_object(u32 texObjId) noexcept {
 }
 
 void evict_tlut_object(u32 tlutObjId) noexcept {
+  ++s_resolvedBindGroupGen;
   if (const auto it = s_tlutObjectCaches.find(tlutObjId); it != s_tlutObjectCaches.end()) {
     for (const u32 texObjId : it->second.staticTextureUsers) {
       s_textureObjectCaches.erase(texObjId);
@@ -733,6 +753,8 @@ void evict_tlut_object(u32 tlutObjId) noexcept {
 static absl::flat_hash_map<const void*, const void*> s_copyAliases;
 
 void clear_copy_texture_cache() noexcept {
+  ++s_copyTextureGen;
+  ++s_resolvedBindGroupGen;
   g_gxState.copyTextures.clear();
   s_copyAliases.clear();
   g_gxState.copyTextureCache.clear();
@@ -750,7 +772,13 @@ void clear_static_texture_cache() noexcept { s_staticTextureCacheClearPending.st
 
 void invalidate_copy_caches(const void* dest) noexcept { invalidate_data_caches(dest); }
 
+void note_copy_textures_changed() noexcept {
+  ++s_copyTextureGen;
+  ++s_resolvedBindGroupGen;
+}
+
 void alias_copy_texture(const void* src, const void* dest) noexcept {
+  ++s_copyTextureGen;
   invalidate_data_caches(dest);
   const auto it = g_gxState.copyTextures.find(src);
   if (it == g_gxState.copyTextures.end() || !it->second.handle) {
@@ -762,6 +790,7 @@ void alias_copy_texture(const void* src, const void* dest) noexcept {
 }
 
 void forget_memory(const void* lo_, const void* hi_) noexcept {
+  ++s_copyTextureGen;
   const auto lo = reinterpret_cast<uintptr_t>(lo_);
   const auto hi = reinterpret_cast<uintptr_t>(hi_);
   if (hi <= lo) {
@@ -783,6 +812,7 @@ void forget_memory(const void* lo_, const void* hi_) noexcept {
 }
 
 void move_memory(const void* from_, const void* to_, size_t size) noexcept {
+  ++s_copyTextureGen;
   const auto from = reinterpret_cast<uintptr_t>(from_);
   const auto to = reinterpret_cast<uintptr_t>(to_);
   if (from == to || size == 0) {
@@ -837,6 +867,7 @@ void expire_texture_object_caches() noexcept {
   if (frame == UINT32_MAX || frame % SweepPeriod != 0) {
     return;
   }
+  ++s_resolvedBindGroupGen;
   ZoneScoped;
 
   // Anything currently referenced by a texmap/tlut slot must survive regardless of age: a
@@ -911,23 +942,9 @@ void expire_texture_object_caches() noexcept {
     }
   }
 
-  // Evict stale EFB copy textures that haven't been written or sampled recently.
-  std::vector<const void*> staleCopyDests;
-  for (const auto& [dest, ref] : g_gxState.copyTextures) {
-    if (!boundDataAddrs.contains(dest) && frame - ref.lastUsedFrame > 180) {
-      staleCopyDests.push_back(dest);
-    }
-  }
-  for (const void* dest : staleCopyDests) {
-    evict_copy_texture(dest);
-  }
-  for (auto it = g_gxState.copyTextureCache.begin(); it != g_gxState.copyTextureCache.end();) {
-    if (!boundDataAddrs.contains(it->first.dest) && frame - it->second.lastUsedFrame > 180) {
-      g_gxState.copyTextureCache.erase(it++);
-    } else {
-      ++it;
-    }
-  }
+  // Note: g_gxState.copyTextures / copyTextureCache hold unique EFB captures (e.g. extdrv crowd textures)
+  // that cannot be re-decoded from CPU memory. Their lifetime is managed by forget_memory() and move_memory()
+  // when game heaps free or compact allocations, so they must not be evicted on a fixed frame timeout.
 
   // If cached textures exceed budget on 1 GB RAM devices, drop stale non-bound texture objects first.
   if (s_staticContentCache.size() > 4096) {
@@ -955,6 +972,7 @@ void expire_texture_object_caches() noexcept {
 }
 
 void evict_copy_texture(const void* dest) noexcept {
+  ++s_copyTextureGen;
   s_copyAliases.erase(dest);
   invalidate_data_caches(dest);
   absl::flat_hash_set<const void*> sourceIdentities;
@@ -1042,6 +1060,8 @@ void resolve_sampled_textures(const ShaderInfo& info) noexcept {
     auto& textureBind = g_gxState.textures[i];
     auto& lastMeta = s_lastResolvedMeta[i];
     const auto updateLastMeta = [&](bool isCopy) noexcept {
+      const GXState::TexMetric metric = compute_tex_metric(textureBind);
+      g_gxState.texMetrics[i] = metric;
       if (textureBind.ref) {
         lastMeta = {
             .valid = true,
@@ -1057,6 +1077,7 @@ void resolve_sampled_textures(const ShaderInfo& info) noexcept {
             .mipCount = mipCount,
             .mode0 = obj.mode0,
             .mode1 = obj.mode1,
+            .metric = metric,
         };
       } else {
         lastMeta = {};
@@ -1090,6 +1111,7 @@ void resolve_sampled_textures(const ShaderInfo& info) noexcept {
              ? (lastMeta.texObjId == obj.texObjId && lastMeta.texDataVersion == obj.texDataVersion)
              : (lastMeta.texObjId == 0 && obj.data != nullptr));
     if (sameTex) {
+      g_gxState.texMetrics[i] = lastMeta.metric;
       // Texture bind unchanged
       ++s_dbg_sameTex;
       continue;
@@ -1640,24 +1662,21 @@ void populate_pipeline_config(PipelineConfig& config, GXPrimitive primitive, GXV
     }
   }
 
-  config = {
-      .msaaSamples = gfx::get_sample_count(),
-      .shaderConfig = config.shaderConfig,
-      .depthFunc = g_gxState.depthFunc,
-      .cullMode = cullMode,
-      .blendMode = g_gxState.blendMode,
-      .blendFacSrc = g_gxState.blendFacSrc,
-      .blendFacDst = g_gxState.blendFacDst,
-      .blendOp = g_gxState.blendOp,
-      .dstAlpha = g_gxState.dstAlpha,
-      .polygonOffsetBits = std::bit_cast<uint32_t>(polygonOffset),
-      .polygonOffsetScaleBits = std::bit_cast<uint32_t>(polygonOffsetScale),
-      .polygonOffsetClampBits = std::bit_cast<uint32_t>(g_gxState.clamp),
-      .depthCompare = g_gxState.depthCompare,
-      .depthUpdate = cullMode == GX_CULL_ALL ? false : g_gxState.depthUpdate,
-      .alphaUpdate = cullMode == GX_CULL_ALL ? false : g_gxState.alphaUpdate,
-      .colorUpdate = cullMode == GX_CULL_ALL ? false : g_gxState.colorUpdate,
-  };
+  config.msaaSamples = gfx::get_sample_count();
+  config.depthFunc = g_gxState.depthFunc;
+  config.cullMode = cullMode;
+  config.blendMode = g_gxState.blendMode;
+  config.blendFacSrc = g_gxState.blendFacSrc;
+  config.blendFacDst = g_gxState.blendFacDst;
+  config.blendOp = g_gxState.blendOp;
+  config.dstAlpha = g_gxState.dstAlpha;
+  config.polygonOffsetBits = std::bit_cast<uint32_t>(polygonOffset);
+  config.polygonOffsetScaleBits = std::bit_cast<uint32_t>(polygonOffsetScale);
+  config.polygonOffsetClampBits = std::bit_cast<uint32_t>(g_gxState.clamp);
+  config.depthCompare = g_gxState.depthCompare;
+  config.depthUpdate = cullMode == GX_CULL_ALL ? false : g_gxState.depthUpdate;
+  config.alphaUpdate = cullMode == GX_CULL_ALL ? false : g_gxState.alphaUpdate;
+  config.colorUpdate = cullMode == GX_CULL_ALL ? false : g_gxState.colorUpdate;
   if (paperShadow) {
     config.depthFunc = GX_LESS;
     config.cullMode = GX_CULL_NONE;
@@ -1684,45 +1703,280 @@ GXBindGroups build_bind_groups(const ShaderInfo& info) noexcept {
   // Up to 8 texture+sampler pairs; unused slots get the 1x1 empty fill. Texture
   // unit i == GX slot i; the GLSL sampler uniforms are bound to those units at link.
   gl::BindingSet set{};
+  uint8_t activeMask = 0;
   for (u32 i = 0; i < MaxTextures; ++i) {
     const auto& tex = g_gxState.textures[i];
     auto& binding = set.textures[i];
     if (tex && (info.sampledTextures[i] || info.sampledIndTextures[i])) {
       binding.texture = tex.ref->sampleTextureView.id;
       binding.sampler = tex.sampler.id != 0 ? tex.sampler.id : gfx::sampler_ref(tex.get_descriptor()).id;
+      activeMask |= static_cast<uint8_t>(1u << i);
     } else {
       binding.texture = sEmptyTexture.id;
       binding.sampler = sEmptySampler.id;
     }
   }
+  set.activeTexMask = activeMask;
+  set.useActiveTexMask = true;
+
   struct FastBindEntry {
-    std::array<gl::BindingSet::TextureBinding, MaxTextures> textures;
+    std::array<gl::BindingSet::TextureBinding, MaxTextures> textures{};
     gfx::BindGroupRef ref = 0;
     u32 frame = UINT32_MAX;
+    uint8_t activeMask = 0;
   };
-  static constexpr size_t kFastBindCacheSize = 16;
-  static FastBindEntry s_fastBindCache[kFastBindCacheSize]{};
-  static size_t s_fastBindHead = 0;
+  static constexpr size_t kFastBindCacheSize = 512;
+  static std::array<FastBindEntry, kFastBindCacheSize> s_fastBindCache{};
   const u32 currentFrame = gfx::current_frame();
+  const u64 texHash =
+      XXH3_64bits(set.textures.data(), sizeof(set.textures)) ^ (static_cast<u64>(activeMask) << 56);
+  const size_t slot = static_cast<size_t>((texHash ^ (texHash >> 9)) & (kFastBindCacheSize - 1));
+  FastBindEntry& entry = s_fastBindCache[slot];
 
-  for (size_t k = 0; k < kFastBindCacheSize; ++k) {
-    const size_t idx = (s_fastBindHead + kFastBindCacheSize - 1 - k) % kFastBindCacheSize;
-    if (s_fastBindCache[idx].ref != 0 && s_fastBindCache[idx].frame == currentFrame &&
-        std::memcmp(s_fastBindCache[idx].textures.data(), set.textures.data(), sizeof(set.textures)) == 0) {
-      return {
-          .textureBindGroup = s_fastBindCache[idx].ref,
-      };
-    }
+  if (currentFrame != UINT32_MAX && entry.ref != 0 && entry.frame == currentFrame &&
+      entry.activeMask == activeMask &&
+      std::memcmp(entry.textures.data(), set.textures.data(), sizeof(set.textures)) == 0) {
+    return {
+        .textureBindGroup = entry.ref,
+    };
   }
 
   const auto ref = gfx::bind_group_ref(set);
-  s_fastBindCache[s_fastBindHead].textures = set.textures;
-  s_fastBindCache[s_fastBindHead].ref = ref;
-  s_fastBindCache[s_fastBindHead].frame = currentFrame;
-  s_fastBindHead = (s_fastBindHead + 1) % kFastBindCacheSize;
+  if (currentFrame != UINT32_MAX) {
+    entry.textures = set.textures;
+    entry.ref = ref;
+    entry.frame = currentFrame;
+    entry.activeMask = activeMask;
+  }
   return {
       .textureBindGroup = ref,
   };
+}
+
+GXBindGroups build_batched_tex0_bind_groups(const gfx::BindGroupRef* slotBindGroups, u32 slotCount) noexcept {
+  if (slotCount == 0 || slotBindGroups == nullptr) {
+    return {};
+  }
+  const u32 count = std::min<u32>(slotCount, MaxTextures);
+  const u32 tierSlots = std::min<u32>(std::bit_ceil(std::max<u32>(count, 2u)), MaxTextures);
+  gl::BindingSet set{};
+  uint8_t activeMask = 0;
+  for (u32 i = 0; i < MaxTextures; ++i) {
+    auto& binding = set.textures[i];
+    if (i < count && slotBindGroups[i] != 0) {
+      const auto& srcSet = gfx::find_bind_group(slotBindGroups[i]);
+      binding = srcSet.textures[0];
+      activeMask |= static_cast<uint8_t>(1u << i);
+    } else {
+      binding.texture = sEmptyTexture.id;
+      binding.sampler = sEmptySampler.id;
+      if (i < tierSlots) {
+        activeMask |= static_cast<uint8_t>(1u << i);
+      }
+    }
+  }
+  set.activeTexMask = activeMask;
+  set.useActiveTexMask = true;
+
+  struct BatchedBindEntry {
+    std::array<gl::BindingSet::TextureBinding, MaxTextures> textures{};
+    gfx::BindGroupRef ref = 0;
+    u32 frame = UINT32_MAX;
+    uint8_t activeMask = 0;
+  };
+  static constexpr size_t kBatchedBindCacheSize = 256;
+  static std::array<BatchedBindEntry, kBatchedBindCacheSize> s_batchedBindCache{};
+  const u32 currentFrame = gfx::current_frame();
+  const u64 texHash =
+      XXH3_64bits(set.textures.data(), sizeof(set.textures)) ^ (static_cast<u64>(activeMask) << 56);
+  const size_t slot = static_cast<size_t>((texHash ^ (texHash >> 8)) & (kBatchedBindCacheSize - 1));
+  BatchedBindEntry& entry = s_batchedBindCache[slot];
+
+  if (currentFrame != UINT32_MAX && entry.ref != 0 && entry.frame == currentFrame &&
+      entry.activeMask == activeMask &&
+      std::memcmp(entry.textures.data(), set.textures.data(), sizeof(set.textures)) == 0) {
+    return {
+        .textureBindGroup = entry.ref,
+    };
+  }
+
+  const auto ref = gfx::bind_group_ref(set);
+  if (currentFrame != UINT32_MAX) {
+    entry.textures = set.textures;
+    entry.ref = ref;
+    entry.frame = currentFrame;
+    entry.activeMask = activeMask;
+  }
+  return {
+      .textureBindGroup = ref,
+  };
+}
+
+GXBindGroups resolve_and_build_bind_groups(const ShaderInfo& info) noexcept {
+  ZoneScoped;
+
+  const uint8_t sampledMask = static_cast<uint8_t>(info.sampledTextures.to_ulong() & 0xFFul);
+  const uint8_t indMask = static_cast<uint8_t>(info.sampledIndTextures.to_ulong() & 0xFFul);
+  if (sampledMask == 0 && indMask == 0) {
+    return {};
+  }
+
+  const u32 currentFrame = gfx::current_frame();
+  const bool canUseCache = (indMask & ~sampledMask) == 0 && currentFrame != UINT32_MAX &&
+                           !s_staticTextureCacheClearPending.load(std::memory_order_relaxed);
+
+  struct ResolvedSlotKey {
+    const void* data = nullptr;
+    const void* tlutData = nullptr;
+    u32 texObjId = 0;
+    u32 texDataVersion = 0;
+    u32 image0 = 0;
+    u32 format = 0;
+    u32 mipCount = 0;
+    u32 mode0 = 0;
+    u32 mode1 = 0;
+    u32 tlutObjId = 0;
+    u32 tlutDataVersion = 0;
+    u32 pad = 0;
+
+    bool operator==(const ResolvedSlotKey&) const = default;
+  };
+  static_assert(std::has_unique_object_representations_v<ResolvedSlotKey>);
+
+  // Stores scalar metadata + BindGroupRef ID only (zero TextureHandle/shared_ptr), so entries cannot pin textures.
+  struct ResolvedDrawBindEntry {
+    u64 hash = 0;
+    u32 lastTouchFrame = UINT32_MAX;
+    u32 gen = 0;
+    u32 copyGen = 0;
+    u32 bgCacheGen = 0;
+    uint8_t sampledMask = 0;
+    uint8_t indMask = 0;
+    GXBindGroups bindGroups{};
+    std::array<ResolvedSlotKey, MaxTextures> slots{};
+    std::array<GXState::TexMetric, MaxTextures> metrics{};
+  };
+  static constexpr size_t kResolvedBindCacheSize = 512;
+  static std::array<ResolvedDrawBindEntry, kResolvedBindCacheSize> s_resolvedDrawBindCache{};
+
+  std::array<ResolvedSlotKey, MaxTextures> keys{};
+  bool cacheable = canUseCache;
+  uint64_t h = (static_cast<uint64_t>(sampledMask) << 8) | indMask;
+  h ^= h * 0x9E3779B97F4A7C15ull;
+
+  if (canUseCache) {
+    for (uint32_t m = sampledMask; m != 0;) {
+      const uint32_t i = static_cast<uint32_t>(std::countr_zero(m));
+      m &= (m - 1);
+      const GXTexObj_& obj = g_gxState.loadedTextures[i];
+      if (obj.no_cache() || (obj.texObjId == 0 && obj.data == nullptr)) {
+        cacheable = false;
+        break;
+      }
+      u32 tlutObjId = 0;
+      u32 tlutDataVersion = 0;
+      const void* tlutData = nullptr;
+      if (is_palette_format(obj.format())) {
+        const auto tlutIdx = static_cast<size_t>(obj.tlut);
+        if (tlutIdx < g_gxState.loadedTluts.size()) {
+          const auto& tlut = g_gxState.loadedTluts[tlutIdx];
+          if (tlut.no_cache()) {
+            cacheable = false;
+            break;
+          }
+          tlutObjId = tlut.tlutObjId;
+          tlutDataVersion = tlut.tlutDataVersion;
+          tlutData = tlut.data;
+        }
+      }
+      keys[i] = {
+          .data = obj.data,
+          .tlutData = tlutData,
+          .texObjId = obj.texObjId,
+          .texDataVersion = obj.texDataVersion,
+          .image0 = obj.image0,
+          .format = static_cast<u32>(obj.format()),
+          .mipCount = obj.mip_count(),
+          .mode0 = obj.mode0,
+          .mode1 = obj.mode1,
+          .tlutObjId = tlutObjId,
+          .tlutDataVersion = tlutDataVersion,
+          .pad = 0,
+      };
+      const u64 slotHash = XXH3_64bits(&keys[i], sizeof(ResolvedSlotKey));
+      h ^= slotHash + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2) + i;
+    }
+  }
+
+  const u32 curBgGen = gfx::bind_group_cache_gen();
+  if (cacheable) {
+    const size_t slot = static_cast<size_t>((h ^ (h >> 9)) & (kResolvedBindCacheSize - 1));
+    ResolvedDrawBindEntry& entry = s_resolvedDrawBindCache[slot];
+    if (entry.bindGroups.textureBindGroup != 0 && entry.gen == s_resolvedBindGroupGen &&
+        entry.copyGen == s_copyTextureGen && entry.bgCacheGen == curBgGen && entry.hash == h &&
+        entry.sampledMask == sampledMask && entry.indMask == indMask) {
+      bool match = true;
+      for (uint32_t m = sampledMask; m != 0;) {
+        const uint32_t i = static_cast<uint32_t>(std::countr_zero(m));
+        m &= (m - 1);
+        if (!(entry.slots[i] == keys[i])) {
+          match = false;
+          break;
+        }
+      }
+      if (match) {
+        if (currentFrame < entry.lastTouchFrame || (currentFrame - entry.lastTouchFrame) >= 64u) {
+          if (gfx::touch_bind_group(entry.bindGroups.textureBindGroup)) {
+            entry.lastTouchFrame = currentFrame;
+          } else {
+            match = false;
+          }
+        }
+        if (match) {
+          for (uint32_t m = sampledMask; m != 0;) {
+            const uint32_t i = static_cast<uint32_t>(std::countr_zero(m));
+            m &= (m - 1);
+            g_gxState.texMetrics[i] = entry.metrics[i];
+          }
+          return entry.bindGroups;
+        }
+      }
+    }
+
+    resolve_sampled_textures(info);
+    const GXBindGroups result = build_bind_groups(info);
+    if (result.textureBindGroup != 0) {
+      bool allValid = true;
+      for (uint32_t m = sampledMask; m != 0;) {
+        const uint32_t i = static_cast<uint32_t>(std::countr_zero(m));
+        m &= (m - 1);
+        if (!g_gxState.textures[i].ref) {
+          allValid = false;
+          break;
+        }
+      }
+      if (allValid) {
+        entry.hash = h;
+        entry.lastTouchFrame = currentFrame;
+        entry.gen = s_resolvedBindGroupGen;
+        entry.copyGen = s_copyTextureGen;
+        entry.bgCacheGen = curBgGen;
+        entry.sampledMask = sampledMask;
+        entry.indMask = indMask;
+        entry.bindGroups = result;
+        for (uint32_t m = sampledMask; m != 0;) {
+          const uint32_t i = static_cast<uint32_t>(std::countr_zero(m));
+          m &= (m - 1);
+          entry.slots[i] = keys[i];
+          entry.metrics[i] = g_gxState.texMetrics[i];
+        }
+      }
+    }
+    return result;
+  }
+
+  resolve_sampled_textures(info);
+  return build_bind_groups(info);
 }
 
 void initialize() noexcept {
@@ -1744,6 +1998,8 @@ void initialize() noexcept {
 }
 
 void shutdown() noexcept {
+  ++s_resolvedBindGroupGen;
+  ++s_copyTextureGen;
   sEmptySampler = {};
   sEmptyTexture = {};
   g_emptyTextureBindGroup = {};

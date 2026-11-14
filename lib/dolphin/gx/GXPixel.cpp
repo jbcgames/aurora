@@ -5,6 +5,21 @@
 
 extern "C" {
 void GXSetFog(GXFogType type, float startZ, float endZ, float nearZ, float farZ, GXColor color) {
+  // BP FOGCLR (0xF2) - color
+  u32 fogclr = 0;
+  SET_REG_FIELD(0, fogclr, 8, 0, color.b);
+  SET_REG_FIELD(0, fogclr, 8, 8, color.g);
+  SET_REG_FIELD(0, fogclr, 8, 16, color.r);
+  SET_REG_FIELD(0, fogclr, 8, 24, 0xF2);
+
+  const bool inDL = aurora::gx::fifo::in_display_list();
+  const u32 ep = __gxShadow.epoch;
+  if (!inDL && __gxShadow.fogParamEpoch == ep && __gxShadow.fogType == type && __gxShadow.fogStartZ == startZ &&
+      __gxShadow.fogEndZ == endZ && __gxShadow.fogNearZ == nearZ && __gxShadow.fogFarZ == farZ) {
+    __gx_write_shadow_ras(fogclr, __gxShadow.fogClr, __gxShadow.fogClrEpoch);
+    return;
+  }
+
   // Compute fog coefficients matching SDK
   f32 A, B, C;
   if (farZ == nearZ || endZ == startZ) {
@@ -63,18 +78,31 @@ void GXSetFog(GXFogType type, float startZ, float endZ, float nearZ, float farZ,
   SET_REG_FIELD(0, fog3, 3, 21, type);
   SET_REG_FIELD(0, fog3, 8, 24, 0xF1);
 
-  // BP FOGCLR (0xF2) - color
-  u32 fogclr = 0;
-  SET_REG_FIELD(0, fogclr, 8, 0, color.b);
-  SET_REG_FIELD(0, fogclr, 8, 8, color.g);
-  SET_REG_FIELD(0, fogclr, 8, 16, color.r);
-  SET_REG_FIELD(0, fogclr, 8, 24, 0xF2);
+  if (!inDL) {
+    __gxShadow.fogParamEpoch = ep;
+    __gxShadow.fogType = type;
+    __gxShadow.fogStartZ = startZ;
+    __gxShadow.fogEndZ = endZ;
+    __gxShadow.fogNearZ = nearZ;
+    __gxShadow.fogFarZ = farZ;
+    __gxShadow.fogRegs[0] = fog0;
+    __gxShadow.fogRegs[1] = fog1;
+    __gxShadow.fogRegs[2] = fog2;
+    __gxShadow.fogRegs[3] = fog3;
+  }
 
-  GX_WRITE_RAS_REG(fog0);
-  GX_WRITE_RAS_REG(fog1);
-  GX_WRITE_RAS_REG(fog2);
-  GX_WRITE_RAS_REG(fog3);
-  GX_WRITE_RAS_REG(fogclr);
+  const bool writeClr = inDL || __gxShadow.fogClrEpoch != ep || __gxShadow.fogClr != fogclr;
+  if (writeClr) {
+    if (!inDL) {
+      __gxShadow.fogClrEpoch = ep;
+      __gxShadow.fogClr = fogclr;
+    }
+    const u32 regs[5] = {fog0, fog1, fog2, fog3, fogclr};
+    __gx_write_ras_regs(regs);
+  } else {
+    const u32 regs[4] = {fog0, fog1, fog2, fog3};
+    __gx_write_ras_regs(regs);
+  }
   __gx->bpSent = 1;
 }
 
@@ -85,8 +113,7 @@ void GXSetFogColor(GXColor color) {
   SET_REG_FIELD(0, fogclr, 8, 8, color.g);
   SET_REG_FIELD(0, fogclr, 8, 16, color.r);
   SET_REG_FIELD(0, fogclr, 8, 24, 0xF2);
-  GX_WRITE_RAS_REG(fogclr);
-  __gx->bpSent = 1;
+  __gx_write_shadow_ras(fogclr, __gxShadow.fogClr, __gxShadow.fogClrEpoch);
 }
 
 void GXSetFogRangeAdj(GXBool enable, u16 center, GXFogAdjTable* table) {
@@ -118,34 +145,29 @@ void GXSetBlendMode(GXBlendMode mode, GXBlendFactor src, GXBlendFactor dst, GXLo
   SET_REG_FIELD(0, __gx->cmode0, 4, 12, op);
   SET_REG_FIELD(0, __gx->cmode0, 3, 8, src);
   SET_REG_FIELD(0, __gx->cmode0, 3, 5, dst);
-  GX_WRITE_RAS_REG(__gx->cmode0);
-  __gx->bpSent = 1;
+  __gx_write_shadow_ras(__gx->cmode0, __gxShadow.cmode0, __gxShadow.cmode0Epoch);
 }
 
 void GXSetColorUpdate(GXBool enabled) {
   SET_REG_FIELD(0, __gx->cmode0, 1, 3, enabled);
-  GX_WRITE_RAS_REG(__gx->cmode0);
-  __gx->bpSent = 1;
+  __gx_write_shadow_ras(__gx->cmode0, __gxShadow.cmode0, __gxShadow.cmode0Epoch);
 }
 
 void GXSetAlphaUpdate(bool enabled) {
   SET_REG_FIELD(0, __gx->cmode0, 1, 4, enabled);
-  GX_WRITE_RAS_REG(__gx->cmode0);
-  __gx->bpSent = 1;
+  __gx_write_shadow_ras(__gx->cmode0, __gxShadow.cmode0, __gxShadow.cmode0Epoch);
 }
 
 void GXSetZMode(bool compare_enable, GXCompare func, bool update_enable) {
   SET_REG_FIELD(0, __gx->zmode, 1, 0, compare_enable);
   SET_REG_FIELD(0, __gx->zmode, 3, 1, func);
   SET_REG_FIELD(0, __gx->zmode, 1, 4, update_enable);
-  GX_WRITE_RAS_REG(__gx->zmode);
-  __gx->bpSent = 1;
+  __gx_write_shadow_ras(__gx->zmode, __gxShadow.zmode, __gxShadow.zmodeEpoch);
 }
 
 void GXSetZCompLoc(GXBool before_tex) {
   SET_REG_FIELD(0, __gx->peCtrl, 1, 6, before_tex);
-  GX_WRITE_RAS_REG(__gx->peCtrl);
-  __gx->bpSent = 1;
+  __gx_write_shadow_ras(__gx->peCtrl, __gxShadow.peCtrl, __gxShadow.peCtrlEpoch);
 }
 
 void GXSetPixelFmt(GXPixelFmt pix_fmt, GXZFmt16 z_fmt) {
@@ -180,14 +202,14 @@ void GXSetPixelFmt(GXPixelFmt pix_fmt, GXZFmt16 z_fmt) {
   SET_REG_FIELD(0, __gx->peCtrl, 3, 0, hwPixelFmt);
   SET_REG_FIELD(0, __gx->peCtrl, 3, 3, z_fmt);
   if (oldPeCtrl != __gx->peCtrl) {
-    GX_WRITE_RAS_REG(__gx->peCtrl);
+    __gx_write_shadow_ras(__gx->peCtrl, __gxShadow.peCtrl, __gxShadow.peCtrlEpoch);
     SET_REG_FIELD(0, __gx->genMode, 1, 9, pix_fmt == GX_PF_RGB565_Z16);
     __gx->dirtyState |= 4;
   }
 
   if (hwPixelFmt == 4) {
     SET_REG_FIELD(0, __gx->cmode1, 2, 9, (static_cast<u32>(pix_fmt) - GX_PF_Y8) & 0x3);
-    GX_WRITE_RAS_REG(__gx->cmode1);
+    __gx_write_shadow_ras(__gx->cmode1, __gxShadow.cmode1, __gxShadow.cmode1Epoch);
   }
 
   __gx->bpSent = 1;
@@ -195,15 +217,13 @@ void GXSetPixelFmt(GXPixelFmt pix_fmt, GXZFmt16 z_fmt) {
 
 void GXSetDither(GXBool dither) {
   SET_REG_FIELD(0, __gx->cmode0, 1, 2, dither);
-  GX_WRITE_RAS_REG(__gx->cmode0);
-  __gx->bpSent = 1;
+  __gx_write_shadow_ras(__gx->cmode0, __gxShadow.cmode0, __gxShadow.cmode0Epoch);
 }
 
 void GXSetDstAlpha(bool enabled, u8 value) {
   SET_REG_FIELD(0, __gx->cmode1, 8, 0, value);
   SET_REG_FIELD(0, __gx->cmode1, 1, 8, enabled);
-  GX_WRITE_RAS_REG(__gx->cmode1);
-  __gx->bpSent = 1;
+  __gx_write_shadow_ras(__gx->cmode1, __gxShadow.cmode1, __gxShadow.cmode1Epoch);
 }
 
 void GXSetFieldMask(GXBool odd_mask, GXBool even_mask) {

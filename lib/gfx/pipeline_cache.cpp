@@ -461,7 +461,7 @@ static void notify_pipeline_ready(bool queued) {
 
 static PipelineRef g_lastPipelineRef = std::numeric_limits<PipelineRef>::max();
 static bool g_lastPipelineReady = false;
-static uint32_t g_pipelineCacheGeneration = 1;
+static std::atomic<uint32_t> g_pipelineCacheGeneration{1};
 
 template <typename PipelineConfig>
 static PipelineRef find_pipeline_impl(ShaderType type, const PipelineConfig& config, NewPipelineCallback&& cb,
@@ -1234,7 +1234,7 @@ PipelineRef find_pipeline_status(ShaderType type, const gx::PipelineConfig& conf
   return find_pipeline_impl(type, config, std::move(cb), PipelinePriority::Normal, std::nullopt, &outReady);
 }
 
-uint32_t pipeline_cache_generation() noexcept { return g_pipelineCacheGeneration; }
+uint32_t pipeline_cache_generation() noexcept { return g_pipelineCacheGeneration.load(std::memory_order_acquire); }
 
 #ifdef AURORA_ENABLE_RMLUI
 template <>
@@ -1289,7 +1289,8 @@ void shutdown_pipeline_cache() {
   g_pendingPipelines.clear();
   g_lastPipelineRef = std::numeric_limits<PipelineRef>::max();
   g_lastPipelineReady = false;
-  ++g_pipelineCacheGeneration;
+  const uint32_t nextGen = g_pipelineCacheGeneration.load(std::memory_order_relaxed) + 1;
+  g_pipelineCacheGeneration.store(nextGen == 0 ? 1 : nextGen, std::memory_order_release);
 
   queuedPipelines = 0;
   createdPipelines = 0;
@@ -1308,12 +1309,31 @@ void end_pipeline_frame() {
 }
 
 bool get_pipeline(PipelineRef ref, gl::Pipeline& pipeline) {
+  struct FastPipelineEntry {
+    PipelineRef ref = 0;
+    uint32_t gen = 0;
+    gl::Pipeline pipeline{};
+  };
+  thread_local static FastPipelineEntry s_fastPipelines[512]{};
+
+  const uint32_t gen = g_pipelineCacheGeneration.load(std::memory_order_acquire);
+  const size_t slot = static_cast<size_t>(ref ^ (ref >> 9)) & 511u;
+  FastPipelineEntry& entry = s_fastPipelines[slot];
+  if (entry.gen == gen && entry.ref == ref) {
+    pipeline = entry.pipeline;
+    return true;
+  }
+
   std::lock_guard guard{g_pipelineMutex};
   const auto it = g_pipelines.find(ref);
   if (it == g_pipelines.end()) {
     return false;
   }
+  const uint32_t lockedGen = g_pipelineCacheGeneration.load(std::memory_order_acquire);
   pipeline = it->second.pipeline;
+  entry.ref = ref;
+  entry.gen = lockedGen;
+  entry.pipeline = pipeline;
   return true;
 }
 

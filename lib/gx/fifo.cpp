@@ -4,10 +4,12 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <thread>
 
 namespace aurora::gx::fifo {
 static Module Log("aurora::gx::fifo");
@@ -39,8 +41,51 @@ static std::condition_variable sConsumerCv;
 static std::atomic<bool> sDoubleBuffering{false};
 static std::atomic<bool> sStopping{false};
 
+// Async end-of-frame drain thread state: drains the previous producer slot while the main thread
+// concurrently runs flush_present().
+static std::thread sAsyncDrainThread;
+static std::mutex sAsyncDrainMutex;
+static std::condition_variable sAsyncDrainCv;
+static bool sAsyncDrainBusy = false;
+static bool sAsyncDrainStop = false;
+static uint32_t sAsyncConsumeSlot = 0;
+static double sAsyncDrainLastMs = 0.0;
+
+static void async_drain_worker() {
+  for (;;) {
+    uint32_t slot = 0;
+    {
+      std::unique_lock<std::mutex> lock(sAsyncDrainMutex);
+      sAsyncDrainCv.wait(lock, [] { return sAsyncDrainBusy || sAsyncDrainStop; });
+      if (sAsyncDrainStop && !sAsyncDrainBusy) {
+        return;
+      }
+      slot = sAsyncConsumeSlot;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    const uint32_t sz = sSlots[slot].size;
+    if (sz > 0) {
+      process(sSlots[slot].data, sz, true);
+      sSlots[slot].size = 0;
+    }
+    const auto t1 = std::chrono::steady_clock::now();
+    {
+      std::lock_guard<std::mutex> lock(sAsyncDrainMutex);
+      sAsyncDrainLastMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+      sAsyncDrainBusy = false;
+    }
+    sAsyncDrainCv.notify_all();
+  }
+}
+
 void init() {
   constexpr uint32_t initialCapacity = 512 * 1024;
+  {
+    std::lock_guard<std::mutex> alock(sAsyncDrainMutex);
+    sAsyncDrainStop = false;
+    sAsyncDrainBusy = false;
+    sAsyncDrainLastMs = 0.0;
+  }
   std::lock_guard<std::mutex> lock(sFifoMutex);
   sStopping.store(false, std::memory_order_relaxed);
   for (int i = 0; i < 2; ++i) {
@@ -64,6 +109,17 @@ void init() {
 }
 
 void shutdown() {
+  std::thread threadToJoin;
+  {
+    std::lock_guard<std::mutex> lock(sAsyncDrainMutex);
+    sAsyncDrainStop = true;
+    threadToJoin = std::move(sAsyncDrainThread);
+  }
+  sAsyncDrainCv.notify_all();
+  if (threadToJoin.joinable()) {
+    threadToJoin.join();
+  }
+
   sStopping.store(true, std::memory_order_release);
   sProducerCv.notify_all();
   sConsumerCv.notify_all();
@@ -166,6 +222,7 @@ bool in_display_list() { return detail::sInDisplayList; }
 
 void drain() {
   if (!sDoubleBuffering.load(std::memory_order_acquire)) {
+    drain_async_wait();
     if (detail::sBufferSize == 0) {
       return;
     }
@@ -195,6 +252,51 @@ void drain() {
   sConsumerSlot = 1 - sConsumerSlot;
   ++sFramesConsumed;
   sProducerCv.notify_all();
+}
+
+void drain_async_start() {
+  if (sDoubleBuffering.load(std::memory_order_acquire) || detail::sInDisplayList) {
+    return;
+  }
+  {
+    std::unique_lock<std::mutex> lock(sAsyncDrainMutex);
+    sAsyncDrainCv.wait(lock, [] { return !sAsyncDrainBusy; });
+    if (detail::sBufferSize == 0) {
+      sAsyncDrainLastMs = 0.0;
+      return;
+    }
+    if (!sAsyncDrainThread.joinable() && !sAsyncDrainStop) {
+      sAsyncDrainThread = std::thread(async_drain_worker);
+    }
+  }
+  const uint32_t consumeSlot = sProducerSlot;
+  const uint32_t nextSlot = 1u - sProducerSlot;
+  if (sSlots[nextSlot].data == nullptr) {
+    drain();
+    return;
+  }
+  sSlots[consumeSlot].data = detail::sBufferData;
+  sSlots[consumeSlot].size = detail::sBufferSize;
+  sSlots[consumeSlot].capacity = detail::sBufferCapacity;
+
+  sProducerSlot = nextSlot;
+  detail::sBufferData = sSlots[nextSlot].data;
+  detail::sBufferSize = 0;
+  detail::sBufferCapacity = sSlots[nextSlot].capacity;
+
+  {
+    std::lock_guard<std::mutex> lock(sAsyncDrainMutex);
+    sAsyncConsumeSlot = consumeSlot;
+    sAsyncDrainLastMs = 0.0;
+    sAsyncDrainBusy = true;
+  }
+  sAsyncDrainCv.notify_one();
+}
+
+double drain_async_wait() {
+  std::unique_lock<std::mutex> lock(sAsyncDrainMutex);
+  sAsyncDrainCv.wait(lock, [] { return !sAsyncDrainBusy; });
+  return sAsyncDrainLastMs;
 }
 
 const uint8_t* get_buffer_data() { return detail::sBufferData; }

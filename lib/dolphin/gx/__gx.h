@@ -83,6 +83,36 @@
   GX_WRITE_U32(value);                \
   } while (0)
 
+static inline void __gx_put_be16(u8* dst, u16 val) {
+  const u16 be = bswap(val);
+  std::memcpy(dst, &be, sizeof(be));
+}
+
+static inline void __gx_put_be32(u8* dst, u32 val) {
+  const u32 be = bswap(val);
+  std::memcpy(dst, &be, sizeof(be));
+}
+
+static inline void __gx_put_be64(u8* dst, u64 val) {
+  const u64 be = bswap(val);
+  std::memcpy(dst, &be, sizeof(be));
+}
+
+static inline void __gx_put_bef32(u8* dst, f32 val) {
+  const f32 be = bswap(val);
+  std::memcpy(dst, &be, sizeof(be));
+}
+
+template <size_t N>
+static inline void __gx_write_ras_regs(const u32 (&regs)[N]) {
+  u8 buf[N * 5];
+  for (size_t i = 0; i < N; ++i) {
+    buf[i * 5] = 0x61;
+    __gx_put_be32(buf + i * 5 + 1, regs[i]);
+  }
+  GX_WRITE_DATA(buf, sizeof(buf));
+}
+
 // Shadow register struct
 struct __GXData_struct {
   u16 vNum;         // vertex count for flush prim
@@ -177,3 +207,161 @@ void __GXSetMatrixIndex(GXAttr matIdxAttr);
 void __GXSendFlushPrim();
 void __GXFlushTextureState();
 };
+
+struct __GXShadowCache {
+  struct LightEntry {
+    u32 epoch = 0;
+    u32 words[13]{}; // packed color + a0..a2 + k0..k2 + px..pz + nx..nz
+  };
+
+  u32 epoch = 1;
+  u32 cmode0Epoch = 0, cmode0 = 0;
+  u32 cmode1Epoch = 0, cmode1 = 0;
+  u32 zmodeEpoch = 0, zmode = 0;
+  u32 peCtrlEpoch = 0, peCtrl = 0;
+  u32 genModeEpoch = 0, genMode = 0;
+  u32 alphaCompEpoch = 0, alphaComp = 0;
+  u32 suScisEpoch = 0, suScis0 = 0, suScis1 = 0;
+  u32 fogParamEpoch = 0;
+  GXFogType fogType = GX_FOG_NONE;
+  f32 fogStartZ = 0.0f, fogEndZ = 0.0f, fogNearZ = 0.0f, fogFarZ = 0.0f;
+  u32 fogRegs[4]{};
+  u32 fogClrEpoch = 0, fogClr = 0;
+  u32 matIdxAEpoch = 0, matIdxA = 0;
+  u32 matIdxBEpoch = 0, matIdxB = 0;
+  u32 xfNumChansEpoch = 0, xfNumChans = 0;
+  u32 xfNumTexGensEpoch = 0, xfNumTexGens = 0;
+  u32 xfClipModeEpoch = 0, xfClipMode = 0;
+  u32 xfAmbEpoch[2]{}, xfAmb[2]{};
+  u32 xfMatEpoch[2]{}, xfMat[2]{};
+  u32 xfChanCtrlEpoch[4]{}, xfChanCtrl[4]{};
+  u32 xfTexGenEpoch[8]{}, xfTexGenReg[8]{}, xfTexGenPost[8]{};
+  u32 tevCEpoch[16]{}, tevC[16]{};
+  u32 tevAEpoch[16]{}, tevA[16]{};
+  u32 trefEpoch[8]{}, tref[8]{};
+  u32 tevKselEpoch[8]{}, tevKsel[8]{};
+  u32 tevColorEpoch[4]{}, tevColorRA[4]{}, tevColorBG[4]{};
+  u32 tevKColorEpoch[4]{}, tevKColorRA[4]{}, tevKColorBG[4]{};
+  u32 suTs0Epoch[8]{}, suTs0[8]{};
+  u32 suTs1Epoch[8]{}, suTs1[8]{};
+  u32 vatEpoch[8]{}, vatA[8]{}, vatB[8]{}, vatC[8]{};
+  u32 vcdEpoch = 0, vcdLo = 0, vcdHi = 0;
+  u8 vcdHasNrms = 0, vcdHasBiNrms = 0;
+  u32 projEpoch = 0;
+  u32 projType = 0;
+  f32 projMtx[6]{};
+  u32 vpEpoch = 0;
+  f32 vpParams[6]{};
+  LightEntry lights[8]{};
+};
+
+extern __GXShadowCache __gxShadow;
+
+struct __GXShadowCacheExt {
+  struct TexSlot {
+    u32 epoch;
+    u32 texEpoch;
+    u32 mode0;
+    u32 mode1;
+    u32 image0;
+    u32 image3;
+    const void* data;
+    u32 mWidth;
+    u32 mHeight;
+    u32 mFormat;
+    u32 tlut;
+    u32 texObjId;
+    u32 texDataVersion;
+    u8 flags;
+  } texObjs[8];
+  struct ArraySlot {
+    u32 epoch;
+    u32 arrayEpoch;
+    const void* data;
+    u32 size;
+    u8 stride;
+    u8 le;
+  } arrays[16];
+  u32 texEpoch;
+  u32 arrayEpoch;
+  u32 vcdVatGen;
+  u32 xfRowEpoch[64];
+  u32 xfRowWords[64][4];
+  u32 nrmRowEpoch[40];
+  u32 nrmRowWords[40][3];
+  u32 ptRowEpoch[64];
+  u32 ptRowWords[64][4];
+};
+extern __GXShadowCacheExt __gxShadowExt;
+
+static inline void __gx_shadow_reset() noexcept {
+  std::memset(&__gxShadow, 0, sizeof(__gxShadow));
+  std::memset(&__gxShadowExt, 0, sizeof(__gxShadowExt));
+  __gxShadow.epoch = 1;
+  __gxShadowExt.texEpoch = 1;
+  __gxShadowExt.arrayEpoch = 1;
+  __gxShadowExt.vcdVatGen = 1;
+}
+
+static inline void __gx_shadow_invalidate_tex() noexcept {
+  if (++__gxShadowExt.texEpoch == 0) {
+    __gxShadowExt.texEpoch = 1;
+    std::memset(__gxShadowExt.texObjs, 0, sizeof(__gxShadowExt.texObjs));
+  }
+}
+
+static inline void __gx_shadow_invalidate_arrays() noexcept {
+  if (++__gxShadowExt.arrayEpoch == 0) {
+    __gxShadowExt.arrayEpoch = 1;
+    std::memset(__gxShadowExt.arrays, 0, sizeof(__gxShadowExt.arrays));
+  }
+}
+
+static inline void __gx_shadow_invalidate() noexcept {
+  if (++__gxShadow.epoch == 0) {
+    __gx_shadow_reset();
+  }
+}
+
+void __gx_dl_invalidate_cache() noexcept;
+void __gx_dl_forget_memory(const void* lo, const void* hi) noexcept;
+
+static inline void __gx_write_shadow_ras(u32 reg, u32& cachedReg, u32& cachedEpoch) noexcept {
+  if (!aurora::gx::fifo::in_display_list()) {
+    const u32 ep = __gxShadow.epoch;
+    if (cachedEpoch == ep && cachedReg == reg) {
+      return;
+    }
+    cachedEpoch = ep;
+    cachedReg = reg;
+  }
+  GX_WRITE_RAS_REG(reg);
+  __gx->bpSent = 1;
+}
+
+static inline void __gx_write_shadow_ras_pair(u32 reg0, u32 reg1, u32& cached0, u32& cached1, u32& cachedEpoch) noexcept {
+  if (!aurora::gx::fifo::in_display_list()) {
+    const u32 ep = __gxShadow.epoch;
+    if (cachedEpoch == ep && cached0 == reg0 && cached1 == reg1) {
+      return;
+    }
+    cachedEpoch = ep;
+    cached0 = reg0;
+    cached1 = reg1;
+  }
+  const u32 regs[2] = {reg0, reg1};
+  __gx_write_ras_regs(regs);
+  __gx->bpSent = 1;
+}
+
+static inline void __gx_write_shadow_xf(u32 addr, u32 val, u32& cachedVal, u32& cachedEpoch) noexcept {
+  if (!aurora::gx::fifo::in_display_list()) {
+    const u32 ep = __gxShadow.epoch;
+    if (cachedEpoch == ep && cachedVal == val) {
+      return;
+    }
+    cachedEpoch = ep;
+    cachedVal = val;
+  }
+  GX_WRITE_XF_REG(addr, val);
+}

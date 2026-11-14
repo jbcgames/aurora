@@ -96,14 +96,16 @@ void destroy_sync(void*& sync) {
 // can wait on it). Called on main (shim ctx, reverse fence) and on the worker (render ctx, forward
 // fence).
 void* create_fence() {
-  gl::gl.Flush();
 #if defined(__aarch64__) || defined(__arm__)
   if (gl::gl.eglCreateSyncKHR == nullptr) {
+    gl::gl.Flush();
     return nullptr;
   }
   void* sync = gl::gl.eglCreateSyncKHR(g_display, gl::EGL_SYNC_FENCE_KHR, nullptr);
+  gl::gl.Flush();
   return sync;
 #else
+  gl::gl.Flush();
   return nullptr;
 #endif
 }
@@ -281,12 +283,13 @@ void blit_and_swap(Slot& slot) {
   int drawableHeight = static_cast<int>(g_height);
   SDL_GetWindowSizeInPixels(window, &drawableWidth, &drawableHeight);
 
-  // Wait for the worker to finish compositing this slot on GPU.
+  // Wait for the worker to finish compositing this slot on GPU (server-side wait
+  // so main CPU continues overlapping game work instead of stalling on the GPU).
   if (slot.fwdSync != nullptr) {
-    if (gl::gl.eglClientWaitSyncKHR != nullptr) {
-      gl::gl.eglClientWaitSyncKHR(g_display, slot.fwdSync, 1u /* EGL_SYNC_FLUSH_COMMANDS_BIT_KHR */, RevSyncWaitTimeoutNs);
-    } else if (gl::gl.eglWaitSyncKHR != nullptr) {
+    if (gl::gl.eglWaitSyncKHR != nullptr) {
       gl::gl.eglWaitSyncKHR(g_display, slot.fwdSync, 0);
+    } else if (gl::gl.eglClientWaitSyncKHR != nullptr) {
+      gl::gl.eglClientWaitSyncKHR(g_display, slot.fwdSync, 1u /* EGL_SYNC_FLUSH_COMMANDS_BIT_KHR */, RevSyncWaitTimeoutNs);
     }
   }
 
@@ -643,15 +646,6 @@ void flush_present() {
   auto tp_fwd = tp_wait;
   auto tp_swap = tp_wait;
   if (presentable) {
-    if (s_logPres && slot.fwdSync != nullptr) {
-      if (gl::gl.eglClientWaitSyncKHR != nullptr) {
-        gl::gl.eglClientWaitSyncKHR(g_display, slot.fwdSync, 1u, RevSyncWaitTimeoutNs);
-      } else if (gl::gl.eglWaitSyncKHR != nullptr) {
-        gl::gl.eglWaitSyncKHR(g_display, slot.fwdSync, 0);
-      }
-      destroy_sync(slot.fwdSync);
-      tp_fwd = std::chrono::steady_clock::now();
-    }
     blit_and_swap(slot);
     tp_swap = std::chrono::steady_clock::now();
   }
@@ -672,7 +666,7 @@ void flush_present() {
   if (s_logPres) {
     const auto tp_end = std::chrono::steady_clock::now();
     const double msTotal = std::chrono::duration<double, std::milli>(tp_end - tp0).count();
-    if (msTotal > 25.0) {
+    if (msTotal > 10.0) {
       const double msWait = std::chrono::duration<double, std::milli>(tp_wait - tp0).count();
       const double msFwd = std::chrono::duration<double, std::milli>(tp_fwd - tp_wait).count();
       const double msSwap = std::chrono::duration<double, std::milli>(tp_swap - tp_fwd).count();

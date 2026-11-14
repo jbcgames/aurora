@@ -38,11 +38,16 @@ struct PassTarget {
 
 class PassEncoder {
 public:
-  explicit PassEncoder(const PassTarget& target) : m_target(target) {}
+  explicit PassEncoder(const PassTarget& target) : m_target(target) {
+    static uint64_t s_nextPassId = 0;
+    m_id = ++s_nextPassId;
+  }
 
   void SetPipeline(const Pipeline& pipeline);
   void SetBindGroup(uint32_t index, const BindingSet& set, size_t dynamicOffsetCount = 0,
                     const uint32_t* dynamicOffsets = nullptr);
+  void SetUniformBuffer0(GLuint buffer, uint32_t offset, uint32_t size);
+  uint64_t id() const noexcept { return m_id; }
   void SetVertexBuffer(uint32_t slot, const Buffer& buffer, uint64_t offset = 0, uint64_t size = kWholeSize);
   void SetIndexBuffer(const Buffer& buffer, IndexFormat format, uint64_t offset = 0, uint64_t size = kWholeSize);
   void SetViewport(float x, float y, float width, float height, float minDepth, float maxDepth);
@@ -62,6 +67,7 @@ public:
 
 private:
   PassTarget m_target;
+  uint64_t m_id = 0;
 
   // Draw state assembled across Set* calls and consumed by Draw/DrawIndexed. The
   // pipeline is stored by value: bind_pipeline() hands us a local gl::Pipeline that

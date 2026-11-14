@@ -1,6 +1,9 @@
 #include "gx.hpp"
 #include "__gx.h"
 
+#include <bit>
+#include <cstring>
+
 extern "C" {
 void GXInitLightAttn(GXLightObj* light_, float a0, float a1, float a2, float k0, float k1, float k2) {
   auto* light = reinterpret_cast<GXLightObj_*>(light_);
@@ -131,42 +134,51 @@ void GXInitLightColor(GXLightObj* light_, GXColor col) {
 }
 
 void GXLoadLightObjImm(GXLightObj* light_, GXLightID id) {
-  u32 idx = std::log2<u32>(id);
+  u32 idx = (id != 0) ? static_cast<u32>(std::countr_zero(static_cast<u32>(id))) : 0u;
   auto* light = reinterpret_cast<const GXLightObj_*>(light_);
+
+  // Convert color to packed u32 for XF
+  u32 colorPacked = (static_cast<u32>(light->color.r) << 24) | (static_cast<u32>(light->color.g) << 16) |
+                    (static_cast<u32>(light->color.b) << 8) | static_cast<u32>(light->color.a);
+
+  u32 words[13];
+  words[0] = colorPacked;
+  words[1] = std::bit_cast<u32>(light->a0);
+  words[2] = std::bit_cast<u32>(light->a1);
+  words[3] = std::bit_cast<u32>(light->a2);
+  words[4] = std::bit_cast<u32>(light->k0);
+  words[5] = std::bit_cast<u32>(light->k1);
+  words[6] = std::bit_cast<u32>(light->k2);
+  words[7] = std::bit_cast<u32>(light->px);
+  words[8] = std::bit_cast<u32>(light->py);
+  words[9] = std::bit_cast<u32>(light->pz);
+  words[10] = std::bit_cast<u32>(light->nx);
+  words[11] = std::bit_cast<u32>(light->ny);
+  words[12] = std::bit_cast<u32>(light->nz);
+
+  const bool inDL = aurora::gx::fifo::in_display_list();
+  if (!inDL && idx < 8) {
+    auto& entry = __gxShadow.lights[idx];
+    if (entry.epoch == __gxShadow.epoch && std::memcmp(entry.words, words, sizeof(words)) == 0) {
+      return;
+    }
+    entry.epoch = __gxShadow.epoch;
+    std::memcpy(entry.words, words, sizeof(words));
+  }
 
   // XF bulk write: 16 values at light base address
   // Light addresses: 0x600 + idx * 0x10
   u32 addr = 0x600 + idx * 0x10;
   u32 reg = addr | (0xF << 16); // 16-1=15 values
 
-  // Convert color to packed u32 for XF
-  u32 colorPacked = (static_cast<u32>(light->color.r) << 24) | (static_cast<u32>(light->color.g) << 16) |
-                    (static_cast<u32>(light->color.b) << 8) | static_cast<u32>(light->color.a);
-
-  GX_WRITE_U8(0x10);
-  GX_WRITE_U32(reg);
-  // Padding (3 u32s)
-  GX_WRITE_U32(0);
-  GX_WRITE_U32(0);
-  GX_WRITE_U32(0);
-  // Color
-  GX_WRITE_U32(colorPacked);
-  // Cosine attenuation (a0, a1, a2)
-  GX_WRITE_F32(light->a0);
-  GX_WRITE_F32(light->a1);
-  GX_WRITE_F32(light->a2);
-  // Distance attenuation (k0, k1, k2)
-  GX_WRITE_F32(light->k0);
-  GX_WRITE_F32(light->k1);
-  GX_WRITE_F32(light->k2);
-  // Position (px, py, pz)
-  GX_WRITE_F32(light->px);
-  GX_WRITE_F32(light->py);
-  GX_WRITE_F32(light->pz);
-  // Direction (nx, ny, nz)
-  GX_WRITE_F32(light->nx);
-  GX_WRITE_F32(light->ny);
-  GX_WRITE_F32(light->nz);
+  u8 pkt[1 + 17 * 4];
+  pkt[0] = 0x10;
+  __gx_put_be32(pkt + 1, reg);
+  std::memset(pkt + 5, 0, 12); // Padding (3 u32s)
+  for (int i = 0; i < 13; ++i) {
+    __gx_put_be32(pkt + 17 + i * 4, words[i]);
+  }
+  GX_WRITE_DATA(pkt, sizeof(pkt));
 }
 
 void GXSetChanAmbColor(GXChannelID id, GXColor color) {
@@ -186,10 +198,10 @@ void GXSetChanAmbColor(GXChannelID id, GXColor color) {
                (static_cast<u32>(color.b) << 8) | static_cast<u32>(color.a);
   if (id == GX_COLOR0 || id == GX_ALPHA0) {
     __gx->ambColor[0] = packed;
-    GX_WRITE_XF_REG(0xA, packed);
+    __gx_write_shadow_xf(0xA, packed, __gxShadow.xfAmb[0], __gxShadow.xfAmbEpoch[0]);
   } else {
     __gx->ambColor[1] = packed;
-    GX_WRITE_XF_REG(0xB, packed);
+    __gx_write_shadow_xf(0xB, packed, __gxShadow.xfAmb[1], __gxShadow.xfAmbEpoch[1]);
   }
   __gx->bpSent = 0;
 }
@@ -211,17 +223,17 @@ void GXSetChanMatColor(GXChannelID id, GXColor color) {
                (static_cast<u32>(color.b) << 8) | static_cast<u32>(color.a);
   if (id == GX_COLOR0 || id == GX_ALPHA0) {
     __gx->matColor[0] = packed;
-    GX_WRITE_XF_REG(0xC, packed);
+    __gx_write_shadow_xf(0xC, packed, __gxShadow.xfMat[0], __gxShadow.xfMatEpoch[0]);
   } else {
     __gx->matColor[1] = packed;
-    GX_WRITE_XF_REG(0xD, packed);
+    __gx_write_shadow_xf(0xD, packed, __gxShadow.xfMat[1], __gxShadow.xfMatEpoch[1]);
   }
   __gx->bpSent = 0;
 }
 
 void GXSetNumChans(u8 num) {
   SET_REG_FIELD(0, __gx->genMode, 3, 4, num);
-  GX_WRITE_XF_REG(9, num);
+  __gx_write_shadow_xf(9, num, __gxShadow.xfNumChans, __gxShadow.xfNumChansEpoch);
   __gx->dirtyState |= 4;
 }
 
@@ -285,7 +297,7 @@ void GXSetChanCtrl(GXChannelID id, bool lightingEnabled, GXColorSrc ambSrc, GXCo
   SET_REG_FIELD(0, reg, 4, 11, (lightState >> 4) & 0xF); // lights 4-7
 
   // XF channel control registers: 0x100E-0x1011
-  GX_WRITE_XF_REG(0xE + id, reg);
+  __gx_write_shadow_xf(0xE + id, reg, __gxShadow.xfChanCtrl[id], __gxShadow.xfChanCtrlEpoch[id]);
   __gx->bpSent = 0;
 }
 }

@@ -46,6 +46,8 @@ void use_program(GLuint program);
 void bind_vertex_array(GLuint vao);
 // Bind texture + sampler object to unit `unit` (GX slot i == unit i).
 void bind_texture_unit(uint32_t unit, GLuint texture, GLuint sampler);
+// Bind an 8-unit GX/RmlUi texture set, visiting activeMask bits and any units currently non-empty.
+void bind_texture_set(const BindingSet::TextureBinding* textures, uint32_t activeMask);
 // glBindBufferRange(GL_UNIFORM_BUFFER, index, ...). `index` is the block binding point.
 void bind_uniform_range(uint32_t index, GLuint buffer, uint32_t offset, uint32_t size);
 

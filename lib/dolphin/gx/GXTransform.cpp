@@ -1,3 +1,5 @@
+#include <cstring>
+
 #include "gx.hpp"
 #include "__gx.h"
 #include "dolphin/mtx/GeoTypes.h"
@@ -7,6 +9,28 @@ static inline void CacheProjectionVector(const f32* ptr, GXProjectionType type) 
   for (int i = 0; i < 6; ++i) {
     __gx->projMtx[i] = ptr[i + 1];
   }
+}
+
+static inline void WriteProjection() {
+  if (!aurora::gx::fifo::in_display_list()) {
+    const u32 ep = __gxShadow.epoch;
+    if (__gxShadow.projEpoch == ep && __gxShadow.projType == __gx->projType &&
+        std::memcmp(__gxShadow.projMtx, __gx->projMtx, sizeof(__gx->projMtx)) == 0) {
+      return;
+    }
+    __gxShadow.projEpoch = ep;
+    __gxShadow.projType = __gx->projType;
+    std::memcpy(__gxShadow.projMtx, __gx->projMtx, sizeof(__gx->projMtx));
+  }
+
+  // XF bulk write: 6 params + projection type at 0x1020-0x1026
+  GX_WRITE_U8(0x10);
+  GX_WRITE_U32(0x00061020);
+  for (int i = 0; i < 6; ++i) {
+    GX_WRITE_F32(__gx->projMtx[i]);
+  }
+  GX_WRITE_U32(__gx->projType);
+  __gx->bpSent = 0;
 }
 
 extern "C" {
@@ -23,18 +47,7 @@ void GXSetProjection(const void* mtx_, GXProjectionType type) {
       mtx[2][3],
   };
   CacheProjectionVector(projVec, type);
-
-  // XF bulk write: 6 params + projection type at 0x1020-0x1026
-  GX_WRITE_U8(0x10);
-  GX_WRITE_U32(0x00061020);
-  GX_WRITE_XF_REG_F(32, __gx->projMtx[0]);
-  GX_WRITE_XF_REG_F(33, __gx->projMtx[1]);
-  GX_WRITE_XF_REG_F(34, __gx->projMtx[2]);
-  GX_WRITE_XF_REG_F(35, __gx->projMtx[3]);
-  GX_WRITE_XF_REG_F(36, __gx->projMtx[4]);
-  GX_WRITE_XF_REG_F(37, __gx->projMtx[5]);
-  GX_WRITE_XF_REG_2(38, __gx->projType);
-  __gx->bpSent = 0;
+  WriteProjection();
 }
 
 void GXSetProjectionv(const f32* ptr) {
@@ -42,15 +55,7 @@ void GXSetProjectionv(const f32* ptr) {
 
   const GXProjectionType type = ptr[0] == 0.0f ? GX_PERSPECTIVE : GX_ORTHOGRAPHIC;
   CacheProjectionVector(ptr, type);
-
-  // XF bulk write: 6 params + projection type at 0x1020-0x1026
-  GX_WRITE_U8(0x10);
-  GX_WRITE_U32(0x00061020);
-  for (int i = 0; i < 6; ++i) {
-    GX_WRITE_F32(__gx->projMtx[i]);
-  }
-  GX_WRITE_U32(__gx->projType);
-  __gx->bpSent = 0;
+  WriteProjection();
 }
 
 void GXLoadPosMtxImm(const void* mtx_, u32 id) {
@@ -59,11 +64,28 @@ void GXLoadPosMtxImm(const void* mtx_, u32 id) {
   CHECK(id <= (aurora::gx::MaxPnMtx - 1) * 3, "invalid pn mtx {}", static_cast<int>(id));
   const auto* mtx = reinterpret_cast<const f32*>(mtx_);
 
-  GX_WRITE_U8(0x10);
-  GX_WRITE_U32((id * 4) | 0xB0000);
-  for (int i = 0; i < 12; i++) {
-    GX_WRITE_F32(mtx[i]);
+  u32 words[12];
+  std::memcpy(words, mtx, sizeof(words));
+  if (!aurora::gx::fifo::in_display_list() && id + 3 <= 64) {
+    const u32 ep = __gxShadow.epoch;
+    if (__gxShadowExt.xfRowEpoch[id] == ep && __gxShadowExt.xfRowEpoch[id + 1] == ep &&
+        __gxShadowExt.xfRowEpoch[id + 2] == ep &&
+        std::memcmp(__gxShadowExt.xfRowWords[id], words, sizeof(words)) == 0) {
+      return;
+    }
+    __gxShadowExt.xfRowEpoch[id] = ep;
+    __gxShadowExt.xfRowEpoch[id + 1] = ep;
+    __gxShadowExt.xfRowEpoch[id + 2] = ep;
+    std::memcpy(__gxShadowExt.xfRowWords[id], words, sizeof(words));
   }
+
+  u8 pkt[1 + 13 * 4];
+  pkt[0] = 0x10;
+  __gx_put_be32(pkt + 1, (id * 4) | 0xB0000);
+  for (int i = 0; i < 12; i++) {
+    __gx_put_be32(pkt + 5 + i * 4, words[i]);
+  }
+  GX_WRITE_DATA(pkt, sizeof(pkt));
 }
 
 void GXLoadNrmMtxImm(const void* mtx_, u32 id) {
@@ -71,18 +93,31 @@ void GXLoadNrmMtxImm(const void* mtx_, u32 id) {
   CHECK(id <= (aurora::gx::MaxPnMtx - 1) * 3, "invalid pn mtx {}", static_cast<int>(id));
   const auto* mtx = reinterpret_cast<const f32*>(mtx_);
 
-  GX_WRITE_U8(0x10);
-  GX_WRITE_U32((id * 3 + 0x400) | 0x80000);
+  u32 words[9];
+  std::memcpy(&words[0], &mtx[0], 12);
+  std::memcpy(&words[3], &mtx[4], 12);
+  std::memcpy(&words[6], &mtx[8], 12);
+  if (!aurora::gx::fifo::in_display_list() && id + 3 <= 40) {
+    const u32 ep = __gxShadow.epoch;
+    if (__gxShadowExt.nrmRowEpoch[id] == ep && __gxShadowExt.nrmRowEpoch[id + 1] == ep &&
+        __gxShadowExt.nrmRowEpoch[id + 2] == ep &&
+        std::memcmp(__gxShadowExt.nrmRowWords[id], words, sizeof(words)) == 0) {
+      return;
+    }
+    __gxShadowExt.nrmRowEpoch[id] = ep;
+    __gxShadowExt.nrmRowEpoch[id + 1] = ep;
+    __gxShadowExt.nrmRowEpoch[id + 2] = ep;
+    std::memcpy(__gxShadowExt.nrmRowWords[id], words, sizeof(words));
+  }
+
+  u8 pkt[1 + 10 * 4];
+  pkt[0] = 0x10;
+  __gx_put_be32(pkt + 1, (id * 3 + 0x400) | 0x80000);
   // Write 3x3 from 3x4 matrix (skip translation column)
-  GX_WRITE_F32(mtx[0]);
-  GX_WRITE_F32(mtx[1]);
-  GX_WRITE_F32(mtx[2]);
-  GX_WRITE_F32(mtx[4]);
-  GX_WRITE_F32(mtx[5]);
-  GX_WRITE_F32(mtx[6]);
-  GX_WRITE_F32(mtx[8]);
-  GX_WRITE_F32(mtx[9]);
-  GX_WRITE_F32(mtx[10]);
+  for (int i = 0; i < 9; i++) {
+    __gx_put_be32(pkt + 5 + i * 4, words[i]);
+  }
+  GX_WRITE_DATA(pkt, sizeof(pkt));
 }
 
 void GXSetCurrentMtx(u32 id) {
@@ -95,24 +130,55 @@ void GXLoadTexMtxImm(const void* mtx_, u32 id, GXTexMtxType type) {
   CHECK((id >= GX_TEXMTX0 && id <= GX_IDENTITY) || (id >= GX_PTTEXMTX0 && id <= GX_PTIDENTITY), "invalid tex mtx {}",
         id);
 
+  const auto* mtx = reinterpret_cast<const f32*>(mtx_);
+  u32 count = (type == GX_MTX2x4) ? 8 : 12;
+  u32 rows = (count == 8) ? 2 : 3;
+  u32 words[12];
+  std::memcpy(words, mtx, count * sizeof(u32));
+
   u32 addr;
   if (id >= GX_PTTEXMTX0) {
-    addr = (id - GX_PTTEXMTX0) * 4 + 0x500;
+    const u32 ptRow = id - GX_PTTEXMTX0;
+    addr = ptRow * 4 + 0x500;
     CHECK(type == GX_MTX3x4, "invalid pt mtx type {}", underlying(type));
+    if (!aurora::gx::fifo::in_display_list() && ptRow + 3 <= 64) {
+      const u32 ep = __gxShadow.epoch;
+      if (__gxShadowExt.ptRowEpoch[ptRow] == ep && __gxShadowExt.ptRowEpoch[ptRow + 1] == ep &&
+          __gxShadowExt.ptRowEpoch[ptRow + 2] == ep &&
+          std::memcmp(__gxShadowExt.ptRowWords[ptRow], words, 12 * sizeof(u32)) == 0) {
+        return;
+      }
+      __gxShadowExt.ptRowEpoch[ptRow] = ep;
+      __gxShadowExt.ptRowEpoch[ptRow + 1] = ep;
+      __gxShadowExt.ptRowEpoch[ptRow + 2] = ep;
+      std::memcpy(__gxShadowExt.ptRowWords[ptRow], words, 12 * sizeof(u32));
+    }
   } else {
     addr = id * 4;
+    if (!aurora::gx::fifo::in_display_list() && id + rows <= 64) {
+      const u32 ep = __gxShadow.epoch;
+      bool match = (__gxShadowExt.xfRowEpoch[id] == ep && __gxShadowExt.xfRowEpoch[id + 1] == ep &&
+                    (rows == 2 || __gxShadowExt.xfRowEpoch[id + 2] == ep));
+      if (match && std::memcmp(__gxShadowExt.xfRowWords[id], words, count * sizeof(u32)) == 0) {
+        return;
+      }
+      __gxShadowExt.xfRowEpoch[id] = ep;
+      __gxShadowExt.xfRowEpoch[id + 1] = ep;
+      if (rows == 3) {
+        __gxShadowExt.xfRowEpoch[id + 2] = ep;
+      }
+      std::memcpy(__gxShadowExt.xfRowWords[id], words, count * sizeof(u32));
+    }
   }
 
-  u32 count = (type == GX_MTX2x4) ? 8 : 12;
   u32 reg = addr | ((count - 1) << 16);
-
-  GX_WRITE_U8(0x10);
-  GX_WRITE_U32(reg);
-
-  const auto* mtx = reinterpret_cast<const f32*>(mtx_);
+  u8 pkt[1 + 13 * 4];
+  pkt[0] = 0x10;
+  __gx_put_be32(pkt + 1, reg);
   for (u32 i = 0; i < count; i++) {
-    GX_WRITE_F32(mtx[i]);
+    __gx_put_be32(pkt + 5 + i * 4, words[i]);
   }
+  GX_WRITE_DATA(pkt, 5 + count * 4);
 }
 
 void GXSetViewport(float left, float top, float width, float height, float nearZ, float farZ) {
@@ -149,14 +215,21 @@ void GXSetViewportJitter(float left, float top, float width, float height, float
   __gx->vpNearz = nearZ;
   __gx->vpFarz = farZ;
 
+  const f32 vp[6] = {sx, sy, sz, ox, oy, oz};
+  if (!aurora::gx::fifo::in_display_list()) {
+    const u32 ep = __gxShadow.epoch;
+    if (__gxShadow.vpEpoch == ep && std::memcmp(__gxShadow.vpParams, vp, sizeof(vp)) == 0) {
+      return;
+    }
+    __gxShadow.vpEpoch = ep;
+    std::memcpy(__gxShadow.vpParams, vp, sizeof(vp));
+  }
+
   GX_WRITE_U8(0x10);
   GX_WRITE_U32(0x0005101A);
-  GX_WRITE_XF_REG_F(26, sx);
-  GX_WRITE_XF_REG_F(27, sy);
-  GX_WRITE_XF_REG_F(28, sz);
-  GX_WRITE_XF_REG_F(29, ox);
-  GX_WRITE_XF_REG_F(30, oy);
-  GX_WRITE_XF_REG_F(31, oz);
+  for (int i = 0; i < 6; ++i) {
+    GX_WRITE_F32(vp[i]);
+  }
   __gx->bpSent = 0;
 }
 

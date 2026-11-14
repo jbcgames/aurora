@@ -242,4 +242,118 @@ void GXParam4f32(const f32 x, const f32 y, const f32 z, const f32 w) {
   aurora::gx::fifo::write_f32(w);
 }
 
+static inline u8 prepare_anim_trifan_cmd(u8 vtxFmt) {
+  CHECK(!sInBegin, "GXEmitAnimTriFan16: called without matching GXEnd");
+  if (__gx->dirtyState != 0) {
+    __GXSetDirtyState();
+  }
+  if (*reinterpret_cast<u32*>(&__gx->vNum) != 0) {
+    __GXSendFlushPrim();
+  }
+  return static_cast<u8>(vtxFmt & 7u) | static_cast<u8>(GX_TRIANGLEFAN);
+}
+
+static inline void write_be16_header(u8* dst, u8 drawCmd, u16 count) {
+  dst[0] = drawCmd;
+  const u16 countBe = bswap(count);
+  std::memcpy(dst + 1, &countBe, 2);
+}
+
+void GXEmitAnimTriFan16_1Tex(u8 vtxFmt, u16 count, const void* posIdx, const void* nrmIdx, const void* clr0Idx,
+                             const void* texIdx) {
+  using namespace aurora::gx::fifo;
+  const u8 drawCmd = prepare_anim_trifan_cmd(vtxFmt);
+  const u32 totalBytes = 3u + static_cast<u32>(count) * 8u;
+  const auto* p = static_cast<const u8*>(posIdx);
+  const auto* n = static_cast<const u8*>(nrmIdx);
+  const auto* c = static_cast<const u8*>(clr0Idx);
+  const auto* t = static_cast<const u8*>(texIdx);
+
+  if (!detail::sInDisplayList && detail::sBufferSize + totalBytes <= detail::sBufferCapacity)
+    LIKELY {
+      u8* dst = detail::sBufferData + detail::sBufferSize;
+      detail::sBufferSize += totalBytes;
+      write_be16_header(dst, drawCmd, count);
+      dst += 3;
+      for (u16 k = 0; k < count; ++k, dst += 8, p += 4, n += 4, c += 4, t += 4) {
+        std::memcpy(dst + 0, p, 2);
+        std::memcpy(dst + 2, n, 2);
+        std::memcpy(dst + 4, c, 2);
+        std::memcpy(dst + 6, t, 2);
+      }
+      return;
+    }
+
+  if (totalBytes <= 2048u) {
+    u8 tmp[2048];
+    write_be16_header(tmp, drawCmd, count);
+    u8* dst = tmp + 3;
+    for (u16 k = 0; k < count; ++k, dst += 8, p += 4, n += 4, c += 4, t += 4) {
+      std::memcpy(dst + 0, p, 2);
+      std::memcpy(dst + 2, n, 2);
+      std::memcpy(dst + 4, c, 2);
+      std::memcpy(dst + 6, t, 2);
+    }
+    write_data(tmp, totalBytes);
+    return;
+  }
+
+  u8 hdr[3];
+  write_be16_header(hdr, drawCmd, count);
+  write_data(hdr, 3);
+  for (u16 k = 0; k < count; ++k, p += 4, n += 4, c += 4, t += 4) {
+    u8 vtx[8];
+    std::memcpy(vtx + 0, p, 2);
+    std::memcpy(vtx + 2, n, 2);
+    std::memcpy(vtx + 4, c, 2);
+    std::memcpy(vtx + 6, t, 2);
+    write_data(vtx, 8);
+  }
+}
+
+void GXEmitAnimTriFan16_NTex(u8 vtxFmt, u16 count, const void* posIdx, const void* nrmIdx, const void* clr0Idx,
+                             const void* const* texIdxPtrs, u32 numTex) {
+  using namespace aurora::gx::fifo;
+  const u8 drawCmd = prepare_anim_trifan_cmd(vtxFmt);
+  const u32 strideBytes = 6u + 2u * numTex;
+  const u32 totalBytes = 3u + static_cast<u32>(count) * strideBytes;
+  const auto* p = static_cast<const u8*>(posIdx);
+  const auto* n = static_cast<const u8*>(nrmIdx);
+  const auto* c = static_cast<const u8*>(clr0Idx);
+
+  if (!detail::sInDisplayList && detail::sBufferSize + totalBytes <= detail::sBufferCapacity)
+    LIKELY {
+      u8* dst = detail::sBufferData + detail::sBufferSize;
+      detail::sBufferSize += totalBytes;
+      write_be16_header(dst, drawCmd, count);
+      dst += 3;
+      for (u16 k = 0; k < count; ++k, p += 4, n += 4, c += 4) {
+        std::memcpy(dst + 0, p, 2);
+        std::memcpy(dst + 2, n, 2);
+        std::memcpy(dst + 4, c, 2);
+        dst += 6;
+        const size_t byteOff = static_cast<size_t>(k) * 4u;
+        for (u32 ti = 0; ti < numTex; ++ti, dst += 2) {
+          std::memcpy(dst, static_cast<const u8*>(texIdxPtrs[ti]) + byteOff, 2);
+        }
+      }
+      return;
+    }
+
+  u8 hdr[3];
+  write_be16_header(hdr, drawCmd, count);
+  write_data(hdr, 3);
+  for (u16 k = 0; k < count; ++k, p += 4, n += 4, c += 4) {
+    u8 vtx[22];
+    std::memcpy(vtx + 0, p, 2);
+    std::memcpy(vtx + 2, n, 2);
+    std::memcpy(vtx + 4, c, 2);
+    const size_t byteOff = static_cast<size_t>(k) * 4u;
+    for (u32 ti = 0; ti < numTex && ti < 8u; ++ti) {
+      std::memcpy(vtx + 6 + ti * 2u, static_cast<const u8*>(texIdxPtrs[ti]) + byteOff, 2);
+    }
+    write_data(vtx, strideBytes <= sizeof(vtx) ? strideBytes : sizeof(vtx));
+  }
+}
+
 } // extern "C"

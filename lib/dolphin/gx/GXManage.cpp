@@ -1,5 +1,6 @@
 #include "gx.hpp"
 #include "__gx.h"
+#include "dolphin/gx/GXAurora.h"
 
 #include "../../gx/fifo.hpp"
 
@@ -8,6 +9,8 @@
 // Global shadow register instance
 static __GXData_struct sGXData;
 __GXData_struct* __gx = &sGXData;
+__GXShadowCache __gxShadow;
+__GXShadowCacheExt __gxShadowExt;
 static GXFifoObj sFifoObj;
 
 extern "C" {
@@ -24,6 +27,7 @@ GXFifoObj* GXInit(void* base, u32 size) {
   u32 i;
 
   std::memset(&sGXData, 0, sizeof(sGXData));
+  __gx_shadow_reset();
   __gx = &sGXData;
   __gx->inDispList = 0;
   __gx->dlSaveContext = 1;
@@ -270,8 +274,7 @@ void GXDrawDone() {
 }
 
 void GXSetDrawDone() {
-  if (DrawDoneCB != nullptr)
-    DrawDoneCB();
+  GXDrawDone();
 }
 
 GXDrawDoneCallback GXSetDrawDoneCallback(GXDrawDoneCallback cb) {
@@ -318,8 +321,7 @@ void __GXSetDirtyState() {
 }
 
 void __GXSetGenMode() {
-  GX_WRITE_RAS_REG(__gx->genMode);
-  __gx->bpSent = 1;
+  __gx_write_shadow_ras(__gx->genMode, __gxShadow.genMode, __gxShadow.genModeEpoch);
 }
 
 void __GXSendFlushPrim() {
@@ -337,6 +339,21 @@ void __GXSendFlushPrim() {
 }
 
 void __GXSetVCD() {
+  const bool inDL = aurora::gx::fifo::in_display_list();
+  const u32 ep = __gxShadow.epoch;
+  if (!inDL && __gxShadow.vcdEpoch == ep && __gxShadow.vcdLo == __gx->vcdLo && __gxShadow.vcdHi == __gx->vcdHi &&
+      __gxShadow.vcdHasNrms == __gx->hasNrms && __gxShadow.vcdHasBiNrms == __gx->hasBiNrms) {
+    __gx->bpSent = 0;
+    return;
+  }
+  if (!inDL) {
+    __gxShadow.vcdEpoch = ep;
+    __gxShadow.vcdLo = __gx->vcdLo;
+    __gxShadow.vcdHi = __gx->vcdHi;
+    __gxShadow.vcdHasNrms = __gx->hasNrms;
+    __gxShadow.vcdHasBiNrms = __gx->hasBiNrms;
+  }
+
   // Write VCD lo and hi to CP registers
   GX_WRITE_SOME_REG4(8, 0x50, __gx->vcdLo, -12);
   GX_WRITE_SOME_REG4(8, 0x60, __gx->vcdHi, -12);
@@ -395,8 +412,20 @@ void __GXSetVCD() {
 }
 
 void __GXSetVAT() {
+  const bool inDL = aurora::gx::fifo::in_display_list();
+  const u32 ep = __gxShadow.epoch;
   for (u8 i = 0; i < 8; i++) {
     if (__gx->dirtyVAT & (1 << i)) {
+      if (!inDL && __gxShadow.vatEpoch[i] == ep && __gxShadow.vatA[i] == __gx->vatA[i] &&
+          __gxShadow.vatB[i] == __gx->vatB[i] && __gxShadow.vatC[i] == __gx->vatC[i]) {
+        continue;
+      }
+      if (!inDL) {
+        __gxShadow.vatEpoch[i] = ep;
+        __gxShadow.vatA[i] = __gx->vatA[i];
+        __gxShadow.vatB[i] = __gx->vatB[i];
+        __gxShadow.vatC[i] = __gx->vatC[i];
+      }
       GX_WRITE_SOME_REG4(8, i | 0x70, __gx->vatA[i], i - 12);
       GX_WRITE_SOME_REG4(8, i | 0x80, __gx->vatB[i], i - 12);
       GX_WRITE_SOME_REG4(8, i | 0x90, __gx->vatC[i], i - 12);
@@ -416,9 +445,8 @@ static void __SetSURegs(u32 tmap, u32 tcoord) {
   u8 t_bias = GET_REG_FIELD(__gx->tMode0[tmap], 2, 2) == 1;
   SET_REG_FIELD(0, __gx->suTs0[tcoord], 1, 16, s_bias);
   SET_REG_FIELD(0, __gx->suTs1[tcoord], 1, 16, t_bias);
-  GX_WRITE_RAS_REG(__gx->suTs0[tcoord]);
-  GX_WRITE_RAS_REG(__gx->suTs1[tcoord]);
-  __gx->bpSent = 1;
+  __gx_write_shadow_ras(__gx->suTs0[tcoord], __gxShadow.suTs0[tcoord], __gxShadow.suTs0Epoch[tcoord]);
+  __gx_write_shadow_ras(__gx->suTs1[tcoord], __gxShadow.suTs1[tcoord], __gxShadow.suTs1Epoch[tcoord]);
 }
 
 void __GXSetSUTexRegs() {
@@ -493,12 +521,26 @@ void __GXUpdateBPMask() {
 }
 
 void __GXSetMatrixIndex(GXAttr matIdxAttr) {
+  const bool inDL = aurora::gx::fifo::in_display_list();
+  const u32 ep = __gxShadow.epoch;
   if (matIdxAttr < GX_VA_TEX4MTXIDX) {
-    GX_WRITE_SOME_REG4(8, 0x30, __gx->matIdxA, -12);
-    GX_WRITE_XF_REG(24, __gx->matIdxA);
+    if (inDL || __gxShadow.matIdxAEpoch != ep || __gxShadow.matIdxA != __gx->matIdxA) {
+      if (!inDL) {
+        __gxShadow.matIdxAEpoch = ep;
+        __gxShadow.matIdxA = __gx->matIdxA;
+      }
+      GX_WRITE_SOME_REG4(8, 0x30, __gx->matIdxA, -12);
+      GX_WRITE_XF_REG(24, __gx->matIdxA);
+    }
   } else {
-    GX_WRITE_SOME_REG4(8, 0x40, __gx->matIdxB, -12);
-    GX_WRITE_XF_REG(25, __gx->matIdxB);
+    if (inDL || __gxShadow.matIdxBEpoch != ep || __gxShadow.matIdxB != __gx->matIdxB) {
+      if (!inDL) {
+        __gxShadow.matIdxBEpoch = ep;
+        __gxShadow.matIdxB = __gx->matIdxB;
+      }
+      GX_WRITE_SOME_REG4(8, 0x40, __gx->matIdxB, -12);
+      GX_WRITE_XF_REG(25, __gx->matIdxB);
+    }
   }
   __gx->bpSent = 0;
 }

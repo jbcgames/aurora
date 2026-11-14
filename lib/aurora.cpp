@@ -241,6 +241,7 @@ void end_frame() noexcept {
   auto t0 = std::chrono::steady_clock::now();
   gx::fifo::drain();
   auto t1 = std::chrono::steady_clock::now();
+  const double d_wait = 0.0;
   // After the drain so this frame's binds are stamped/current; before gfx::end_frame so
   // any evicted textures land in this frame's deferred-destroy snapshot.
   gx::expire_texture_object_caches();
@@ -348,8 +349,8 @@ void end_frame() noexcept {
     const double d_finish = std::chrono::duration<double, std::milli>(t2 - t1).count();
     const double d_pres = std::chrono::duration<double, std::milli>(t_pres1 - t_pres0).count();
     const double d_end = std::chrono::duration<double, std::milli>(t3 - t2).count();
-    std::fprintf(stdout, "[AURORA-SUB] drain: %.1fms | pres: %.1fms | finish: %.1fms | gfx_end: %.1fms\n",
-                 d_drain, d_pres, d_finish, d_end);
+    std::fprintf(stdout, "[AURORA-SUB] drain: %.1fms (wait: %.1fms) | pres: %.1fms | finish: %.1fms | gfx_end: %.1fms\n",
+                 d_drain, d_wait, d_pres, d_finish, d_end);
     std::fflush(stdout);
   }
 

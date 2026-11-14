@@ -910,6 +910,10 @@ GlslProgram emit_glsl(const ShaderConfig& config, const ShaderInfo& info) {
     varyingsOut += fmt::format("\nout {} {};", type, name);
     varyingsIn += fmt::format("\nin {} {};", type, name);
   };
+  const auto addFlatVarying = [&](std::string_view type, const std::string& name) {
+    varyingsOut += fmt::format("\nflat out {} {};", type, name);
+    varyingsIn += fmt::format("\nflat in {} {};", type, name);
+  };
 
   // Native inputs: one packed `layout(location = N) in` per present attr, in canonical
   // GX attr order. MUST match native_vertex_layout()/build_native_layout() — the VAO
@@ -937,15 +941,24 @@ GlslProgram emit_glsl(const ShaderConfig& config, const ShaderInfo& info) {
   }
 
   // ---- Vertex transform ----
-  if (!info.usesMultiPnMtx) {
+  const bool multiTexBatch = config.texBatchTier != 0;
+  std::string_view pnMtxExpr = "in_pnmtxidx"sv;
+  if (multiTexBatch) {
+    CHECK(config.attrs[GX_VA_PNMTXIDX].attrType != GX_NONE, "texBatchTier requires GX_VA_PNMTXIDX");
+    addFlatVarying("uint", "v_tex0Slot");
+    vsBody +=
+        "\n    uint batch_pnmtx = in_pnmtxidx & 15u;"
+        "\n    v_tex0Slot = (in_pnmtxidx >> 4u) & 7u;";
+    pnMtxExpr = "batch_pnmtx"sv;
+  } else if (!info.usesMultiPnMtx) {
     vsBody += "\n    uint in_pnmtxidx = 0u;";
   } else if (config.attrs[GX_VA_PNMTXIDX].attrType == GX_NONE) {
     vsBody += "\n    uint in_pnmtxidx = ubuf.current_pnmtx;";
   }
   vsBody += fmt::format(
-      "\n    vec3 mv_pos = vec4({0}, 1.0) * ubuf.postex_mtx[in_pnmtxidx];"
+      "\n    vec3 mv_pos = vec4({0}, 1.0) * ubuf.postex_mtx[{1}];"
       "\n    gl_Position = vec4(mv_pos, 1.0) * ubuf.proj;",
-      vtx_attr(config, GX_VA_POS));
+      vtx_attr(config, GX_VA_POS), pnMtxExpr);
   // Reversed-Z (matches the depth compare/range/clear flips), then the GL clip-space
   // remap (S2): WebGPU clips z in [0,w], GL in [-w,w]. window depth stays bit-identical.
   if constexpr (UseReversedZ) {
@@ -956,9 +969,9 @@ GlslProgram emit_glsl(const ShaderConfig& config, const ShaderInfo& info) {
   vsBody += "\n    gl_Position.z = gl_Position.z * 2.0 - gl_Position.w;";
   if (info.usesNormals) {
     vsBody += fmt::format(
-        "\n    vec3 nrm_tmp = vec4({0}, 0.0) * ubuf.nrm_mtx[in_pnmtxidx];"
+        "\n    vec3 nrm_tmp = vec4({0}, 0.0) * ubuf.nrm_mtx[{1}];"
         "\n    vec3 mv_nrm = (dot(nrm_tmp, nrm_tmp) > 1e-10) ? normalize(nrm_tmp) : nrm_tmp;",
-        vtx_attr(config, GX_VA_NRM));
+        vtx_attr(config, GX_VA_NRM), pnMtxExpr);
   }
   // Fallback definitions for tangent and binormal (used by emboss bump mapping)
   vsBody += fmt::format(
@@ -1085,10 +1098,10 @@ GlslProgram emit_glsl(const ShaderConfig& config, const ShaderInfo& info) {
       const u32 lightIdx = tcg.type - GX_TG_BUMP0;
       vsBody += fmt::format(
           "\n    vec3 bump_ldir{0} = normalize(ubuf.lights[{1}].pos - mv_pos);"
-          "\n    vec3 bump_tan{0} = vec4(in_tangent, 0.0) * ubuf.nrm_mtx[in_pnmtxidx];"
-          "\n    vec3 bump_bin{0} = vec4(in_binrm, 0.0) * ubuf.nrm_mtx[in_pnmtxidx];"
+          "\n    vec3 bump_tan{0} = vec4(in_tangent, 0.0) * ubuf.nrm_mtx[{3}];"
+          "\n    vec3 bump_bin{0} = vec4(in_binrm, 0.0) * ubuf.nrm_mtx[{3}];"
           "\n    v_tex{0}_uv = tc{2}_proj.xy + vec2(dot(bump_ldir{0}, bump_tan{0}), dot(bump_ldir{0}, bump_bin{0}));",
-          i, lightIdx, tcg.embossSrc);
+          i, lightIdx, tcg.embossSrc, pnMtxExpr);
       fsPre += fmt::format("\n    vec2 tex{0}_uv = v_tex{0}_uv.xy;", i);
       continue;
     }
@@ -1351,8 +1364,28 @@ GlslProgram emit_glsl(const ShaderConfig& config, const ShaderInfo& info) {
     if (uvIn.empty()) {
       uvIn = fmt::format("tex{0}_uv", underlying(stage.texCoordId));
     }
-    fsPre += fmt::format("\n    vec4 sampled{0} = texture(tex{1}, {2}, ubuf.tex{1}_size_bias.z);", i,
-                         underlying(stage.texMapId), uvIn);
+    if (multiTexBatch) {
+      CHECK(underlying(stage.texMapId) == 0, "texBatchTier expects texMapId 0 (got {})", underlying(stage.texMapId));
+      const u32 slotCount = tex_batch_slots(config.texBatchTier);
+      fsPre += fmt::format("\n    vec4 sampled{0};", i);
+      for (u32 k = 0; k < slotCount; ++k) {
+        const u32 vecIdx = k >> 2u;
+        const u32 compIdx = k & 3u;
+        if (k == 0) {
+          fsPre += "\n    if (v_tex0Slot == 0u) {";
+        } else if (k + 1 < slotCount) {
+          fsPre += fmt::format("\n    else if (v_tex0Slot == {}u) {{", k);
+        } else {
+          fsPre += "\n    else {";
+        }
+        fsPre += fmt::format(
+            "\n        sampled{0} = texture(tex{1}, {2}, ubuf.tex0_batch_bias[{3}][{4}]);\n    }}",
+            i, k, uvIn, vecIdx, compIdx);
+      }
+    } else {
+      fsPre += fmt::format("\n    vec4 sampled{0} = texture(tex{1}, {2}, ubuf.tex{1}_size_bias.z);", i,
+                           underlying(stage.texMapId), uvIn);
+    }
     if ((config.sdfMaps >> underlying(stage.texMapId)) & 1u) {
       fsPre += fmt::format(
           "\n    float sdf_w{0} = max(fwidth(sampled{0}.a), 1e-4);"
@@ -1404,7 +1437,7 @@ GlslProgram emit_glsl(const ShaderConfig& config, const ShaderInfo& info) {
     }
     fsBody += "\n    prev = vec4(mix(prev.rgb, ubuf.fog.color.rgb, clamp(fogZ, 0.0, 1.0)), prev.a);";
   }
-  if (info.sampledTexCoords.any()) {
+  if (info.usesTexCoordScales) {
     uniformFields += fmt::format("\n    vec4 texcoord_scale[{}];", MaxTexCoord);
   }
   if (info.usedIndTexMtxs.any()) {
@@ -1416,6 +1449,13 @@ GlslProgram emit_glsl(const ShaderConfig& config, const ShaderInfo& info) {
     }
     uniformFields += fmt::format("\n    vec4 tex{}_size_bias;", i);
     samplerDecls += fmt::format("\nuniform sampler2D tex{};", i);
+  }
+  if (multiTexBatch) {
+    uniformFields += "\n    vec4 tex0_batch_bias[2];";
+    const u32 slotCount = tex_batch_slots(config.texBatchTier);
+    for (u32 k = 1; k < slotCount; ++k) {
+      samplerDecls += fmt::format("\nuniform sampler2D tex{};", k);
+    }
   }
   fsBody += "\n    prev = tev_overflow_vec4f(prev);";
   if (config.shadowFill) {

@@ -15,19 +15,27 @@ Module Log("aurora::gx");
 
 bool is_alpha_bump_channel(GXChannelID id) { return id == GX_ALPHA_BUMP || id == GX_ALPHA_BUMPN; }
 
-Vec4<float> texture_size_bias(const gfx::TextureBind& tex) {
-  auto width = static_cast<float>(tex.texObj.width());
-  auto height = static_cast<float>(tex.texObj.height());
+Vec4<float> texture_size_bias(const GXState::TexMetric& tex) {
+  const float width = tex.width;
+  const float height = tex.height;
   float vpBias = 0.f;
-  if (enableLodBias && tex.ref && tex.ref->hasArbitraryMips) {
+  if (enableLodBias && tex.arbitraryMips) {
     const float viewportScale =
         std::min(g_gxState.renderViewport.width / std::max(g_gxState.logicalViewport.width, 1.f),
                  g_gxState.renderViewport.height / std::max(g_gxState.logicalViewport.height, 1.f));
-    const float replacementScale = static_cast<float>(tex.ref->size.width) / std::max(width, 1.f);
+    const float replacementScale = static_cast<float>(tex.texWidth) / std::max(width, 1.f);
     vpBias = std::log2(viewportScale / std::max(replacementScale, 0.001f));
   }
-  return {width, height, tex.texObj.lod_bias() + vpBias, 0.0f};
+  return {width, height, tex.lodBias + vpBias, 0.0f};
 }
+
+} // namespace
+
+float current_tex_lod_bias(u32 texMapId) noexcept {
+  return texture_size_bias(g_gxState.texMetrics[texMapId]).z();
+}
+
+namespace {
 
 void color_arg_reg_info(GXTevColorArg arg, const TevStage& stage, ShaderInfo& info) {
   switch (arg) {
@@ -259,6 +267,17 @@ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
       info.usedIndTexMtxs.set(stage.indTexMtxId - GX_ITM_T0);
     }
   }
+  if (info.usedIndStages.any()) {
+    info.usesTexCoordScales = true;
+    info.usesTexSize = true;
+  }
+  for (int i = 0; i < config.tevStageCount; ++i) {
+    const auto& stage = config.tevStages[i];
+    if (stage.texCoordId != GX_TEXCOORD_NULL && stage.texMapId != GX_TEXMAP_NULL &&
+        (stage.indTexMtxId != GX_ITM_OFF || stage.indTexAddPrev)) {
+      info.usesTexCoordScales = true;
+    }
+  }
 
   // Emboss bump needs its source texcoord generated and a light enabled
   for (int i = 0; i < info.sampledTexCoords.size(); ++i) {
@@ -320,16 +339,20 @@ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
       const auto& cc = config.colorChannels[i];
       if (cc.lightingEnabled && cc.ambSrc == GX_SRC_REG) {
         info.uniformSize += sizeof(Vec4<float>);
+        info.usesAmbColorMask |= static_cast<u8>(1u << i);
       }
       if (cc.matSrc == GX_SRC_REG) {
         info.uniformSize += sizeof(Vec4<float>);
+        info.usesMatColorMask |= static_cast<u8>(1u << i);
       }
       const auto& cca = config.colorChannels[i + GX_ALPHA0];
       if (cca.lightingEnabled && cca.ambSrc == GX_SRC_REG) {
         info.uniformSize += sizeof(Vec4<float>);
+        info.usesAmbColorMask |= static_cast<u8>(1u << i);
       }
       if (cca.matSrc == GX_SRC_REG) {
         info.uniformSize += sizeof(Vec4<float>);
+        info.usesMatColorMask |= static_cast<u8>(1u << i);
       }
     }
   }
@@ -350,13 +373,16 @@ ShaderInfo build_shader_info(const ShaderConfig& config) noexcept {
     info.usesFog = true;
     info.uniformSize += sizeof(Fog);
   }
-  if (info.sampledTexCoords.any()) {
+  if (info.usesTexCoordScales) {
     info.uniformSize += MaxTexCoord * sizeof(Vec4<float>);
   }
   if (info.usedIndTexMtxs.any()) {
     info.uniformSize += MaxIndTexMtxs * sizeof(Mat2x4<float>);
   }
   info.uniformSize += info.sampledTextures.count() * sizeof(Vec4<float>);
+  if (config.texBatchTier != 0) {
+    info.uniformSize += 2 * sizeof(Vec4<float>);
+  }
   info.uniformSize = gfx::align_uniform(info.uniformSize);
   if (info.uniformSize > MaxUniformSize) {
     Log.fatal("Uniform size exceeds maximum: {} > {}", info.uniformSize, MaxUniformSize);
@@ -402,136 +428,13 @@ static u32 line_texcoord_mask() noexcept {
   return mask;
 }
 
-gfx::Range build_uniform(const ShaderInfo& info, u32 vtxStart, const BindGroupRanges& ranges) noexcept {
-  ZoneScoped;
+template <typename T>
+static inline void write_u(u8*& dst, const T& val) noexcept {
+  std::memcpy(dst, &val, sizeof(T));
+  dst += sizeof(T);
+}
 
-  static ByteBuffer buf;
-  buf.clear();
-  buf.reserve_extra(info.uniformSize);
-
-  buf.append(0u);
-  buf.append(info.usesMultiPnMtx ? g_gxState.currentPnMtx : 0u);
-  buf.append<f32>(g_gxState.renderViewport.width);
-  buf.append<f32>(g_gxState.renderViewport.height);
-  buf.append<f32>(g_gxState.logicalViewport.width);
-  buf.append<f32>(g_gxState.logicalViewport.height);
-  buf.append_zeroes(8); // pad
-  for (const auto& vaRange : ranges.vaRanges) {
-    buf.append<u32>(vaRange.offset);
-  }
-  if (info.lineMode != 0) {
-    if (info.lineMode == 3) { // GX_POINTS
-      buf.append<f32>(static_cast<f32>(g_gxState.pointSize) / 6.f);
-      buf.append<f32>(1.0f);
-      buf.append<f32>(tex_offset(g_gxState.pointTexOffset));
-      buf.append<u32>(point_texcoord_mask());
-    } else { // GX_LINES / GX_LINESTRIP
-      buf.append<f32>(static_cast<f32>(g_gxState.lineWidth) / 6.f);
-      buf.append<f32>(g_gxState.lineHalfAspect ? 0.5f : 1.f);
-      buf.append<f32>(tex_offset(g_gxState.lineTexOffset));
-      buf.append<u32>(line_texcoord_mask());
-    }
-  }
-  auto proj = g_gxState.proj;
-  if (g_gxState.projScaleX != 1.f && !gfx::is_offscreen()) {
-    const float s = g_gxState.projScaleX;
-    proj.m0 = proj.m0 * Vec4{s, s, s, s};
-  }
-  buf.append(proj);
-
-  if (info.usesMultiPnMtx) {
-    for (int i = 0; i < MaxPnMtx; i++) {
-      buf.append(g_gxState.pnMtx[i].pos);
-    }
-  } else {
-    buf.append(g_gxState.pnMtx[std::min<u32>(g_gxState.currentPnMtx, MaxPnMtx - 1)].pos);
-  }
-
-  if (info.usesTexMtx) {
-    buf.append(g_gxState.texMtxs);
-  }
-
-  if (info.usesNormals) {
-    if (info.usesMultiPnMtx) {
-      for (int i = 0; i < MaxPnMtx; i++) {
-        buf.append(g_gxState.pnMtx[i].nrm);
-      }
-    } else {
-      buf.append(g_gxState.pnMtx[std::min<u32>(g_gxState.currentPnMtx, MaxPnMtx - 1)].nrm);
-    }
-  }
-
-  for (int i = 0; i < info.loadsTevReg.size(); ++i) {
-    if (info.loadsTevReg.test(i)) {
-      buf.append(g_gxState.colorRegs[i]);
-    }
-  }
-  if (info.lightingEnabled) {
-    // Lights
-    static_assert(sizeof(g_gxState.lights) == 80 * GX::MaxLights);
-    buf.append(g_gxState.lights);
-    // Light state for all channels
-    for (int i = 0; i < 4; ++i) {
-      buf.append<u32>(g_gxState.colorChannelState[i].lightMask.to_ulong());
-    }
-  }
-  for (int i = 0; i < info.sampledColorChannels.size(); ++i) {
-    if (!info.sampledColorChannels.test(i)) {
-      continue;
-    }
-    const auto& ccc = g_gxState.colorChannelConfig[i];
-    const auto& ccs = g_gxState.colorChannelState[i];
-    if (ccc.lightingEnabled && ccc.ambSrc == GX_SRC_REG) {
-      buf.append(ccs.ambColor);
-    }
-    if (ccc.matSrc == GX_SRC_REG) {
-      buf.append(ccs.matColor);
-    }
-    const auto& ccca = g_gxState.colorChannelConfig[i + GX_ALPHA0];
-    const auto& ccsa = g_gxState.colorChannelState[i + GX_ALPHA0];
-    if (ccca.lightingEnabled && ccca.ambSrc == GX_SRC_REG) {
-      buf.append(ccsa.ambColor);
-    }
-    if (ccca.matSrc == GX_SRC_REG) {
-      buf.append(ccsa.matColor);
-    }
-  }
-  for (int i = 0; i < info.sampledKColors.size(); ++i) {
-    if (info.sampledKColors.test(i)) {
-      buf.append(g_gxState.kcolors[i]);
-    }
-  }
-  if (info.usesPTTexMtx.any()) {
-    buf.append(g_gxState.ptTexMtxs);
-  }
-  if (info.usesFog) {
-    const auto& state = g_gxState.fog;
-    Fog fog{.color = state.color, .a = state.a, .b = state.b, .c = state.c};
-    buf.append(fog);
-  }
-  if (info.sampledTexCoords.any()) {
-    for (const auto& scale : g_gxState.texCoordScales) {
-      buf.append(
-          Vec4{static_cast<f32>(scale.scaleS) + 1.0f, static_cast<f32>(scale.scaleT) + 1.0f, 0.0f, 0.0f});
-    }
-  }
-  if (info.usedIndTexMtxs.any()) {
-    for (int i = 0; i < MaxIndTexMtxs; ++i) {
-      const auto& mtx = g_gxState.indTexMtxs[i];
-      buf.append(Vec4{mtx.mtx.m0.x, mtx.mtx.m0.y, mtx.mtx.m1.x, mtx.mtx.m1.y});
-      buf.append(Vec4{mtx.mtx.m2.x, mtx.mtx.m2.y, std::exp2f(mtx.scaleExp), 0.0f});
-    }
-  }
-  for (int i = 0; i < info.sampledTextures.size(); ++i) {
-    if (!info.sampledTextures.test(i)) {
-      continue;
-    }
-    const auto& tex = get_texture(static_cast<GXTexMapID>(i));
-    // CHECK(tex, "unbound texture {}", i);
-    buf.append(texture_size_bias(tex));
-  }
-  g_gxState.stateDirty = false;
-
+static gfx::Range dedup_and_push_uniform(const u8* bufBase, u32 uSize) noexcept {
   struct UniformDedupEntry {
     u32 frame = UINT32_MAX;
     u32 size = 0;
@@ -541,22 +444,244 @@ gfx::Range build_uniform(const ShaderInfo& info, u32 vtxStart, const BindGroupRa
   static constexpr size_t kUniformDedupSize = 1024;
   static std::array<UniformDedupEntry, kUniformDedupSize> s_uniformDedup{};
   const u32 curFrame = gfx::current_frame();
-  const u32 uSize = static_cast<u32>(buf.size());
   if (curFrame != UINT32_MAX && uSize > 0) {
-    const u64 uHash = XXH3_64bits(buf.data(), uSize);
+    const u64 uHash = XXH3_64bits(bufBase, uSize);
     const size_t slot = (uHash ^ (uHash >> 10)) & (kUniformDedupSize - 1);
     auto& e = s_uniformDedup[slot];
     if (e.frame == curFrame && e.size == uSize && e.hash == uHash) {
       const u8* existing = gfx::uniform_data_at(e.offset);
-      if (existing != nullptr && std::memcmp(existing, buf.data(), uSize) == 0) {
+      if (existing != nullptr && std::memcmp(existing, bufBase, uSize) == 0) {
         return {e.offset, uSize};
       }
     }
-    const gfx::Range pushed = gfx::push_uniform(buf.data(), uSize);
+    const gfx::Range pushed = gfx::push_uniform(bufBase, uSize);
     e = {curFrame, uSize, uHash, pushed.offset};
     return pushed;
   }
 
-  return gfx::push_uniform(buf.data(), buf.size());
+  return gfx::push_uniform(bufBase, uSize);
+}
+
+gfx::Range build_uniform(const ShaderInfo& info, u32 vtxStart, const BindGroupRanges& ranges) noexcept {
+  ZoneScoped;
+
+  alignas(16) static std::array<u8, 8192> s_inlineBuf;
+  static std::vector<u8> s_overflowBuf;
+  u8* bufBase = s_inlineBuf.data();
+  const size_t maxBytes = static_cast<size_t>(info.uniformSize) + ranges.vaRanges.size() * sizeof(u32) + 64u;
+  if (maxBytes > s_inlineBuf.size()) UNLIKELY {
+    if (s_overflowBuf.size() < maxBytes) {
+      s_overflowBuf.resize(maxBytes);
+    }
+    bufBase = s_overflowBuf.data();
+  }
+  u8* cur = bufBase;
+
+  write_u<u32>(cur, 0u);
+  write_u<u32>(cur, info.usesMultiPnMtx ? g_gxState.currentPnMtx : 0u);
+  write_u<f32>(cur, g_gxState.renderViewport.width);
+  write_u<f32>(cur, g_gxState.renderViewport.height);
+  write_u<f32>(cur, g_gxState.logicalViewport.width);
+  write_u<f32>(cur, g_gxState.logicalViewport.height);
+  std::memset(cur, 0, 8);
+  cur += 8;
+  for (const auto& vaRange : ranges.vaRanges) {
+    write_u<u32>(cur, vaRange.offset);
+  }
+  if (info.lineMode != 0) {
+    if (info.lineMode == 3) { // GX_POINTS
+      write_u<f32>(cur, static_cast<f32>(g_gxState.pointSize) / 6.f);
+      write_u<f32>(cur, 1.0f);
+      write_u<f32>(cur, tex_offset(g_gxState.pointTexOffset));
+      write_u<u32>(cur, point_texcoord_mask());
+    } else { // GX_LINES / GX_LINESTRIP
+      write_u<f32>(cur, static_cast<f32>(g_gxState.lineWidth) / 6.f);
+      write_u<f32>(cur, g_gxState.lineHalfAspect ? 0.5f : 1.f);
+      write_u<f32>(cur, tex_offset(g_gxState.lineTexOffset));
+      write_u<u32>(cur, line_texcoord_mask());
+    }
+  }
+  if (g_gxState.projScaleX != 1.f && !gfx::is_offscreen()) {
+    auto proj = g_gxState.proj;
+    const float s = g_gxState.projScaleX;
+    proj.m0 = proj.m0 * Vec4{s, s, s, s};
+    write_u(cur, proj);
+  } else {
+    write_u(cur, g_gxState.proj);
+  }
+
+  if (info.usesMultiPnMtx) {
+    for (int i = 0; i < MaxPnMtx; i++) {
+      write_u(cur, g_gxState.pnMtx[i].pos);
+    }
+  } else {
+    write_u(cur, g_gxState.pnMtx[std::min<u32>(g_gxState.currentPnMtx, MaxPnMtx - 1)].pos);
+  }
+
+  if (info.usesTexMtx) {
+    write_u(cur, g_gxState.texMtxs);
+  }
+
+  if (info.usesNormals) {
+    if (info.usesMultiPnMtx) {
+      for (int i = 0; i < MaxPnMtx; i++) {
+        write_u(cur, g_gxState.pnMtx[i].nrm);
+      }
+    } else {
+      write_u(cur, g_gxState.pnMtx[std::min<u32>(g_gxState.currentPnMtx, MaxPnMtx - 1)].nrm);
+    }
+  }
+
+  if (info.loadsTevReg.any()) {
+    for (int i = 0; i < info.loadsTevReg.size(); ++i) {
+      if (info.loadsTevReg.test(i)) {
+        write_u(cur, g_gxState.colorRegs[i]);
+      }
+    }
+  }
+  if (info.lightingEnabled) {
+    // Lights
+    static_assert(sizeof(g_gxState.lights) == 80 * GX::MaxLights);
+    write_u(cur, g_gxState.lights);
+    // Light state for all channels
+    for (int i = 0; i < 4; ++i) {
+      write_u<u32>(cur, g_gxState.colorChannelState[i].lightMask.to_ulong());
+    }
+  }
+  if (info.sampledColorChannels.any()) {
+    for (int i = 0; i < info.sampledColorChannels.size(); ++i) {
+      if (!info.sampledColorChannels.test(i)) {
+        continue;
+      }
+      const auto& ccc = g_gxState.colorChannelConfig[i];
+      const auto& ccs = g_gxState.colorChannelState[i];
+      if (ccc.lightingEnabled && ccc.ambSrc == GX_SRC_REG) {
+        write_u(cur, ccs.ambColor);
+      }
+      if (ccc.matSrc == GX_SRC_REG) {
+        write_u(cur, ccs.matColor);
+      }
+      const auto& ccca = g_gxState.colorChannelConfig[i + GX_ALPHA0];
+      const auto& ccsa = g_gxState.colorChannelState[i + GX_ALPHA0];
+      if (ccca.lightingEnabled && ccca.ambSrc == GX_SRC_REG) {
+        write_u(cur, ccsa.ambColor);
+      }
+      if (ccca.matSrc == GX_SRC_REG) {
+        write_u(cur, ccsa.matColor);
+      }
+    }
+  }
+  if (info.sampledKColors.any()) {
+    for (int i = 0; i < info.sampledKColors.size(); ++i) {
+      if (info.sampledKColors.test(i)) {
+        write_u(cur, g_gxState.kcolors[i]);
+      }
+    }
+  }
+  if (info.usesPTTexMtx.any()) {
+    write_u(cur, g_gxState.ptTexMtxs);
+  }
+  if (info.usesFog) {
+    const auto& state = g_gxState.fog;
+    const Fog fog{.color = state.color, .a = state.a, .b = state.b, .c = state.c};
+    write_u(cur, fog);
+  }
+  if (info.usesTexCoordScales) {
+    for (const auto& scale : g_gxState.texCoordScales) {
+      write_u(cur, Vec4{static_cast<f32>(scale.scaleS) + 1.0f, static_cast<f32>(scale.scaleT) + 1.0f, 0.0f, 0.0f});
+    }
+  }
+  if (info.usedIndTexMtxs.any()) {
+    for (int i = 0; i < MaxIndTexMtxs; ++i) {
+      const auto& mtx = g_gxState.indTexMtxs[i];
+      write_u(cur, Vec4{mtx.mtx.m0.x, mtx.mtx.m0.y, mtx.mtx.m1.x, mtx.mtx.m1.y});
+      write_u(cur, Vec4{mtx.mtx.m2.x, mtx.mtx.m2.y, std::exp2f(mtx.scaleExp), 0.0f});
+    }
+  }
+  if (info.sampledTextures.any()) {
+    for (int i = 0; i < info.sampledTextures.size(); ++i) {
+      if (!info.sampledTextures.test(i)) {
+        continue;
+      }
+      write_u(cur, texture_size_bias(g_gxState.texMetrics[i]));
+    }
+  }
+  g_gxState.stateDirty = false;
+  const u32 uSize = static_cast<u32>(cur - bufBase);
+  return dedup_and_push_uniform(bufBase, uSize);
+}
+
+gfx::Range build_merged_uniform(const ShaderInfo& baseInfo, uint32_t baseUniformOffset, uint32_t baseUniformSize,
+                                const Mat3x4<float>* posMtxs, const Mat3x4<float>* nrmMtxs,
+                                uint32_t mtxCount, const float* texBatchBiases,
+                                uint32_t texSlotCount) noexcept {
+  const u8* baseSrc = gfx::uniform_data_at(baseUniformOffset);
+  CHECK(baseSrc != nullptr && mtxCount > 0 && mtxCount <= MaxPnMtx, "build_merged_uniform: invalid state");
+  constexpr size_t kHeaderBytes = 4 + 4 + 16 + 8 + BindGroupRanges{}.vaRanges.size() * sizeof(u32);
+  const size_t preMtxBytes = kHeaderBytes + (baseInfo.lineMode != 0 ? 16u : 0u) + sizeof(Mat4x4<float>);
+  const size_t basePosMtxBytes = sizeof(Mat3x4<float>) * (baseInfo.usesMultiPnMtx ? MaxPnMtx : 1u);
+  const size_t texMtxBytes = baseInfo.usesTexMtx ? sizeof(g_gxState.texMtxs) : 0u;
+  const size_t baseNrmMtxBytes =
+      baseInfo.usesNormals ? sizeof(Mat3x4<float>) * (baseInfo.usesMultiPnMtx ? MaxPnMtx : 1u) : 0u;
+  const size_t suffixOff = preMtxBytes + basePosMtxBytes + texMtxBytes + baseNrmMtxBytes;
+  CHECK(suffixOff <= baseUniformSize, "build_merged_uniform: uniform layout mismatch ({} > {})", suffixOff,
+        baseUniformSize);
+  const size_t suffixBytes = baseUniformSize - suffixOff;
+  const size_t mergedPosMtxBytes = sizeof(Mat3x4<float>) * MaxPnMtx;
+  const size_t mergedNrmMtxBytes = baseInfo.usesNormals ? sizeof(Mat3x4<float>) * MaxPnMtx : 0u;
+  const size_t batchBiasBytes = (texSlotCount > 1 && texBatchBiases != nullptr) ? (2u * sizeof(Vec4<float>)) : 0u;
+  const u32 mergedSize = static_cast<u32>(preMtxBytes + mergedPosMtxBytes + texMtxBytes + mergedNrmMtxBytes +
+                                          suffixBytes + batchBiasBytes);
+
+  alignas(16) static std::array<u8, 8192> s_mergedInlineBuf;
+  static std::vector<u8> s_mergedOverflowBuf;
+  u8* dstBase = s_mergedInlineBuf.data();
+  if (mergedSize > s_mergedInlineBuf.size()) UNLIKELY {
+    if (s_mergedOverflowBuf.size() < mergedSize) {
+      s_mergedOverflowBuf.resize(mergedSize);
+    }
+    dstBase = s_mergedOverflowBuf.data();
+  }
+
+  u8* cur = dstBase;
+  std::memcpy(cur, baseSrc, preMtxBytes);
+  std::memset(cur + 4, 0, sizeof(u32));
+  cur += preMtxBytes;
+
+  std::memcpy(cur, posMtxs, sizeof(Mat3x4<float>) * mtxCount);
+  if (mtxCount < MaxPnMtx) {
+    std::memset(cur + sizeof(Mat3x4<float>) * mtxCount, 0, sizeof(Mat3x4<float>) * (MaxPnMtx - mtxCount));
+  }
+  cur += mergedPosMtxBytes;
+
+  if (texMtxBytes > 0) {
+    std::memcpy(cur, baseSrc + preMtxBytes + basePosMtxBytes, texMtxBytes);
+    cur += texMtxBytes;
+  }
+
+  if (mergedNrmMtxBytes > 0) {
+    std::memcpy(cur, nrmMtxs, sizeof(Mat3x4<float>) * mtxCount);
+    if (mtxCount < MaxPnMtx) {
+      std::memset(cur + sizeof(Mat3x4<float>) * mtxCount, 0, sizeof(Mat3x4<float>) * (MaxPnMtx - mtxCount));
+    }
+    cur += mergedNrmMtxBytes;
+  }
+
+  if (suffixBytes > 0) {
+    std::memcpy(cur, baseSrc + suffixOff, suffixBytes);
+    cur += suffixBytes;
+  }
+
+  if (batchBiasBytes > 0) {
+    float biasVals[8];
+    const u32 activeSlots = std::min<u32>(texSlotCount, 8u);
+    for (u32 k = 0; k < 8u; ++k) {
+      biasVals[k] = (k < activeSlots) ? texBatchBiases[k] : 0.0f;
+    }
+    std::memcpy(cur, biasVals, sizeof(biasVals));
+    cur += sizeof(biasVals);
+  }
+
+  return gfx::push_uniform(dstBase, mergedSize);
 }
 } // namespace aurora::gx

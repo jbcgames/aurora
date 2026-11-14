@@ -479,6 +479,7 @@ struct GlProcTable {
   EGLBoolean (*eglDestroySyncKHR)(EGLDisplay, EGLSyncKHR) = nullptr;
   EGLint (*eglClientWaitSyncKHR)(EGLDisplay, EGLSyncKHR, EGLint, uint64_t) = nullptr;
   EGLBoolean (*eglWaitSyncKHR)(EGLDisplay, EGLSyncKHR, EGLint) = nullptr;
+  EGLBoolean (*eglSwapInterval)(EGLDisplay, EGLint) = nullptr;
   void (*glEGLImageTargetTexture2DOES)(GLenum, void*) = nullptr;
 };
 

@@ -194,6 +194,8 @@ void GXSetVtxAttrFmt(GXVtxFmt vtxfmt, GXAttr attr, GXCompCnt cnt, GXCompType typ
   u32* vb = &__gx->vatB[vtxfmt];
   u32* vc = &__gx->vatC[vtxfmt];
   SETVAT(va, vb, vc, attr, cnt, type, frac);
+  __gxShadowExt.vcdVatGen++;
+  __gxShadowExt.vcdVatGen++;
   __gx->dirtyState |= 0x10;
   __gx->dirtyVAT |= static_cast<u8>(1 << vtxfmt);
 }
@@ -211,11 +213,12 @@ void GXSetVtxAttrFmtv(GXVtxFmt vtxfmt, const GXVtxAttrFmtList* list) {
     ++list;
   }
 
+  __gxShadowExt.vcdVatGen++;
   __gx->dirtyState |= 0x10;
   __gx->dirtyVAT |= static_cast<u8>(1 << vtxfmt);
 }
 
-void GXSetArray(GXAttr attr, const void* data, u32 size, u8 stride, bool le) {
+void GXSetArrayExt(GXAttr attr, const void* data, u32 size, u8 stride, u8 leMode) {
   GXAttr cpAttr = static_cast<GXAttr>(attr);
   if (attr == GX_VA_NBT) {
     cpAttr = GX_VA_NRM;
@@ -224,14 +227,35 @@ void GXSetArray(GXAttr attr, const void* data, u32 size, u8 stride, bool le) {
 
   assert((cpIdx & ~0xF) == 0);
 
+  const u8 leByte = leMode;
+  if (!aurora::gx::fifo::in_display_list() && cpIdx < 16u) {
+    const u32 ep = __gxShadow.epoch;
+    const u32 aep = __gxShadowExt.arrayEpoch;
+    auto& slot = __gxShadowExt.arrays[cpIdx];
+    if (slot.epoch == ep && slot.arrayEpoch == aep && slot.data == data && slot.size == size &&
+        slot.stride == stride && slot.le == leByte) {
+      return;
+    }
+    slot.epoch = ep;
+    slot.arrayEpoch = aep;
+    slot.data = data;
+    slot.size = size;
+    slot.stride = stride;
+    slot.le = leByte;
+  }
+
   // Write array base
   GX_WRITE_AURORA(GX_AURORA_LOAD_ARRAYBASE | cpIdx);
   GX_WRITE_U64(reinterpret_cast<u64>(data));
   GX_WRITE_U32(size);
-  GX_WRITE_U8(le ? 1 : 0);
+  GX_WRITE_U8(leByte);
 
   // Write array stride
   GX_WRITE_CP_REG(CP_REG_ARRAYSTRIDE_ID | cpIdx, stride);
+}
+
+void GXSetArray(GXAttr attr, const void* data, u32 size, u8 stride, bool le) {
+  GXSetArrayExt(attr, data, size, stride, le ? 1 : 0);
 }
 
 void GXSetTexCoordGen2(GXTexCoordID dst, GXTexGenType type, GXTexGenSrc src, u32 mtx, GXBool normalize, u32 postMtx) {
@@ -328,13 +352,33 @@ void GXSetTexCoordGen2(GXTexCoordID dst, GXTexGenType type, GXTexGenSrc src, u32
     break;
   }
 
-  GX_WRITE_XF_REG(dst + 0x40, reg);
-
   // Post-transform register
   u32 postReg = 0;
   SET_REG_FIELD(0, postReg, 6, 0, postMtx - 64);
   SET_REG_FIELD(0, postReg, 1, 8, normalize);
-  GX_WRITE_XF_REG(dst + 0x50, postReg);
+
+  if (!aurora::gx::fifo::in_display_list()) {
+    const u32 ep = __gxShadow.epoch;
+    if (__gxShadow.xfTexGenEpoch[dst] != ep) {
+      __gxShadow.xfTexGenEpoch[dst] = ep;
+      __gxShadow.xfTexGenReg[dst] = reg;
+      __gxShadow.xfTexGenPost[dst] = postReg;
+      GX_WRITE_XF_REG(dst + 0x40, reg);
+      GX_WRITE_XF_REG(dst + 0x50, postReg);
+    } else {
+      if (__gxShadow.xfTexGenReg[dst] != reg) {
+        __gxShadow.xfTexGenReg[dst] = reg;
+        GX_WRITE_XF_REG(dst + 0x40, reg);
+      }
+      if (__gxShadow.xfTexGenPost[dst] != postReg) {
+        __gxShadow.xfTexGenPost[dst] = postReg;
+        GX_WRITE_XF_REG(dst + 0x50, postReg);
+      }
+    }
+  } else {
+    GX_WRITE_XF_REG(dst + 0x40, reg);
+    GX_WRITE_XF_REG(dst + 0x50, postReg);
+  }
 
   // Update matrix index shadows
   switch (dst) {
@@ -368,11 +412,14 @@ void GXSetTexCoordGen2(GXTexCoordID dst, GXTexGenType type, GXTexGenSrc src, u32
 
 void GXSetNumTexGens(u8 num) {
   SET_REG_FIELD(0, __gx->genMode, 4, 0, num);
-  GX_WRITE_XF_REG(0x3F, num);
+  __gx_write_shadow_xf(0x3F, num, __gxShadow.xfNumTexGens, __gxShadow.xfNumTexGensEpoch);
   __gx->dirtyState |= 4;
 }
 
-void GXInvalidateVtxCache() { GX_WRITE_U8(0x48); }
+void GXInvalidateVtxCache() {
+  __gx_shadow_invalidate_arrays();
+  GX_WRITE_U8(0x48);
+}
 
 void GXSetLineWidth(u8 width, GXTexOffset offs) {
   SET_REG_FIELD(0, __gx->lpSize, 8, 0, width);
@@ -391,7 +438,6 @@ void GXSetPointSize(u8 pointSize, GXTexOffset texOffsets) {
 void GXEnableTexOffsets(GXTexCoordID coord, GXBool line_enable, GXBool point_enable) {
   SET_REG_FIELD(0, __gx->suTs0[coord], 1, 18, line_enable);
   SET_REG_FIELD(0, __gx->suTs0[coord], 1, 19, point_enable);
-  GX_WRITE_RAS_REG(__gx->suTs0[coord]);
-  __gx->bpSent = 1;
+  __gx_write_shadow_ras(__gx->suTs0[coord], __gxShadow.suTs0[coord], __gxShadow.suTs0Epoch[coord]);
 }
 }

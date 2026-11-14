@@ -12,6 +12,7 @@
 
 #include <absl/container/flat_hash_map.h>
 #include <limits>
+#include <memory>
 #include <tracy/Tracy.hpp>
 
 #include <bit>
@@ -35,6 +36,34 @@ static u32 s_gxArrayBindGen = 0;
 // Bumped ONLY when disc-backed (!le) blobs/memory ranges are forgotten, moved, or reloaded,
 // so read-only big-endian map/model arrays do not need to be re-hashed every frame or per NPC.
 static u32 s_gxDiscArrayInvalidateGen = 0;
+
+// Generation counters for O(1) vertex/matrix/cache-pointer validation in hot draw loops.
+static std::array<u32, MaxPnMtx> s_pnMtxGen = []() constexpr {
+  std::array<u32, MaxPnMtx> g{};
+  for (u32 i = 0; i < MaxPnMtx; ++i) g[i] = i + 1;
+  return g;
+}();
+static u32 s_pnMtxNextGen = MaxPnMtx + 1;
+static std::array<u32, MaxVtxFmt> s_vtxFmtGen = {1, 1, 1, 1, 1, 1, 1, 1};
+static std::array<u32, 12> s_arrayStateGen = {1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
+static u32 s_vtxStateDirtyGen = 1;
+static u32 s_curVtxStateVerifiedGen = 0;
+static u16 s_curVtxStateVerifiedId = UINT16_MAX;
+static u64 s_vtxDescPacked = 0;
+static bool s_vtxDescPackedDirty = true;
+
+static inline u64 current_vtx_desc_bits() noexcept {
+  if (s_vtxDescPackedDirty) UNLIKELY {
+    static_assert(MaxVtxAttr * 2 <= 64);
+    u64 bits = 0;
+    for (u32 a = 0; a < MaxVtxAttr; ++a) {
+      bits |= (static_cast<u64>(g_gxState.vtxDesc[a]) & 3ull) << (a * 2u);
+    }
+    s_vtxDescPacked = bits;
+    s_vtxDescPackedDirty = false;
+  }
+  return s_vtxDescPacked;
+}
 
 static u16 prepare_idx_buffer(ByteBuffer& buf, GXPrimitive prim, u16 vtxStart, u16 vtxCount) {
   u16 numIndices = 0;
@@ -232,37 +261,20 @@ struct TexBpRegMapping {
   enum class Kind : uint8_t { Mode0, Mode1, Image0, Image1, Image2, Image3, Tlut } kind;
 };
 
-static std::optional<TexBpRegMapping> decode_tex_bp_reg(u32 regId) {
-  constexpr std::array mode0Ids{0x80u, 0x81u, 0x82u, 0x83u, 0xA0u, 0xA1u, 0xA2u, 0xA3u};
-  constexpr std::array mode1Ids{0x84u, 0x85u, 0x86u, 0x87u, 0xA4u, 0xA5u, 0xA6u, 0xA7u};
-  constexpr std::array image0Ids{0x88u, 0x89u, 0x8Au, 0x8Bu, 0xA8u, 0xA9u, 0xAAu, 0xABu};
-  constexpr std::array image1Ids{0x8Cu, 0x8Du, 0x8Eu, 0x8Fu, 0xACu, 0xADu, 0xAEu, 0xAFu};
-  constexpr std::array image2Ids{0x90u, 0x91u, 0x92u, 0x93u, 0xB0u, 0xB1u, 0xB2u, 0xB3u};
-  constexpr std::array image3Ids{0x94u, 0x95u, 0x96u, 0x97u, 0xB4u, 0xB5u, 0xB6u, 0xB7u};
-  constexpr std::array tlutIds{0x98u, 0x99u, 0x9Au, 0x9Bu, 0xB8u, 0xB9u, 0xBAu, 0xBBu};
-
-  for (u8 i = 0; i < MaxTextures; ++i) {
-    if (regId == mode0Ids[i]) {
-      return TexBpRegMapping{.texMapId = i, .kind = TexBpRegMapping::Kind::Mode0};
-    }
-    if (regId == mode1Ids[i]) {
-      return TexBpRegMapping{.texMapId = i, .kind = TexBpRegMapping::Kind::Mode1};
-    }
-    if (regId == image0Ids[i]) {
-      return TexBpRegMapping{.texMapId = i, .kind = TexBpRegMapping::Kind::Image0};
-    }
-    if (regId == image1Ids[i]) {
-      return TexBpRegMapping{.texMapId = i, .kind = TexBpRegMapping::Kind::Image1};
-    }
-    if (regId == image2Ids[i]) {
-      return TexBpRegMapping{.texMapId = i, .kind = TexBpRegMapping::Kind::Image2};
-    }
-    if (regId == image3Ids[i]) {
-      return TexBpRegMapping{.texMapId = i, .kind = TexBpRegMapping::Kind::Image3};
-    }
-    if (regId == tlutIds[i]) {
-      return TexBpRegMapping{.texMapId = i, .kind = TexBpRegMapping::Kind::Tlut};
-    }
+static inline std::optional<TexBpRegMapping> decode_tex_bp_reg(u32 regId) {
+  if (regId >= 0x80u && regId <= 0x9Bu) {
+    const u32 off = regId - 0x80u;
+    return TexBpRegMapping{
+        .texMapId = static_cast<u8>(off & 3u),
+        .kind = static_cast<TexBpRegMapping::Kind>(off >> 2),
+    };
+  }
+  if (regId >= 0xA0u && regId <= 0xBBu) {
+    const u32 off = regId - 0xA0u;
+    return TexBpRegMapping{
+        .texMapId = static_cast<u8>(4u + (off & 3u)),
+        .kind = static_cast<TexBpRegMapping::Kind>(off >> 2),
+    };
   }
   return std::nullopt;
 }
@@ -284,6 +296,27 @@ static inline f32 read_f32(const u8* ptr, bool bigEndian) {
   return val;
 }
 
+static inline bool copy_xf_flat_mtx(void* dst, const u8* data, u32 len, bool bigEndian) {
+  u32* flatU = reinterpret_cast<u32*>(dst);
+  f32* flat = reinterpret_cast<f32*>(dst);
+  bool changed = false;
+  for (u32 i = 0; i < len; i++) {
+    const u32 bits = read_u32(data + i * 4, bigEndian);
+    if (flatU[i] != bits) {
+      f32 v;
+      std::memcpy(&v, &bits, sizeof(v));
+      if (flat[i] != v) {
+        changed = true;
+      }
+      flatU[i] = bits;
+    }
+  }
+  return changed;
+}
+
+static u32 s_splitTexMtxGen = 0;
+static u32 s_splitLightsGen = 0;
+
 static bool copy_xf_data(u32 addr, const u8* data, u32 len, bool bigEndian) {
   if (addr < 0x78) {
     // Position matrices (0x0000 - 0x0077)
@@ -292,18 +325,9 @@ static bool copy_xf_data(u32 addr, const u8* data, u32 len, bool bigEndian) {
     // We only support full writes to matrices
     CHECK(mtxIdx < MaxPnMtx, "XF: PosMtx copy oob? Should never happen; mtxIdx={}", mtxIdx);
     CHECK(startOffset == 0 && len == 12, "XF: PosMtx sub-copy unsupported: offs={}, len={}", startOffset, len);
-    auto& mtx = g_gxState.pnMtx[mtxIdx].pos;
-    f32* flat = reinterpret_cast<f32*>(&mtx);
-    bool changed = false;
-    for (u32 i = 0; i < len; i++) {
-      const f32 v = read_f32(data + i * 4, bigEndian);
-      if (flat[i] != v) {
-        flat[i] = v;
-        changed = true;
-      }
-    }
-    if (changed) {
+    if (copy_xf_flat_mtx(&g_gxState.pnMtx[mtxIdx].pos, data, len, bigEndian)) {
       g_gxState.stateDirty = true;
+      s_pnMtxGen[mtxIdx] = ++s_pnMtxNextGen;
     }
     return true;
   } else if (addr < 0x0F0) {
@@ -316,18 +340,9 @@ static bool copy_xf_data(u32 addr, const u8* data, u32 len, bool bigEndian) {
           len);
 
     // Determine if 2x4 or 3x4 from count
-    auto& mtx = g_gxState.texMtxs[mtxIdx];
-    f32* flat = reinterpret_cast<f32*>(&mtx);
-    bool changed = false;
-    for (u32 i = 0; i < len; i++) {
-      const f32 v = read_f32(data + i * 4, bigEndian);
-      if (flat[i] != v) {
-        flat[i] = v;
-        changed = true;
-      }
-    }
-    if (changed) {
+    if (copy_xf_flat_mtx(&g_gxState.texMtxs[mtxIdx], data, len, bigEndian)) {
       g_gxState.stateDirty = true;
+      ++s_splitTexMtxGen;
     }
     return true;
   } else if (addr >= 0x400 && addr < 0x45A) {
@@ -339,19 +354,25 @@ static bool copy_xf_data(u32 addr, const u8* data, u32 len, bool bigEndian) {
     CHECK(mtxIdx < MaxPnMtx, "XF: NrmMtx copy oob? Should never happen; mtxIdx={}", mtxIdx);
     CHECK(startOffset == 0 && len == 9, "XF: NrmMtx sub-copy unsupported: offs={}, len={}", startOffset, len);
     auto& mtx = g_gxState.pnMtx[mtxIdx].nrm;
+    u32* flatU = reinterpret_cast<u32*>(&mtx);
     f32* flat = reinterpret_cast<f32*>(&mtx);
     bool changed = false;
     static constexpr uint8_t s_nrmIdx[9] = {0, 1, 2, 4, 5, 6, 8, 9, 10};
     for (u32 i = 0; i < len; i++) {
-      const f32 v = read_f32(data + i * 4, bigEndian);
+      const u32 bits = read_u32(data + i * 4, bigEndian);
       const u32 dstIdx = s_nrmIdx[i];
-      if (flat[dstIdx] != v) {
-        flat[dstIdx] = v;
-        changed = true;
+      if (flatU[dstIdx] != bits) {
+        f32 v;
+        std::memcpy(&v, &bits, sizeof(v));
+        if (flat[dstIdx] != v) {
+          changed = true;
+        }
+        flatU[dstIdx] = bits;
       }
     }
     if (changed) {
       g_gxState.stateDirty = true;
+      s_pnMtxGen[mtxIdx] = ++s_pnMtxNextGen;
     }
     return true;
   } else if (addr >= 0x500 && addr < 0x5F0) {
@@ -361,18 +382,9 @@ static bool copy_xf_data(u32 addr, const u8* data, u32 len, bool bigEndian) {
     u32 startOffset = ptBase % 12;
     CHECK(mtxIdx < MaxPTTexMtx, "XF: PTTexMtx copy oob? Should never happen; mtxIdx={}", mtxIdx);
     CHECK(startOffset == 0 && len == 12, "XF: PTTexMtx sub-copy unsupported: offs={}, len={}", startOffset, len);
-    auto& mtx = g_gxState.ptTexMtxs[mtxIdx];
-    f32* flat = reinterpret_cast<f32*>(&mtx);
-    bool changed = false;
-    for (u32 i = 0; i < len; i++) {
-      const f32 v = read_f32(data + i * 4, bigEndian);
-      if (flat[startOffset + i] != v) {
-        flat[startOffset + i] = v;
-        changed = true;
-      }
-    }
-    if (changed) {
+    if (copy_xf_flat_mtx(&g_gxState.ptTexMtxs[mtxIdx], data, len, bigEndian)) {
       g_gxState.stateDirty = true;
+      ++s_splitTexMtxGen;
     }
     return true;
   } else if (addr >= 0x600 && addr < 0x680) {
@@ -446,6 +458,7 @@ static bool copy_xf_data(u32 addr, const u8* data, u32 len, bool bigEndian) {
     }
     if (changed) {
       g_gxState.stateDirty = true;
+      ++s_splitLightsGen;
     }
     return true;
   }
@@ -453,11 +466,18 @@ static bool copy_xf_data(u32 addr, const u8* data, u32 len, bool bigEndian) {
 }
 
 // Forward declarations for register handlers
-static void handle_bp(u32 value, bool bigEndian);
+static inline u32& bp_cache_slot(u32 regId, u32 value) noexcept {
+  if (regId >= 0xE0 && regId <= 0xE7 && (value & (1u << 23)) != 0) {
+    return g_gxState.tevKColorBpCache[regId - 0xE0];
+  }
+  return g_gxState.bpRegCache[regId];
+}
+static bool handle_bp(u32 value, bool bigEndian);
 static void handle_cp(u8 addr, u32 value, bool bigEndian);
 static void handle_xf(const u8* data, u32& pos, u32 size, bool bigEndian, bool& pipelineChanged);
 static void handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndian);
 static void handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian);
+static void flush_pending_pnmtx_batch();
 
 namespace {
 static bool s_hasLastDrawState = false;
@@ -466,7 +486,10 @@ static PipelineConfig s_lastConfig{};
 static ShaderConfig s_lastShaderConfig{};
 static ShaderInfo s_lastInfo{};
 static gfx::PipelineRef s_lastPipeline{};
+static size_t s_lastPipeMemoIdx = SIZE_MAX;
+static uint64_t s_lastCfgHash = 0;
 static GXBindGroups s_lastBindGroups{};
+static GXBindGroups s_candidateBg{};
 static uint32_t s_lastTextureDirty = 0;
 static uint32_t s_lastUniformDirty = 0;
 static gfx::Range s_lastUniformRange{};
@@ -490,16 +513,200 @@ struct DrainTiming {
   double ms_tex_resolve = 0.0;
   double ms_bg_build = 0.0;
   double ms_geom_miss = 0.0;
+  double ms_static_dl = 0.0;
+  double ms_submit = 0.0;
+  double ms_flush = 0.0;
+  double ms_flush_merge = 0.0;
   double ms_total = 0.0;
   u32 frames = 0;
+  u32 sdl_calls = 0;
+  u32 sdl_clears = 0;
+  u32 sdl_max_sz = 0;
   u32 draw_count = 0;
   u32 bg_calls = 0;
   u32 arr_hash_calls = 0;
   u64 arr_hash_bytes = 0;
   u64 fifo_hash_bytes = 0;
   u32 xf_calls = 0;
+  // Draw-split diagnostics (only updated when TTYD_TIMING_DETAIL is set)
+  u32 split_pairs = 0;
+  u32 split_same_pipe = 0;
+  u32 split_same_tex = 0;
+  u32 split_same_both = 0;
+  u32 split_only_pnmtx = 0;
+  u32 split_only_tex = 0;
+  u32 split_only_pipe = 0;
+  u32 split_chg_texmtx = 0;
+  u32 split_chg_lights = 0;
+  u32 split_chg_bp_uni = 0;
+  u32 split_chg_oth_uni = 0;
+  u32 split_same_all = 0;
+  // Detailed split/flush breakdown
+  u32 fl_nonbat = 0;
+  u32 fl_topo = 0;
+  u32 fl_da = 0;
+  u32 fl_tm = 0;
+  u32 fl_li = 0;
+  u32 fl_bp = 0;
+  u32 fl_oth = 0;
+  u32 fl_vtx = 0;
+  u32 fl_pipe = 0;
+  u32 fl_tex = 0;
+  u32 fl_mtx = 0;
+  u32 skip_fixtg = 0;
+  u32 bat_ok = 0;
+  u32 bat_single = 0;
+  u32 bat_merged = 0;
+  u32 oth_amb = 0;
+  u32 oth_mat = 0;
+  u32 oth_vp = 0;
+  u32 oth_proj = 0;
+  u32 oth_tdim = 0;
+  u32 oth_off = 0;
+  u32 bp_fog = 0;
+  u32 bp_tcol = 0;
+  u32 bp_su = 0;
+  u32 bp_ind = 0;
+  u32 bp_line = 0;
+  u32 op_cull = 0;
+  u32 op_z = 0;
+  u32 op_blend = 0;
+  u32 op_topo = 0;
+  u32 op_fog = 0;
+  u32 op_attrs = 0;
+  u32 op_tev = 0;
+  u32 op_chan = 0;
+  u32 op_tcg = 0;
+  u32 op_acmp = 0;
+  u32 op_paper = 0;
+  u32 pd_cull = 0;
+  u32 pd_z = 0;
+  u32 pd_blend = 0;
+  u32 pd_topo = 0;
+  u32 pd_fog = 0;
+  u32 pd_attrs = 0;
+  u32 pd_tev = 0;
+  u32 pd_chan = 0;
+  u32 pd_tcg = 0;
+  u32 pd_acmp = 0;
+  u32 pd_paper = 0;
+  std::array<u32, 256> bp_uni_reg{};
 };
 static DrainTiming s_drainTiming;
+
+struct BatchUniState {
+  u32 vpProjGen = 0;
+  u32 offGen = 0;
+  u32 bpFogGen = 0;
+  u32 bpSuGen = 0;
+  u32 bpIndGen = 0;
+  u32 bpLineGen = 0;
+  std::array<u32, 4> bpTevColGen{};
+  std::array<u32, 4> bpKColGen{};
+  std::array<u32, 2> othAmbGen{};
+  std::array<u32, 2> othMatGen{};
+  std::array<u32, MaxTextures> texDimGen{};
+};
+static BatchUniState s_curUniState{};
+
+enum class UniMismatch : u8 { None = 0, Lights, Bp, Oth };
+
+static inline UniMismatch batch_uniforms_mismatch(const BatchUniState& batchUni, u32 batchLightsGen,
+                                                  const ShaderInfo& info, bool ignoreTex0Dim = false) noexcept {
+  if (info.lightingEnabled && batchLightsGen != s_splitLightsGen) {
+    return UniMismatch::Lights;
+  }
+  if (batchUni.vpProjGen != s_curUniState.vpProjGen || batchUni.offGen != s_curUniState.offGen) {
+    return UniMismatch::Oth;
+  }
+  if (info.usesFog && batchUni.bpFogGen != s_curUniState.bpFogGen) {
+    return UniMismatch::Bp;
+  }
+  if ((info.usesTexCoordScales || info.lineMode != 0) && batchUni.bpSuGen != s_curUniState.bpSuGen) {
+    return UniMismatch::Bp;
+  }
+  if (info.usedIndTexMtxs.any() && batchUni.bpIndGen != s_curUniState.bpIndGen) {
+    return UniMismatch::Bp;
+  }
+  if (info.lineMode != 0 && batchUni.bpLineGen != s_curUniState.bpLineGen) {
+    return UniMismatch::Bp;
+  }
+  if (((info.usesAmbColorMask & 1u) != 0 && batchUni.othAmbGen[0] != s_curUniState.othAmbGen[0]) ||
+      ((info.usesAmbColorMask & 2u) != 0 && batchUni.othAmbGen[1] != s_curUniState.othAmbGen[1]) ||
+      ((info.usesMatColorMask & 1u) != 0 && batchUni.othMatGen[0] != s_curUniState.othMatGen[0]) ||
+      ((info.usesMatColorMask & 2u) != 0 && batchUni.othMatGen[1] != s_curUniState.othMatGen[1])) {
+    return UniMismatch::Oth;
+  }
+  if (info.loadsTevReg.any()) {
+    u32 m = static_cast<u32>(info.loadsTevReg.to_ulong());
+    while (m != 0) {
+      const u32 idx = static_cast<u32>(std::countr_zero(m));
+      m &= m - 1;
+      if (batchUni.bpTevColGen[idx] != s_curUniState.bpTevColGen[idx]) {
+        return UniMismatch::Bp;
+      }
+    }
+  }
+  if (info.sampledKColors.any()) {
+    u32 m = static_cast<u32>(info.sampledKColors.to_ulong());
+    while (m != 0) {
+      const u32 idx = static_cast<u32>(std::countr_zero(m));
+      m &= m - 1;
+      if (batchUni.bpKColGen[idx] != s_curUniState.bpKColGen[idx]) {
+        return UniMismatch::Bp;
+      }
+    }
+  }
+  if (info.sampledTextures.any()) {
+    u32 m = static_cast<u32>(info.sampledTextures.to_ulong());
+    while (m != 0) {
+      const u32 idx = static_cast<u32>(std::countr_zero(m));
+      m &= m - 1;
+      if (ignoreTex0Dim && idx == 0) {
+        continue;
+      }
+      if (batchUni.texDimGen[idx] != s_curUniState.texDimGen[idx]) {
+        return UniMismatch::Oth;
+      }
+    }
+  }
+  return UniMismatch::None;
+}
+
+static u32 s_splitBpUniGen = 0;
+static u32 s_splitOthUniGen = 0;
+static u32 s_splitOthAmbGen = 0;
+static u32 s_splitOthMatGen = 0;
+static u32 s_splitOthVpGen = 0;
+static u32 s_splitOthProjGen = 0;
+static u32 s_splitOthTexDimGen = 0;
+static u32 s_splitOthOffGen = 0;
+static u32 s_splitBpFogGen = 0;
+static u32 s_splitBpTevColGen = 0;
+static u32 s_splitBpSuGen = 0;
+static u32 s_splitBpIndGen = 0;
+static u32 s_splitBpLineGen = 0;
+static bool s_splitHasPrev = false;
+static gfx::PipelineRef s_splitPrevPipe = 0;
+static gfx::BindGroupRef s_splitPrevTex = 0;
+static u32 s_splitPrevDstAlpha = 0;
+static u32 s_splitPrevUniformDirty = 0;
+static u32 s_splitPrevTexMtxGen = 0;
+static u32 s_splitPrevLightsGen = 0;
+static u32 s_splitPrevBpUniGen = 0;
+static u32 s_splitPrevOthUniGen = 0;
+static u32 s_splitPrevOthAmbGen = 0;
+static u32 s_splitPrevOthMatGen = 0;
+static u32 s_splitPrevOthVpGen = 0;
+static u32 s_splitPrevOthProjGen = 0;
+static u32 s_splitPrevOthTexDimGen = 0;
+static u32 s_splitPrevOthOffGen = 0;
+static u32 s_splitPrevBpFogGen = 0;
+static u32 s_splitPrevBpTevColGen = 0;
+static u32 s_splitPrevBpSuGen = 0;
+static u32 s_splitPrevBpIndGen = 0;
+static u32 s_splitPrevBpLineGen = 0;
+static PipelineConfig s_splitPrevConfig{};
 
 struct CachedShaderDraw {
   uint64_t shaderHash = 0;
@@ -519,11 +726,22 @@ static u32 s_vatGen = 1;
 static std::array<u32, 256> s_cpRegCache{};
 static std::array<bool, 256> s_cpRegValid{};
 
+static void process_stream(const u8* data, u32 size, bool bigEndian, bool logTiming);
+static void native_geom_cache_maybe_log_stats();
+static bool s_staticDlCaptureActive = false;
+static bool s_staticDlCaptureAborted = false;
+
 static void reset_frame_draw_cache() {
+  flush_pending_pnmtx_batch();
   s_hasLastDrawState = false;
   s_hasLastUniformRange = false;
   s_lastUniformRange = {};
+  s_lastPipeMemoIdx = SIZE_MAX;
+  s_lastCfgHash = 0;
+  s_splitHasPrev = false;
   s_cpRegValid.fill(false);
+  s_vtxDescPackedDirty = true;
+  s_curVtxStateVerifiedId = UINT16_MAX;
   g_gxState.uniformDirty++;
   g_gxState.pipelineDirty++;
 }
@@ -563,11 +781,129 @@ static inline std::chrono::steady_clock::time_point timing_now() noexcept {
   return is_timing_enabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 }
 
+struct DrainScopeTimer {
+  double& acc;
+  bool active;
+  std::chrono::steady_clock::time_point t0;
+  explicit DrainScopeTimer(double& a) noexcept : acc(a), active(is_timing_enabled()) {
+    if (active) UNLIKELY t0 = std::chrono::steady_clock::now();
+  }
+  ~DrainScopeTimer() {
+    if (active) UNLIKELY {
+      acc += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    }
+  }
+};
+
 void process(const u8* data, u32 size, bool bigEndian) {
   ZoneScoped;
+  native_geom_cache_maybe_log_stats();
   const bool logTiming = is_timing_enabled();
   const auto t_proc_start = logTiming ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
   reset_frame_draw_cache();
+  process_stream(data, size, bigEndian, logTiming);
+
+  flush_pending_pnmtx_batch();
+  if (logTiming) UNLIKELY {
+    if (s_drainTiming.frames + 1 >= 30) {
+      const double f = 1.0 / (s_drainTiming.frames + 1);
+      std::printf("[DRAIN-EXTRA-30f] sub=%.1fms flush=%.1fms(merge=%.1fms) sdl=%.1fms[n=%.0f clr=%.0f maxsz=%u]\n",
+                  s_drainTiming.ms_submit * f,
+                  s_drainTiming.ms_flush * f,
+                  s_drainTiming.ms_flush_merge * f,
+                  s_drainTiming.ms_static_dl * f,
+                  s_drainTiming.sdl_calls * f,
+                  s_drainTiming.sdl_clears * f,
+                  s_drainTiming.sdl_max_sz);
+    }
+  }
+
+  if (logTiming) UNLIKELY {
+    const auto t_proc_end = std::chrono::steady_clock::now();
+    s_drainTiming.ms_total += std::chrono::duration<double, std::milli>(t_proc_end - t_proc_start).count();
+    if (++s_drainTiming.frames >= 30) {
+      const double f = 1.0 / s_drainTiming.frames;
+      std::printf("[DRAIN-TIMING-30f] avg: total %.1fms | draw_tot %.1fms (draws:%.0f hash:%.1f exp:%.1f g_miss:%.1f scan:%.1f pipe_cfg:%.1f pipe_ref:%.1f res:%.1f bg:%.1f[calls:%.0f] uni:%.1f push:%.1f) | xf %.1fms[n:%.0f] | indx %.1fms | bp %.1fms | cp %.1fms | hbytes(fifo:%.1fKB arr:%.1fKB[%u])\n",
+                  s_drainTiming.ms_total * f,
+                  s_drainTiming.ms_draw_total * f,
+                  s_drainTiming.draw_count * f,
+                  s_drainTiming.ms_geom_hash * f,
+                  s_drainTiming.ms_geom_expand * f,
+                  s_drainTiming.ms_geom_miss * f,
+                  s_drainTiming.ms_scan * f,
+                  s_drainTiming.ms_pipe_cfg * f,
+                  s_drainTiming.ms_pipe_ref * f,
+                  s_drainTiming.ms_tex_resolve * f,
+                  s_drainTiming.ms_bg_build * f,
+                  s_drainTiming.bg_calls * f,
+                  s_drainTiming.ms_uni_build * f,
+                  s_drainTiming.ms_push_cmd * f,
+                  s_drainTiming.ms_xf * f,
+                  s_drainTiming.xf_calls * f,
+                  s_drainTiming.ms_indx * f,
+                  s_drainTiming.ms_bp * f,
+                  s_drainTiming.ms_cp * f,
+                  (s_drainTiming.fifo_hash_bytes * f) / 1024.0,
+                  (s_drainTiming.arr_hash_bytes * f) / 1024.0,
+                  static_cast<unsigned>(s_drainTiming.arr_hash_calls / s_drainTiming.frames));
+      std::printf("[SPLIT-30f] avg pairs:%.0f | samePipe:%.0f sameTex:%.0f sameBoth:%.0f | onlyPnMtx:%.0f onlyTex:%.0f onlyPipe:%.0f | chgTexMtx:%.0f chgLights:%.0f chgBpUni:%.0f chgOthUni:%.0f sameAll:%.0f\n",
+                  s_drainTiming.split_pairs * f,
+                  s_drainTiming.split_same_pipe * f,
+                  s_drainTiming.split_same_tex * f,
+                  s_drainTiming.split_same_both * f,
+                  s_drainTiming.split_only_pnmtx * f,
+                  s_drainTiming.split_only_tex * f,
+                  s_drainTiming.split_only_pipe * f,
+                  s_drainTiming.split_chg_texmtx * f,
+                  s_drainTiming.split_chg_lights * f,
+                  s_drainTiming.split_chg_bp_uni * f,
+                  s_drainTiming.split_chg_oth_uni * f,
+                  s_drainTiming.split_same_all * f);
+      u32 topReg[4] = {0, 0, 0, 0};
+      u32 topCnt[4] = {0, 0, 0, 0};
+      for (u32 r = 0; r < 256; ++r) {
+        const u32 c = s_drainTiming.bp_uni_reg[r];
+        if (c == 0) continue;
+        for (int k = 0; k < 4; ++k) {
+          if (c > topCnt[k]) {
+            for (int m = 3; m > k; --m) {
+              topCnt[m] = topCnt[m - 1];
+              topReg[m] = topReg[m - 1];
+            }
+            topCnt[k] = c;
+            topReg[k] = r;
+            break;
+          }
+        }
+      }
+      std::printf("[SPLIT-WHY-30f] flush(nonbat:%.0f topo:%.0f da:%.0f tm:%.0f li:%.0f bp:%.0f oth:%.0f vtx:%.0f pipe:%.0f tex:%.0f mtx:%.0f fixtg:%.0f | batOk:%.0f 1x:%.0f mx:%.0f) | oth(amb:%.0f mat:%.0f vp:%.0f proj:%.0f tdim:%.0f off:%.0f) | bp(fog:%.0f tcol:%.0f su:%.0f ind:%.0f line:%.0f top:%02X=%.0f,%02X=%.0f,%02X=%.0f,%02X=%.0f)\n",
+                  s_drainTiming.fl_nonbat * f, s_drainTiming.fl_topo * f, s_drainTiming.fl_da * f,
+                  s_drainTiming.fl_tm * f, s_drainTiming.fl_li * f, s_drainTiming.fl_bp * f,
+                  s_drainTiming.fl_oth * f, s_drainTiming.fl_vtx * f, s_drainTiming.fl_pipe * f,
+                  s_drainTiming.fl_tex * f, s_drainTiming.fl_mtx * f, s_drainTiming.skip_fixtg * f,
+                  s_drainTiming.bat_ok * f, s_drainTiming.bat_single * f, s_drainTiming.bat_merged * f,
+                  s_drainTiming.oth_amb * f, s_drainTiming.oth_mat * f, s_drainTiming.oth_vp * f,
+                  s_drainTiming.oth_proj * f, s_drainTiming.oth_tdim * f, s_drainTiming.oth_off * f,
+                  s_drainTiming.bp_fog * f, s_drainTiming.bp_tcol * f, s_drainTiming.bp_su * f,
+                  s_drainTiming.bp_ind * f, s_drainTiming.bp_line * f,
+                  topReg[0], topCnt[0] * f, topReg[1], topCnt[1] * f,
+                  topReg[2], topCnt[2] * f, topReg[3], topCnt[3] * f);
+      std::printf("[PIPE-WHY-30f] onlyPipe(cull:%.0f z:%.0f blend:%.0f topo:%.0f fog:%.0f attrs:%.0f tev:%.0f chan:%.0f tcg:%.0f acmp:%.0f paper:%.0f) | allDiffPipe(cull:%.0f z:%.0f blend:%.0f topo:%.0f fog:%.0f attrs:%.0f tev:%.0f chan:%.0f tcg:%.0f acmp:%.0f paper:%.0f)\n",
+                  s_drainTiming.op_cull * f, s_drainTiming.op_z * f, s_drainTiming.op_blend * f,
+                  s_drainTiming.op_topo * f, s_drainTiming.op_fog * f, s_drainTiming.op_attrs * f,
+                  s_drainTiming.op_tev * f, s_drainTiming.op_chan * f, s_drainTiming.op_tcg * f,
+                  s_drainTiming.op_acmp * f, s_drainTiming.op_paper * f,
+                  s_drainTiming.pd_cull * f, s_drainTiming.pd_z * f, s_drainTiming.pd_blend * f,
+                  s_drainTiming.pd_topo * f, s_drainTiming.pd_fog * f, s_drainTiming.pd_attrs * f,
+                  s_drainTiming.pd_tev * f, s_drainTiming.pd_chan * f, s_drainTiming.pd_tcg * f,
+                  s_drainTiming.pd_acmp * f, s_drainTiming.pd_paper * f);
+      std::fflush(stdout);
+      s_drainTiming = DrainTiming{};
+    }
+  }
+}
+
+static void process_stream(const u8* data, u32 size, bool bigEndian, bool logTiming) {
   u32 pos = 0;
 
   while (pos < size) {
@@ -584,22 +920,51 @@ void process(const u8* data, u32 size, bool bigEndian) {
       u32 value = read_u32(data + pos, bigEndian);
       pos += 4;
       const u32 regId = (value >> 24) & 0xFF;
-      if (regId != 0xFE && regId != 0x52 && regId != 0x55 && regId != 0x56 && g_gxState.bpRegCache[0xFE] == 0x00FFFFFF && g_gxState.bpRegCache[regId] == value) {
+      if (regId != 0xFE && regId != 0x52 && regId != 0x55 && regId != 0x56 && g_gxState.bpRegCache[0xFE] == 0x00FFFFFF &&
+          bp_cache_slot(regId, value) == value) {
         continue;
       }
+      bool bpChanged;
       if (logTiming) UNLIKELY {
         const auto t0 = std::chrono::steady_clock::now();
-        handle_bp(value, bigEndian);
+        bpChanged = handle_bp(value, bigEndian);
         const auto t1 = std::chrono::steady_clock::now();
         s_drainTiming.ms_bp += std::chrono::duration<double, std::milli>(t1 - t0).count();
       } else {
-        handle_bp(value, bigEndian);
+        bpChanged = handle_bp(value, bigEndian);
       }
-      if (bp_affects_uniforms(regId)) {
-        g_gxState.uniformDirty++;
-      }
-      if (bp_affects_pipeline(regId)) {
-        g_gxState.pipelineDirty++;
+      if (bpChanged) {
+        if (bp_affects_uniforms(regId)) {
+          g_gxState.uniformDirty++;
+          ++s_splitBpUniGen;
+          if (regId >= 0xEE && regId <= 0xF2) {
+            ++s_curUniState.bpFogGen;
+            if (logTiming) UNLIKELY ++s_splitBpFogGen;
+          } else if (regId >= 0xE0 && regId <= 0xE7) {
+            const u32 idx = (regId - 0xE0) / 2;
+            if ((value & (1u << 23)) != 0) {
+              if (idx < GX_MAX_KCOLOR) ++s_curUniState.bpKColGen[idx];
+            } else {
+              if (idx < MaxTevRegs) ++s_curUniState.bpTevColGen[idx];
+            }
+            if (logTiming) UNLIKELY ++s_splitBpTevColGen;
+          } else if (regId >= 0x30 && regId <= 0x3F) {
+            ++s_curUniState.bpSuGen;
+            if (logTiming) UNLIKELY ++s_splitBpSuGen;
+          } else if (regId >= 0x06 && regId <= 0x0E) {
+            ++s_curUniState.bpIndGen;
+            if (logTiming) UNLIKELY ++s_splitBpIndGen;
+          } else if (regId == 0x22) {
+            ++s_curUniState.bpLineGen;
+            if (logTiming) UNLIKELY ++s_splitBpLineGen;
+          }
+          if (logTiming) UNLIKELY {
+            ++s_drainTiming.bp_uni_reg[regId];
+          }
+        }
+        if (bp_affects_pipeline(regId)) {
+          g_gxState.pipelineDirty++;
+        }
       }
       break;
     }
@@ -760,61 +1125,29 @@ void process(const u8* data, u32 size, bool bigEndian) {
       break;
     }
   }
-
-  if (logTiming) UNLIKELY {
-    const auto t_proc_end = std::chrono::steady_clock::now();
-    s_drainTiming.ms_total += std::chrono::duration<double, std::milli>(t_proc_end - t_proc_start).count();
-    if (++s_drainTiming.frames >= 30) {
-      const double f = 1.0 / s_drainTiming.frames;
-      std::printf("[DRAIN-TIMING-30f] avg: total %.1fms | draw_tot %.1fms (draws:%.0f hash:%.1f exp:%.1f g_miss:%.1f scan:%.1f pipe_cfg:%.1f pipe_ref:%.1f res:%.1f bg:%.1f[calls:%.0f] uni:%.1f push:%.1f) | xf %.1fms[n:%.0f] | indx %.1fms | bp %.1fms | cp %.1fms | hbytes(fifo:%.1fKB arr:%.1fKB[%u])\n",
-                  s_drainTiming.ms_total * f,
-                  s_drainTiming.ms_draw_total * f,
-                  s_drainTiming.draw_count * f,
-                  s_drainTiming.ms_geom_hash * f,
-                  s_drainTiming.ms_geom_expand * f,
-                  s_drainTiming.ms_geom_miss * f,
-                  s_drainTiming.ms_scan * f,
-                  s_drainTiming.ms_pipe_cfg * f,
-                  s_drainTiming.ms_pipe_ref * f,
-                  s_drainTiming.ms_tex_resolve * f,
-                  s_drainTiming.ms_bg_build * f,
-                  s_drainTiming.bg_calls * f,
-                  s_drainTiming.ms_uni_build * f,
-                  s_drainTiming.ms_push_cmd * f,
-                  s_drainTiming.ms_xf * f,
-                  s_drainTiming.xf_calls * f,
-                  s_drainTiming.ms_indx * f,
-                  s_drainTiming.ms_bp * f,
-                  s_drainTiming.ms_cp * f,
-                  (s_drainTiming.fifo_hash_bytes * f) / 1024.0,
-                  (s_drainTiming.arr_hash_bytes * f) / 1024.0,
-                  static_cast<unsigned>(s_drainTiming.arr_hash_calls / s_drainTiming.frames));
-      std::fflush(stdout);
-      s_drainTiming = DrainTiming{};
-    }
-  }
 }
 
 // Helper to extract bit fields from a 32-bit register
 inline static u32 bp_get(u32 reg, u32 size, u32 shift) { return reg >> shift & (1u << size) - 1; }
 
 // BP register handler - decodes BP (RAS/pixel engine) register writes and updates g_gxState
-static void handle_bp(u32 value, bool bigEndian) {
+static bool handle_bp(u32 value, bool bigEndian) {
   u32 regId = (value >> 24) & 0xFF;
   // Mask off the register ID from the value for field extraction
   // (the regId is stored in bits 24-31, data is in bits 0-23)
 
   if (regId == 0xFE) {
     g_gxState.bpRegCache[regId] = value & 0x00FFFFFF;
-    return;
+    return false;
   } else {
     u32 ssMask = g_gxState.bpRegCache[0xFE];
     g_gxState.bpRegCache[0xFE] = 0x00FFFFFF;
-    const u32 merged = (g_gxState.bpRegCache[regId] & ~ssMask) | (value & ssMask);
+    u32& cacheSlot = bp_cache_slot(regId, value);
+    const u32 merged = (cacheSlot & ~ssMask) | (value & ssMask);
     value = (regId << 24) | (merged & 0x00FFFFFF);
-    if (g_gxState.bpRegCache[regId] == value && regId != 0x52 && regId != 0x55 && regId != 0x56)
-      return;
-    g_gxState.bpRegCache[regId] = value;
+    if (cacheSlot == value && regId != 0x52 && regId != 0x55 && regId != 0x56)
+      return false;
+    cacheSlot = value;
   }
 
   // TEV color combiner stages (0xC0, 0xC2, 0xC4, ... 0xDE)
@@ -842,7 +1175,7 @@ static void handle_bp(u32 value, bool bigEndian) {
       }
       g_gxState.stateDirty = true;
     }
-    return;
+    return true;
   }
 
   // TEV alpha combiner stages (0xC1, 0xC3, 0xC5, ... 0xDF)
@@ -870,7 +1203,7 @@ static void handle_bp(u32 value, bool bigEndian) {
       }
       g_gxState.stateDirty = true;
     }
-    return;
+    return true;
   }
 
   switch (regId) {
@@ -951,6 +1284,7 @@ static void handle_bp(u32 value, bool bigEndian) {
     const int32_t rt = static_cast<int32_t>(bp_get(scis1, 11, 12)) - 342;
     const int32_t wd = std::max(rt - lf + 1, 0);
     const int32_t ht = std::max(bm - tp + 1, 0);
+    flush_pending_pnmtx_batch();
     set_logical_scissor({lf, tp, wd, ht});
     break;
   }
@@ -1103,6 +1437,7 @@ static void handle_bp(u32 value, bool bigEndian) {
     if (bp_get(value, 1, 14) != 0) {
       Log.warn("STUB: display copy is not implemented");
     } else {
+      flush_pending_pnmtx_batch();
       copy_tex(g_gxState.texCopyDest, clear);
       g_gxState.textureDirty++;
       g_gxState.stateDirty = true;
@@ -1450,6 +1785,7 @@ static void handle_bp(u32 value, bool bigEndian) {
     }
     break;
   }
+  return true;
 }
 
 // CP register handler - decodes CP register writes and updates g_gxState
@@ -1473,6 +1809,8 @@ static void handle_cp(u8 addr, u32 value, bool bigEndian) {
     vd[GX_VA_CLR1] = static_cast<GXAttrType>(bp_get(value, 2, 15));
     g_gxState.stateDirty = true;
     g_gxState.clearVtxSizeCache();
+    s_vtxDescPackedDirty = true;
+    ++s_vtxStateDirtyGen;
     break;
   }
 
@@ -1489,6 +1827,8 @@ static void handle_cp(u8 addr, u32 value, bool bigEndian) {
     vd[GX_VA_TEX7] = static_cast<GXAttrType>(bp_get(value, 2, 14));
     g_gxState.stateDirty = true;
     g_gxState.clearVtxSizeCache();
+    s_vtxDescPackedDirty = true;
+    ++s_vtxStateDirtyGen;
     break;
   }
 
@@ -1538,6 +1878,8 @@ static void handle_cp(u8 addr, u32 value, bool bigEndian) {
       vf.attrs[GX_VA_TEX0].frac = static_cast<u8>(bp_get(value, 5, 25));
       g_gxState.stateDirty = true;
       g_gxState.clearVtxSizeCache();
+      ++s_vtxFmtGen[fmt];
+      ++s_vtxStateDirtyGen;
     }
     // VAT B registers (0x80-0x87)
     else if (addr >= 0x80 && addr <= 0x87) {
@@ -1557,6 +1899,8 @@ static void handle_cp(u8 addr, u32 value, bool bigEndian) {
       // TEX4 frac is in VAT C
       g_gxState.stateDirty = true;
       g_gxState.clearVtxSizeCache();
+      ++s_vtxFmtGen[fmt];
+      ++s_vtxStateDirtyGen;
     }
     // VAT C registers (0x90-0x97)
     else if (addr >= 0x90 && addr <= 0x97) {
@@ -1574,6 +1918,8 @@ static void handle_cp(u8 addr, u32 value, bool bigEndian) {
       vf.attrs[GX_VA_TEX7].frac = static_cast<u8>(bp_get(value, 5, 27));
       g_gxState.stateDirty = true;
       g_gxState.clearVtxSizeCache();
+      ++s_vtxFmtGen[fmt];
+      ++s_vtxStateDirtyGen;
     }
     // Array base addresses (0xA0-0xAF)
     else if (addr >= 0xA0 && addr <= 0xAF) {
@@ -1588,6 +1934,10 @@ static void handle_cp(u8 addr, u32 value, bool bigEndian) {
         if (array.stride != newStride) {
           array.stride = newStride;
           g_gxState.stateDirty = true;
+          if (attrIdx >= GX_VA_POS && attrIdx < GX_VA_POS + 12) {
+            ++s_arrayStateGen[attrIdx - GX_VA_POS];
+          }
+          ++s_vtxStateDirtyGen;
         }
       }
     }
@@ -1642,24 +1992,36 @@ static void handle_xf(const u8* data, u32& pos, u32 size, bool bigEndian, bool& 
         g_gxState.colorChannelState[GX_COLOR0].ambColor = unpack_color(val);
         g_gxState.colorChannelState[GX_ALPHA0].ambColor = unpack_color(val);
         g_gxState.stateDirty = true;
+        ++s_curUniState.othAmbGen[0];
+        ++s_splitOthUniGen;
+        ++s_splitOthAmbGen;
         break;
       case 0x0B:
         // Ambient color 1
         g_gxState.colorChannelState[GX_COLOR1].ambColor = unpack_color(val);
         g_gxState.colorChannelState[GX_ALPHA1].ambColor = unpack_color(val);
         g_gxState.stateDirty = true;
+        ++s_curUniState.othAmbGen[1];
+        ++s_splitOthUniGen;
+        ++s_splitOthAmbGen;
         break;
       case 0x0C:
         // Material color 0
         g_gxState.colorChannelState[GX_COLOR0].matColor = unpack_color(val);
         g_gxState.colorChannelState[GX_ALPHA0].matColor = unpack_color(val);
         g_gxState.stateDirty = true;
+        ++s_curUniState.othMatGen[0];
+        ++s_splitOthUniGen;
+        ++s_splitOthMatGen;
         break;
       case 0x0D:
         // Material color 1
         g_gxState.colorChannelState[GX_COLOR1].matColor = unpack_color(val);
         g_gxState.colorChannelState[GX_ALPHA1].matColor = unpack_color(val);
         g_gxState.stateDirty = true;
+        ++s_curUniState.othMatGen[1];
+        ++s_splitOthUniGen;
+        ++s_splitOthMatGen;
         break;
       case 0x0E:
       case 0x0F:
@@ -1685,8 +2047,13 @@ static void handle_xf(const u8* data, u32& pos, u32 size, bool bigEndian, bool& 
           } else {
             chan.attnFn = GX_AF_SPOT;
           }
-          u32 lightMask = lightsLo | (lightsHi << 4);
-          g_gxState.colorChannelState[chanId].lightMask = GX::LightMask{lightMask};
+          const u32 lightMask = lightsLo | (lightsHi << 4);
+          const GX::LightMask nextMask{lightMask};
+          if (g_gxState.colorChannelState[chanId].lightMask != nextMask) {
+            g_gxState.colorChannelState[chanId].lightMask = nextMask;
+            g_gxState.uniformDirty++;
+            ++s_splitLightsGen;
+          }
           g_gxState.stateDirty = true;
           pipelineChanged = true;
         }
@@ -1758,6 +2125,7 @@ static void handle_xf(const u8* data, u32& pos, u32 size, bool bigEndian, bool& 
           const auto& lv = g_gxState.logicalViewport;
           if (lv.left != left || lv.top != top || lv.width != width || lv.height != height ||
               lv.znear != znear || lv.zfar != zfar) {
+            flush_pending_pnmtx_batch();
             set_logical_viewport({
                 .left = left,
                 .top = top,
@@ -1768,6 +2136,9 @@ static void handle_xf(const u8* data, u32& pos, u32 size, bool bigEndian, bool& 
             });
             g_gxState.uniformDirty++;
             g_gxState.stateDirty = true;
+            ++s_curUniState.vpProjGen;
+            ++s_splitOthUniGen;
+            ++s_splitOthVpGen;
           }
         }
         break;
@@ -1825,6 +2196,9 @@ static void handle_xf(const u8* data, u32& pos, u32 size, bool bigEndian, bool& 
             g_gxState.projType = nextType;
             g_gxState.proj = nextProj;
             g_gxState.stateDirty = true;
+            ++s_curUniState.vpProjGen;
+            ++s_splitOthUniGen;
+            ++s_splitOthProjGen;
           }
         }
         break;
@@ -2093,6 +2467,9 @@ static bool try_native_draw_indexed(GXVtxFmt fmt, u16 vtxCount, const u8* vtxDat
 // Draw command handler - parses vertices inline and caches results
 static ByteBuffer handle_draw_idx_buf;
 
+static const u8* s_dbgStaticDlPtr = nullptr;
+static u32 s_dbgStaticDlSize = 0;
+
 static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* data, u32& pos, u32 size) {
   ZoneScoped;
   u32 vtxSize;
@@ -2100,6 +2477,24 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* da
     LIKELY { vtxSize = g_gxState.lastVtxSize; }
   else
     UNLIKELY { vtxSize = calculate_last_vtx_size(fmt); }
+
+  if (prim != GX_QUADS && prim != GX_TRIANGLES && prim != GX_TRIANGLESTRIP && prim != GX_TRIANGLEFAN &&
+      prim != GX_LINES && prim != GX_LINESTRIP && prim != GX_POINTS) {
+    std::string fullHex;
+    const u32 fullHi = std::min<u32>(size, 128u);
+    for (u32 i = 0; i < fullHi; ++i) {
+      fullHex += fmt::format("{:02x} ", data[i]);
+    }
+    std::string vd;
+    for (u32 a = 0; a < MaxVtxAttr; ++a) {
+      if (g_gxState.vtxDesc[a] != GX_NONE) {
+        vd += fmt::format("a{}={},", a, static_cast<u32>(g_gxState.vtxDesc[a]));
+      }
+    }
+    Log.error("[BAD-PRIM] prim={} ({:#x}) fmt={} vtxCount={} vtxSize={} pos={} size={} staticDl=({:p},{}) vcd=[{}] bytes[0..{}]=[{}]",
+              static_cast<u32>(prim), static_cast<u32>(prim), static_cast<u32>(fmt), vtxCount, vtxSize, pos, size,
+              static_cast<const void*>(s_dbgStaticDlPtr), s_dbgStaticDlSize, vd, fullHi, fullHex);
+  }
 
   u32 totalVtxBytes = vtxCount * vtxSize;
   if (pos + totalVtxBytes > size)
@@ -2119,6 +2514,10 @@ static void draw_prim(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* da
     return;
   }
 
+  if (s_staticDlCaptureActive) {
+    s_staticDlCaptureAborted = true;
+  }
+  flush_pending_pnmtx_batch();
   auto* lastDraw = !g_gxState.stateDirty ? gfx::get_last_draw_command<DrawData>() : nullptr;
   // A storage draw must never merge into a native draw's range (incompatible buffer layout).
   const bool canMerge = lastDraw != nullptr && prim != GX_LINES && prim != GX_LINESTRIP && prim != GX_POINTS &&
@@ -2265,8 +2664,7 @@ static void push_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, gfx::Rang
     s_pipeMemo[slot].used = true;
   }
 
-  resolve_sampled_textures(info);
-  const auto bindGroups = build_bind_groups(info);
+  const auto bindGroups = resolve_and_build_bind_groups(info);
 
   uint32_t instanceCount = 1;
   if (prim == GX_LINES) {
@@ -2513,7 +2911,7 @@ static bool build_native_layout(GXVtxFmt fmt, std::vector<NativeAttrDesc>& descs
     na.attrType = GX_DIRECT;
     na.offset = outOffset;
     na.cnt = isMtxIdx ? 1 : (isColor ? 1 : (attr == GX_VA_POS || attr == GX_VA_NRM ? 3 : 2));
-    na.compType = static_cast<u8>(attrFmt.type);
+    na.compType = isMtxIdx ? static_cast<u8>(GX_U8) : (isColor ? static_cast<u8>(GX_RGBA8) : static_cast<u8>(GX_F32));
     outOffset += canonical_attr_size(attr);
     descs.push_back(d);
     if (attr == GX_VA_POS) {
@@ -2530,10 +2928,29 @@ static bool build_native_layout(GXVtxFmt fmt, std::vector<NativeAttrDesc>& descs
   return true;
 }
 
+struct AttrLayoutEntry {
+  std::array<AttrConfig, MaxVtxAttr> attrs{};
+  u8 stride = 0;
+};
+static std::vector<AttrLayoutEntry> s_attrLayoutPool;
+
+static u16 intern_attr_layout(const std::array<AttrConfig, MaxVtxAttr>& attrs, u8 stride) {
+  for (size_t i = 0; i < s_attrLayoutPool.size(); ++i) {
+    const auto& e = s_attrLayoutPool[i];
+    if (e.stride == stride && std::memcmp(&e.attrs, &attrs, sizeof(attrs)) == 0) {
+      return static_cast<u16>(i);
+    }
+  }
+  const u16 id = static_cast<u16>(s_attrLayoutPool.size());
+  s_attrLayoutPool.push_back(AttrLayoutEntry{attrs, stride});
+  return id;
+}
+
 struct CachedNativeLayout {
   u32 vatGen = UINT32_MAX;
   bool success = false;
   u8 nativeStride = 0;
+  u16 attrLayoutId = UINT16_MAX;
   std::array<AttrConfig, MaxVtxAttr> nativeAttrs{};
   std::vector<NativeAttrDesc> descs;
   u32 metaVatGen = UINT32_MAX;
@@ -2544,53 +2961,89 @@ struct CachedNativeLayout {
 static std::array<CachedNativeLayout, 8> s_cachedNativeLayouts{};
 
 static bool get_native_layout(GXVtxFmt fmt, const std::vector<NativeAttrDesc>*& outDescs, u8& nativeStride,
-                              std::array<AttrConfig, MaxVtxAttr>& nativeAttrs) {
+                              const std::array<AttrConfig, MaxVtxAttr>*& outNativeAttrs, u16& outAttrLayoutId) {
   auto& c = s_cachedNativeLayouts[static_cast<size_t>(fmt)];
   if (c.vatGen != s_vatGen) {
     c.descs.clear();
     c.success = build_native_layout(fmt, c.descs, c.nativeStride, c.nativeAttrs);
+    if (c.success) {
+      c.attrLayoutId = intern_attr_layout(c.nativeAttrs, c.nativeStride);
+    }
     c.vatGen = s_vatGen;
   }
   if (!c.success) return false;
   outDescs = &c.descs;
   nativeStride = c.nativeStride;
-  nativeAttrs = c.nativeAttrs;
+  outNativeAttrs = &c.nativeAttrs;
+  outAttrLayoutId = c.attrLayoutId;
   return true;
 }
 
-// Expand one GX vertex (FIFO record at `rec`) into hardware attributes.
-static void expand_native_vertex(const std::vector<NativeAttrDesc>& descs, const u8* rec, ByteBuffer& out) {
-  for (const auto& d : descs) {
-    const u8* p;
-    if (d.attrType == GX_DIRECT) {
-      p = rec + d.srcOffset;
-    } else {
-      u32 index = d.attrType == GX_INDEX8 ? u32(*(rec + d.srcOffset)) : u32(read_u16(rec + d.srcOffset, true));
+// Expand GX vertices (FIFO records) into flat hardware attributes without per-vertex division or append checks.
+struct PreparedNativeAttr {
+  NativeAttrDesc desc{};
+  const u8* arrayData = nullptr;
+  u32 maxIndex = UINT32_MAX;
+};
+
+static size_t prepare_native_attrs(const std::vector<NativeAttrDesc>& descs, PreparedNativeAttr* outAttrs) noexcept {
+  const size_t n = descs.size();
+  for (size_t i = 0; i < n; ++i) {
+    const auto& d = descs[i];
+    outAttrs[i].desc = d;
+    if (d.attrType != GX_DIRECT) {
       const auto& array = g_gxState.arrays[d.attr];
-      if (array.size != 0 && d.arrayStride != 0) {
-        const u32 maxIndex = static_cast<u32>(array.size) / d.arrayStride;
-        if (index >= maxIndex) {
+      outAttrs[i].arrayData = static_cast<const u8*>(array.data);
+      outAttrs[i].maxIndex =
+          (array.size != 0 && d.arrayStride != 0) ? (static_cast<u32>(array.size) / d.arrayStride) : UINT32_MAX;
+    }
+  }
+  return n;
+}
+
+static void expand_native_vertices_into(const PreparedNativeAttr* attrs, size_t attrCount, const u8* rec, u32 recStride,
+                                        u32 vtxCount, u8* dst) noexcept {
+  for (u32 v = 0; v < vtxCount; ++v, rec += recStride) {
+    for (size_t i = 0; i < attrCount; ++i) {
+      const auto& a = attrs[i];
+      const auto& d = a.desc;
+      const u8* p;
+      if (d.attrType == GX_DIRECT) {
+        p = rec + d.srcOffset;
+      } else {
+        u32 index = d.attrType == GX_INDEX8 ? u32(*(rec + d.srcOffset)) : u32(read_u16(rec + d.srcOffset, true));
+        if (index >= a.maxIndex) UNLIKELY {
           index = 0; // guard against malformed indices; valid content never hits this
         }
+        p = a.arrayData + static_cast<size_t>(index) * d.arrayStride;
       }
-      p = static_cast<const u8*>(array.data) + static_cast<size_t>(index) * d.arrayStride;
-    }
-    const bool be = !d.le;
-    const auto attr = d.attr;
-    const auto compType = static_cast<GXCompType>(d.compType);
-    if (attr == GX_VA_PNMTXIDX) {
-      out.append<u32>(u32(*p) / 3u); // /3: GX counts matrix rows; shader indexes postex_mtx[in_pnmtxidx] directly
-    } else if (attr >= GX_VA_TEX0MTXIDX && attr <= GX_VA_TEX7MTXIDX) {
-      out.append<u32>(u32(*p)); // raw; shader divides by 3
-    } else if (attr == GX_VA_POS || attr == GX_VA_NRM) {
-      for (int c = 0; c < 3; ++c) {
-        out.append<f32>(c < d.cnt ? read_component_as_float(p + c * d.compSize, compType, d.frac, be) : 0.0f);
-      }
-    } else if (attr == GX_VA_CLR0 || attr == GX_VA_CLR1) {
-      out.append<u32>(read_color_as_rgba8(p, compType, be));
-    } else { // TEXn
-      for (int c = 0; c < 2; ++c) {
-        out.append<f32>(c < d.cnt ? read_component_as_float(p + c * d.compSize, compType, d.frac, be) : 0.0f);
+      const bool be = !d.le;
+      const auto attr = d.attr;
+      const auto compType = static_cast<GXCompType>(d.compType);
+      if (attr == GX_VA_PNMTXIDX) {
+        const u32 val = u32(*p) / 3u; // /3: GX counts matrix rows; shader indexes postex_mtx[in_pnmtxidx] directly
+        std::memcpy(dst, &val, sizeof(val));
+        dst += sizeof(val);
+      } else if (attr >= GX_VA_TEX0MTXIDX && attr <= GX_VA_TEX7MTXIDX) {
+        const u32 val = u32(*p); // raw; shader divides by 3
+        std::memcpy(dst, &val, sizeof(val));
+        dst += sizeof(val);
+      } else if (attr == GX_VA_POS || attr == GX_VA_NRM) {
+        for (int c = 0; c < 3; ++c) {
+          const f32 val = c < d.cnt ? read_component_as_float(p + c * d.compSize, compType, d.frac, be) : 0.0f;
+          std::memcpy(dst, &val, sizeof(val));
+          dst += sizeof(val);
+        }
+      } else if (attr == GX_VA_CLR0 || attr == GX_VA_CLR1) {
+        const u32 val = read_color_as_rgba8(p, compType, be);
+        std::memcpy(dst, &val, sizeof(val));
+        dst += sizeof(val);
+      } else { // TEXn
+        for (int c = 0; c < 2; ++c) {
+          const f32 val = c < d.cnt ? read_component_as_float(p + c * d.compSize, compType, d.frac, be) : 0.0f;
+          std::memcpy(dst, &val, sizeof(val));
+          dst += sizeof(val);
+        }
       }
     }
   }
@@ -2622,11 +3075,10 @@ static constexpr bool kNativeGeomCacheEnabled = true;
 // is the device CPU bottleneck.
 static constexpr size_t kNativeGeomCacheMinBytes = 64;
 
-// Keep triangle strips as strips on the GPU (TriangleStrip topology + primitive restart)
-// so a run of adjacent strip draws collapses to one DrawIndexed, instead of unrolling
-// each into an independent triangle list. This is the top CPU-side draw-submission lever:
-// far fewer draw commands and index bytes in strip-heavy world scenes.
-static constexpr bool kStripTopology = true;
+// Unroll triangle strips into TriangleList indices (cached in native geom cache for static
+// geometry) so GLES mobile drivers (Mali-G31) never hit GL_PRIMITIVE_RESTART_FIXED_INDEX
+// CPU index-scanning slow paths during glDrawElements.
+static constexpr bool kStripTopology = false;
 
 // Emit a periodic one-line cache/batching summary to confirm the geometry cache is
 // actually hitting on-device (and how effective run-batching is). Perf-tuning scaffolding;
@@ -2662,13 +3114,22 @@ struct NativeGeomEntry {
   gfx::Range vertRange;
   gfx::Range idxRange;
   u32 indexCount = 0;
+  std::vector<u8> cpuVerts;
+  std::vector<u16> cpuIndices;
 };
+static size_t s_nativeGeomCpuMirrorBytes = 0;
+static constexpr size_t kMaxNativeGeomCpuMirrorEntryBytes = 64 * 1024;
+static constexpr size_t kMaxNativeGeomCpuMirrorTotalBytes = 16 * 1024 * 1024;
 static absl::flat_hash_map<NativeGeomKey, NativeGeomEntry, NativeGeomKeyHash> s_nativeGeomCache;
 // Keys seen but not yet promoted, mapped to the frame they were last seen in. Content is
 // promoted to the persistent cache only once it recurs across frames, which keeps
 // single-shot and per-frame-animated geometry from ever entering the cache.
 static absl::flat_hash_map<NativeGeomKey, u32, NativeGeomKeyHash> s_nativeGeomSeen;
 static u32 s_nativeGeomCacheGen = 0;
+static u32 s_nativeGeomPtrEpoch = 1;
+static u64 s_pnmtxMergedBatches = 0;
+static u64 s_pnmtxMergedDrawsIn = 0;
+static u64 s_pnmtxMergedCacheHits = 0;
 
 // Emit a cache/batching summary every kNativeGeomStatsLogInterval frames. Called once
 // per native draw attempt; the frame-delta guard keeps it to one line per interval.
@@ -2689,12 +3150,12 @@ static void native_geom_cache_maybe_log_stats() {
   const u64 draws = s_geomCacheHits + s_geomCacheMisses;
   Log.info(
       "[geom-cache] {}f: {} draws, {}/{} hit ({:.1f}%), {} promote, {} ring, {} full; "
-      "src {} run/{} indexed/{} sized, batched {}<-{} segs ({:.2f}/run); {} entries",
+      "src {} run/{} indexed/{} sized, batched {}<-{} segs ({:.2f}/run), pnmtx {}<-{} ({} hit); {} entries",
       frames, draws, s_geomCacheHits, draws, draws != 0 ? 100.0 * static_cast<double>(s_geomCacheHits) / draws : 0.0,
       s_geomCachePromotes, s_geomCacheRingPushes, s_geomCacheFull, s_geomRunsBatched, s_geomDrawsIndexed,
       s_geomDrawsSingle, s_geomRunsBatched, s_geomSegmentsBatched,
       s_geomRunsBatched != 0 ? static_cast<double>(s_geomSegmentsBatched) / s_geomRunsBatched : 0.0,
-      s_nativeGeomCache.size());
+      s_pnmtxMergedBatches, s_pnmtxMergedDrawsIn, s_pnmtxMergedCacheHits, s_nativeGeomCache.size());
   const u64 totalUni = s_uniformCacheHits + s_uniformCacheMisses;
   Log.info(
       "[uniform-cache] {} draws, {}/{} hit ({:.1f}%)",
@@ -2722,17 +3183,249 @@ static void native_geom_cache_maybe_log_stats() {
   s_geomSegmentsBatched = 0;
   s_geomDrawsIndexed = 0;
   s_geomDrawsSingle = 0;
+  s_pnmtxMergedBatches = 0;
+  s_pnmtxMergedDrawsIn = 0;
+  s_pnmtxMergedCacheHits = 0;
+}
+
+static constexpr u32 kStaticDrawExtraBit = 0x80000000u;
+static constexpr u8 kStaticDrawIndexed = 1u << 0;
+static constexpr u8 kStaticDrawStrip = 1u << 1;
+
+struct StaticDlDraw {
+  NativeGeomKey key{};
+  const NativeGeomEntry* cachedEntry = nullptr;
+  u32 cachedPtrEpoch = 0;
+  u16 vtxCount = 0;
+  u16 attrLayoutId = 0;
+  u8 prim = GX_TRIANGLES;
+  u8 fmt = GX_VTXFMT0;
+  u8 nativeStride = 0;
+  u8 flags = 0;
+
+  bool indexed() const noexcept { return (flags & kStaticDrawIndexed) != 0; }
+  bool stripTopology() const noexcept { return (flags & kStaticDrawStrip) != 0; }
+  GXPrimitive gxPrim() const noexcept { return static_cast<GXPrimitive>(prim); }
+  GXVtxFmt gxFmt() const noexcept { return static_cast<GXVtxFmt>(fmt); }
+};
+
+struct DlVtxState {
+  u64 vtxDescBits = 0;
+  u32 discInvalGen = 0;
+  u32 usedFmtMask = 0;
+  u16 usedArrayMask = 0;
+  std::array<u32, MaxVtxFmt> vtxFmtGens{};
+  std::array<u32, 12> arrayGens{};
+  std::array<VtxFmt, MaxVtxFmt> vtxFmts{};
+  std::array<AttrArray, 12> arrays{};
+};
+static std::vector<DlVtxState> s_dlVtxStates;
+
+static u16 intern_dl_vtx_state(u64 vtxDescBits, u32 discInvalGen, u32 usedFmtMask, u16 usedArrayMask) {
+  for (size_t i = 0; i < s_dlVtxStates.size(); ++i) {
+    DlVtxState& st = s_dlVtxStates[i];
+    if (st.vtxDescBits != vtxDescBits || st.discInvalGen != discInvalGen ||
+        st.usedFmtMask != usedFmtMask || st.usedArrayMask != usedArrayMask) {
+      continue;
+    }
+    bool match = true;
+    u32 fm = usedFmtMask;
+    while (fm != 0) {
+      const u32 f = static_cast<u32>(std::countr_zero(fm));
+      fm &= fm - 1u;
+      if (std::memcmp(&st.vtxFmts[f], &g_gxState.vtxFmts[f], sizeof(VtxFmt)) != 0) {
+        match = false;
+        break;
+      }
+    }
+    if (!match) continue;
+    u32 am = usedArrayMask;
+    while (am != 0) {
+      const u32 a = static_cast<u32>(std::countr_zero(am));
+      am &= am - 1u;
+      if (st.arrays[a] != g_gxState.arrays[GX_VA_POS + a]) {
+        match = false;
+        break;
+      }
+    }
+    if (match) {
+      u32 fmUpd = usedFmtMask;
+      while (fmUpd != 0) {
+        const u32 f = static_cast<u32>(std::countr_zero(fmUpd));
+        fmUpd &= fmUpd - 1u;
+        st.vtxFmtGens[f] = s_vtxFmtGen[f];
+      }
+      u32 amUpd = usedArrayMask;
+      while (amUpd != 0) {
+        const u32 a = static_cast<u32>(std::countr_zero(amUpd));
+        amUpd &= amUpd - 1u;
+        st.arrayGens[a] = s_arrayStateGen[a];
+      }
+      return static_cast<u16>(i);
+    }
+  }
+  if (s_dlVtxStates.size() >= UINT16_MAX) {
+    return UINT16_MAX;
+  }
+  const u16 newId = static_cast<u16>(s_dlVtxStates.size());
+  DlVtxState& st = s_dlVtxStates.emplace_back();
+  st.vtxDescBits = vtxDescBits;
+  st.discInvalGen = discInvalGen;
+  st.usedFmtMask = usedFmtMask;
+  st.usedArrayMask = usedArrayMask;
+  for (u32 f = 0; f < MaxVtxFmt; ++f) {
+    if ((usedFmtMask & (1u << f)) != 0) {
+      st.vtxFmts[f] = g_gxState.vtxFmts[f];
+      st.vtxFmtGens[f] = s_vtxFmtGen[f];
+    }
+  }
+  for (u32 a = 0; a < 12; ++a) {
+    if ((usedArrayMask & static_cast<u16>(1u << a)) != 0) {
+      st.arrays[a] = g_gxState.arrays[GX_VA_POS + a];
+      st.arrayGens[a] = s_arrayStateGen[a];
+    }
+  }
+  return newId;
+}
+
+static inline bool verify_dl_vtx_state(u16 vtxStateId) noexcept {
+  if (vtxStateId >= s_dlVtxStates.size()) UNLIKELY {
+    return false;
+  }
+  if (s_curVtxStateVerifiedGen == s_vtxStateDirtyGen && s_curVtxStateVerifiedId == vtxStateId) LIKELY {
+    return true;
+  }
+  DlVtxState& st = s_dlVtxStates[vtxStateId];
+  if (st.discInvalGen != s_gxDiscArrayInvalidateGen || st.vtxDescBits != current_vtx_desc_bits()) {
+    return false;
+  }
+  u32 fm = st.usedFmtMask;
+  while (fm != 0) {
+    const u32 f = static_cast<u32>(std::countr_zero(fm));
+    fm &= fm - 1u;
+    if (st.vtxFmtGens[f] != s_vtxFmtGen[f]) {
+      if (std::memcmp(&st.vtxFmts[f], &g_gxState.vtxFmts[f], sizeof(VtxFmt)) != 0) {
+        return false;
+      }
+      st.vtxFmtGens[f] = s_vtxFmtGen[f];
+    }
+  }
+  u32 am = st.usedArrayMask;
+  while (am != 0) {
+    const u32 a = static_cast<u32>(std::countr_zero(am));
+    am &= am - 1u;
+    if (st.arrayGens[a] != s_arrayStateGen[a]) {
+      if (st.arrays[a] != g_gxState.arrays[GX_VA_POS + a]) {
+        return false;
+      }
+      st.arrayGens[a] = s_arrayStateGen[a];
+    }
+  }
+  s_curVtxStateVerifiedGen = s_vtxStateDirtyGen;
+  s_curVtxStateVerifiedId = vtxStateId;
+  return true;
+}
+
+static constexpr u8 kStaticEntryReady = 1u << 0;
+static constexpr u8 kStaticEntryMirror = 1u << 1;
+static constexpr u8 kStaticEntryBatch = 1u << 2;
+static constexpr u8 kStaticEntryCoalesced = 1u << 3;
+
+struct StaticDlEntry {
+  const void* dlData = nullptr;
+  const void* lastDlData = nullptr;
+  uintptr_t minAddr = 0;
+  uintptr_t maxEnd = 0;
+  u64 head64 = 0;
+  u64 lastHead64 = 0;
+  u32 size = 0;
+  u32 lastDlSize = 0;
+  u32 firstDlSize = 0;
+  u32 dlGen = 0;
+  u32 cachedAllPtrEpoch = 0;
+  u32 extraStart = 0;
+  u16 vtxStateId = UINT16_MAX;
+  u8 drawCount = 0;
+  u8 flags = 0;
+  StaticDlDraw draw0{};
+
+  bool ready() const noexcept { return (flags & kStaticEntryReady) != 0; }
+  bool allHaveMirror() const noexcept { return (flags & kStaticEntryMirror) != 0; }
+  bool isBatch() const noexcept { return (flags & kStaticEntryBatch) != 0; }
+  bool coalesced() const noexcept { return (flags & kStaticEntryCoalesced) != 0; }
+};
+
+static std::vector<StaticDlEntry> s_staticDlPool;
+static std::vector<StaticDlDraw> s_staticDlExtraDraws;
+static absl::flat_hash_map<const void*, u32> s_staticDlIndex;
+struct StaticDlFastSlot {
+  const void* key = nullptr;
+  u32 idxPlus1 = 0;
+};
+struct StaticDlFastSet {
+  StaticDlFastSlot ways[2]{};
+};
+static constexpr size_t kStaticDlFastSets = 4096;
+static std::array<StaticDlFastSet, kStaticDlFastSets> s_staticDlFast{};
+static std::vector<StaticDlDraw> s_staticDlCapturedDraws;
+static u32 s_staticDlCapturedFmtMask = 0;
+
+static inline const StaticDlDraw& get_static_dl_draw(u32 refIdx) noexcept {
+  if ((refIdx & kStaticDrawExtraBit) == 0) {
+    return s_staticDlPool[refIdx].draw0;
+  }
+  return s_staticDlExtraDraws[refIdx & ~kStaticDrawExtraBit];
+}
+
+static inline size_t static_dl_fast_set(const void* dlData) noexcept {
+  const uintptr_t p = reinterpret_cast<uintptr_t>(dlData);
+  const u64 h = static_cast<u64>(p >> 4u) * 11400714819323198485ull;
+  return static_cast<size_t>(h >> 52u) & (kStaticDlFastSets - 1u);
+}
+
+static inline void invalidate_static_dl_fast() noexcept {
+  s_staticDlFast.fill({});
+}
+
+static inline void clear_static_dl_cache() noexcept {
+  s_staticDlIndex.clear();
+  s_staticDlPool.clear();
+  s_staticDlExtraDraws.clear();
+  s_dlVtxStates.clear();
+  s_curVtxStateVerifiedId = UINT16_MAX;
+  invalidate_static_dl_fast();
+}
+
+static inline u32 find_static_dl_pool_idx(const void* dlData) noexcept {
+  auto& set = s_staticDlFast[static_dl_fast_set(dlData)];
+  if (set.ways[0].key == dlData) {
+    return set.ways[0].idxPlus1 - 1u;
+  }
+  if (set.ways[1].key == dlData) {
+    return set.ways[1].idxPlus1 - 1u;
+  }
+  const auto it = s_staticDlIndex.find(dlData);
+  if (it == s_staticDlIndex.end()) {
+    return UINT32_MAX;
+  }
+  const u32 poolIdx = it->second;
+  set.ways[1] = set.ways[0];
+  set.ways[0] = {dlData, poolIdx + 1u};
+  return poolIdx;
 }
 
 // The persistent cache byte regions are recycled on reset (generation bump), which
 // invalidates every cached (key -> range) mapping. Drop both maps when that happens.
-static void native_geom_sync_generation() {
-  native_geom_cache_maybe_log_stats();
+static inline void native_geom_sync_generation() {
   const u32 gen = gfx::native_geom_cache_generation();
-  if (gen != s_nativeGeomCacheGen) {
+  if (gen != s_nativeGeomCacheGen) UNLIKELY {
+    flush_pending_pnmtx_batch();
     s_nativeGeomCacheGen = gen;
     s_nativeGeomCache.clear();
+    ++s_nativeGeomPtrEpoch;
     s_nativeGeomSeen.clear();
+    clear_static_dl_cache();
+    s_nativeGeomCpuMirrorBytes = 0;
   }
 }
 
@@ -2746,6 +3439,7 @@ struct ArrayHashMemo {
   u32 size = 0;
   u64 hash = 0;
   bool le = true;
+  bool immutable = false;
 };
 static absl::flat_hash_map<const void*, ArrayHashMemo> s_arrayHashMemo;
 
@@ -2754,15 +3448,18 @@ static u64 native_array_content_hash(const AttrArray& array) {
     s_arrayHashMemo.clear();
   }
   const u32 frame = gfx::current_frame();
-  const u32 targetGen = array.le ? s_gxArrayInvalidateGen : s_gxDiscArrayInvalidateGen;
+  const bool isMutableLe = array.le && !array.immutable;
+  const u32 targetGen = isMutableLe ? s_gxArrayInvalidateGen : s_gxDiscArrayInvalidateGen;
   auto [it, inserted] = s_arrayHashMemo.try_emplace(array.data);
   auto& memo = it->second;
-  const bool frameStale = array.le && (memo.frame != frame);
-  if (inserted || frameStale || memo.size != array.size || memo.le != array.le || memo.invalGen != targetGen) {
+  const bool frameStale = isMutableLe && (memo.frame != frame);
+  if (inserted || frameStale || memo.size != array.size || memo.le != array.le ||
+      memo.immutable != array.immutable || memo.invalGen != targetGen) {
     memo.frame = frame;
     memo.invalGen = targetGen;
     memo.size = array.size;
     memo.le = array.le;
+    memo.immutable = array.immutable;
     if (is_timing_enabled()) UNLIKELY {
       ++s_drainTiming.arr_hash_calls;
       s_drainTiming.arr_hash_bytes += array.size;
@@ -2837,38 +3534,63 @@ static void native_geom_hash_layout(Hasher& h, const std::vector<NativeAttrDesc>
   }
 }
 
-// Resolve the GPU ranges for a freshly expanded batch. On the first cross-frame recurrence
-// of identical content the batch is promoted into the persistent cache; otherwise it goes
-// to the per-frame ring. `cached` reports which buffers the returned ranges address.
-// `idxData`/`idxBytes` may be null/0 for non-indexed (triangle-list) draws.
-static void native_geom_resolve_ranges(const NativeGeomKey& key, const ByteBuffer& vtxBytes, u8 vtxStride,
-                                       const u8* idxData, size_t idxBytes, u32 numIndices, gfx::Range& vertRange,
-                                       gfx::Range& idxRange, bool& cached) {
+static const NativeGeomEntry* push_and_cache_native_geom(const NativeGeomKey& key, const u8* vtxPtr, size_t vtxBytes,
+                                                          u8 vtxStride, const u8* idxData, size_t idxBytes,
+                                                          u32 numIndices, bool mirrorCpu, size_t maxMirrorEntryBytes,
+                                                          gfx::Range& outVertRange, gfx::Range& outIdxRange) {
   const size_t vertAlign = vtxStride > 4 ? static_cast<size_t>(vtxStride) : 4u;
-  cached = false;
-  if (kNativeGeomCacheEnabled && vtxBytes.size() >= kNativeGeomCacheMinBytes) {
+  if (!gfx::can_push_native_cached(vtxBytes, idxBytes, vertAlign)) {
+    return nullptr;
+  }
+  auto [cv, vok] = gfx::push_native_cached_verts(vtxPtr, vtxBytes, vertAlign);
+  gfx::Range ci{};
+  bool iok = true;
+  if (idxData != nullptr && idxBytes > 0) {
+    const auto pushed = gfx::push_native_cached_indices(idxData, idxBytes);
+    ci = pushed.first;
+    iok = pushed.second;
+  }
+  if (!vok || !iok) {
+    return nullptr;
+  }
+  outVertRange = cv;
+  outIdxRange = ci;
+  NativeGeomEntry entry{.vertRange = cv, .idxRange = ci, .indexCount = numIndices};
+  if (mirrorCpu) {
+    const size_t entryBytes = vtxBytes + idxBytes;
+    if (entryBytes <= maxMirrorEntryBytes &&
+        s_nativeGeomCpuMirrorBytes + entryBytes <= kMaxNativeGeomCpuMirrorTotalBytes) {
+      entry.cpuVerts.assign(vtxPtr, vtxPtr + vtxBytes);
+      if (idxData != nullptr && idxBytes > 0) {
+        const size_t idxCount = idxBytes / sizeof(u16);
+        entry.cpuIndices.resize(idxCount);
+        std::memcpy(entry.cpuIndices.data(), idxData, idxBytes);
+      }
+      s_nativeGeomCpuMirrorBytes += entryBytes;
+    }
+  }
+  auto [insIt, ok] = s_nativeGeomCache.emplace(key, std::move(entry));
+  ++s_nativeGeomPtrEpoch;
+  return &insIt->second;
+}
+
+static bool try_promote_native_geom(const NativeGeomKey& key, const u8* vtxPtr, size_t vtxBytes, u8 vtxStride,
+                                    const u8* idxData, size_t idxBytes, u32 numIndices, gfx::Range& vertRange,
+                                    gfx::Range& idxRange, bool mirrorCpu,
+                                    const NativeGeomEntry** outCachedEntry = nullptr) {
+  if (kNativeGeomCacheEnabled && (vtxBytes >= kNativeGeomCacheMinBytes || (s_staticDlCaptureActive && vtxBytes > 0))) {
     const u32 frame = gfx::current_frame();
     auto [seenIt, inserted] = s_nativeGeomSeen.emplace(key, frame);
     if (!inserted && seenIt->second != frame) {
-      if (gfx::can_push_native_cached(vtxBytes.size(), idxBytes, vertAlign)) {
-        // Content recurred across frames — promote into the persistent cache.
-        auto [cv, vok] = gfx::push_native_cached_verts(vtxBytes.data(), vtxBytes.size(), vertAlign);
-        gfx::Range ci{};
-        bool iok = true;
-        if (idxData != nullptr && idxBytes > 0) {
-          const auto pushed = gfx::push_native_cached_indices(idxData, idxBytes);
-          ci = pushed.first;
-          iok = pushed.second;
+      if (const NativeGeomEntry* cached =
+              push_and_cache_native_geom(key, vtxPtr, vtxBytes, vtxStride, idxData, idxBytes, numIndices, mirrorCpu,
+                                         kMaxNativeGeomCpuMirrorEntryBytes, vertRange, idxRange)) {
+        if (outCachedEntry != nullptr) {
+          *outCachedEntry = cached;
         }
-        if (vok && iok) {
-          vertRange = cv;
-          idxRange = ci;
-          cached = true;
-          s_nativeGeomCache.emplace(key, NativeGeomEntry{.vertRange = cv, .idxRange = ci, .indexCount = numIndices});
-          s_nativeGeomSeen.erase(seenIt);
-          ++s_geomCachePromotes;
-          return;
-        }
+        s_nativeGeomSeen.erase(seenIt);
+        ++s_geomCachePromotes;
+        return true;
       }
       seenIt->second = frame;
       ++s_geomCacheFull;
@@ -2879,47 +3601,152 @@ static void native_geom_resolve_ranges(const NativeGeomKey& key, const ByteBuffe
       s_nativeGeomSeen.clear();
     }
   }
+  return false;
+}
+
+// Resolve the GPU ranges for a freshly expanded batch. On the first cross-frame recurrence
+// of identical content the batch is promoted into the persistent cache; otherwise it goes
+// to the per-frame ring. `cached` reports which buffers the returned ranges address.
+// `idxData`/`idxBytes` may be null/0 for non-indexed (triangle-list) draws.
+static void native_geom_resolve_ranges(const NativeGeomKey& key, const u8* vtxPtr, size_t vtxBytes, u8 vtxStride,
+                                       const u8* idxData, size_t idxBytes, u32 numIndices, gfx::Range& vertRange,
+                                       gfx::Range& idxRange, bool& cached, bool mirrorCpu = true) {
+  if (try_promote_native_geom(key, vtxPtr, vtxBytes, vtxStride, idxData, idxBytes, numIndices, vertRange, idxRange,
+                              mirrorCpu)) {
+    cached = true;
+    return;
+  }
+  cached = false;
+  const size_t vertAlign = vtxStride > 4 ? static_cast<size_t>(vtxStride) : 4u;
   // Per-frame ring fallback.
   ++s_geomCacheRingPushes;
-  vertRange = gfx::push_verts(vtxBytes.data(), vtxBytes.size(), vertAlign);
+  vertRange = gfx::push_verts(vtxPtr, vtxBytes, vertAlign);
   if (idxData != nullptr && idxBytes > 0) {
     idxRange = gfx::push_indices(idxData, idxBytes, 4);
   }
 }
 
-static void push_native_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
-                                 const std::array<AttrConfig, MaxVtxAttr>& nativeAttrs, u8 nativeStride,
-                                 gfx::Range vertRange, gfx::Range idxRange, u32 numIndices, bool cachedGeometry = false,
-                                 bool stripTopology = false) {
-  static uint32_t s_lastPipelineDirty = UINT32_MAX;
-  static GXPrimitive s_lastPrim = static_cast<GXPrimitive>(UINT32_MAX);
-  static GXVtxFmt s_lastFmt = static_cast<GXVtxFmt>(UINT32_MAX);
-  static bool s_lastStripTopology = false;
-  static uint8_t s_lastNativeStride = 0;
-  static u32 s_lastUniformFrame = UINT32_MAX;
+namespace {
+static constexpr bool kEnablePnMtxBatch = true;
 
-  struct NativePipeMemoEntry {
-    uint64_t cfgHash = 0;
-    uint32_t gen = 0;
-    PipelineConfig config{};
-    gfx::PipelineRef pipeline{};
-    uint64_t shaderHash = 0;
-    bool valid = false;
+struct NativePipeMemoEntry {
+  uint64_t cfgHash = 0;
+  uint32_t gen = 0;
+  PipelineConfig config{};
+  gfx::PipelineRef pipeline{};
+  std::array<gfx::PipelineRef, 4> mergedPipelines{};
+  std::array<gfx::PipelineRef, 4> mergedListPipelines{};
+  uint64_t shaderHash = 0;
+  bool valid = false;
+  u8 hasMergedMask = 0;
+  u8 hasMergedListMask = 0;
+};
+static constexpr size_t kNativePipeMemoSize = 512;
+static std::array<NativePipeMemoEntry, kNativePipeMemoSize> s_nativePipeMemo{};
+
+static gfx::PipelineRef resolve_pipeline_cached(const PipelineConfig& cfg, bool& outReady,
+                                                uint64_t& outShaderHash, size_t* outMemoIdx = nullptr,
+                                                uint64_t* outCfgHash = nullptr) noexcept {
+  const uint32_t pipeGen = gfx::pipeline_cache_gen();
+  const uint64_t cfgHash = xxh3_hash(cfg);
+  if (outCfgHash != nullptr) *outCfgHash = cfgHash;
+  const size_t slot = (cfgHash ^ (cfgHash >> 16)) & (kNativePipeMemoSize - 1);
+  auto& pipeMemo = s_nativePipeMemo[slot];
+  if (pipeMemo.valid && pipeMemo.gen == pipeGen && pipeMemo.cfgHash == cfgHash &&
+      std::memcmp(&pipeMemo.config, &cfg, sizeof(PipelineConfig)) == 0) {
+    outReady = true;
+    outShaderHash = pipeMemo.shaderHash;
+    if (outMemoIdx != nullptr) *outMemoIdx = slot;
+    return pipeMemo.pipeline;
+  }
+  const auto tr0 = timing_now();
+  gfx::PipelineRef pipeline = gfx::pipeline_ref_status(cfg, outReady);
+  const auto tr1 = timing_now();
+  s_drainTiming.ms_pipe_ref += std::chrono::duration<double, std::milli>(tr1 - tr0).count();
+  if (outReady) {
+    outShaderHash = XXH3_64bits(&cfg.shaderConfig, sizeof(ShaderConfig));
+    pipeMemo.cfgHash = cfgHash;
+    pipeMemo.gen = pipeGen;
+    pipeMemo.config = cfg;
+    pipeMemo.pipeline = pipeline;
+    pipeMemo.mergedPipelines = {};
+    pipeMemo.mergedListPipelines = {};
+    pipeMemo.shaderHash = outShaderHash;
+    pipeMemo.valid = true;
+    pipeMemo.hasMergedMask = 0;
+    pipeMemo.hasMergedListMask = 0;
+    if (outMemoIdx != nullptr) *outMemoIdx = slot;
+  } else {
+    outShaderHash = 0;
+    if (outMemoIdx != nullptr) *outMemoIdx = SIZE_MAX;
+  }
+  return pipeline;
+}
+
+static bool shader_uses_fixed_pnmtx_texgen(const ShaderInfo& info, const ShaderConfig& cfg) noexcept {
+  for (int i = 0; i < info.sampledTexCoords.size(); ++i) {
+    if (!info.sampledTexCoords.test(i)) {
+      continue;
+    }
+    const auto& tcg = cfg.tcgs[i];
+    if (tcg.type == GX_TG_MTX2x4 || tcg.type == GX_TG_MTX3x4) {
+      if (info.indexAttr.test(GX_VA_TEX0MTXIDX + i)) {
+        return true;
+      }
+      if (tcg.mtx != GX_IDENTITY && tcg.mtx < GX_TEXMTX0) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+static uint32_t s_lastPipelineDirty = UINT32_MAX;
+static GXPrimitive s_lastPrim = static_cast<GXPrimitive>(UINT32_MAX);
+static GXVtxFmt s_lastFmt = static_cast<GXVtxFmt>(UINT32_MAX);
+static bool s_lastStripTopology = false;
+static uint8_t s_lastNativeStride = 0;
+static u32 s_lastUniformFrame = UINT32_MAX;
+static bool s_forceTexResolveAfterBatch = false;
+static PipelineConfig s_currentConfig{};
+
+static void resolve_single_native_draw_state(GXPrimitive prim, GXVtxFmt fmt,
+                                             const std::array<AttrConfig, MaxVtxAttr>& nativeAttrs, u8 nativeStride,
+                                             bool stripTopology, bool preCfgPopulated, bool preConfigSame,
+                                             bool preBgPopulated) noexcept {
+  const bool forceTexResolve = s_forceTexResolveAfterBatch;
+  s_forceTexResolveAfterBatch = false;
+  const u32 curFrame = gfx::current_frame();
+  const auto resolveBindGroupsTimed = [&]() noexcept -> GXBindGroups {
+    const auto t_res0 = timing_now();
+    const GXBindGroups resolved = resolve_and_build_bind_groups(s_lastInfo);
+    const auto t_res1 = timing_now();
+    s_drainTiming.ms_tex_resolve += std::chrono::duration<double, std::milli>(t_res1 - t_res0).count();
+    ++s_drainTiming.bg_calls;
+    return resolved;
   };
-  static constexpr size_t kNativePipeMemoSize = 512;
-  static std::array<NativePipeMemoEntry, kNativePipeMemoSize> s_nativePipeMemo{};
 
-  const bool samePipeline = s_hasLastDrawState &&
-                            (s_lastPipelineDirty == g_gxState.pipelineDirty) &&
-                            (s_lastPrim == prim) &&
-                            (s_lastFmt == fmt) &&
-                            (s_lastStripTopology == stripTopology) &&
-                            (s_lastNativeStride == nativeStride);
-
-  static PipelineConfig s_currentConfig{};
+  const bool samePipeline =
+      preConfigSame ||
+      (!preCfgPopulated && s_hasLastDrawState &&
+       (s_lastPipelineDirty == g_gxState.pipelineDirty) &&
+       (s_lastPrim == prim ||
+        (s_lastConfig.shaderConfig.lineMode == 0 &&
+         (prim == GX_TRIANGLES || prim == GX_TRIANGLESTRIP) &&
+         (s_lastPrim == GX_TRIANGLES || s_lastPrim == GX_TRIANGLESTRIP))) &&
+       (s_lastFmt == fmt) &&
+       (s_lastStripTopology == stripTopology || s_lastConfig.shaderConfig.lineMode == 0) &&
+       (s_lastNativeStride == nativeStride));
   const PipelineConfig* configPtr = nullptr;
   if (samePipeline) {
     configPtr = &s_lastConfig;
+  } else if (preCfgPopulated) {
+    s_lastPipelineDirty = g_gxState.pipelineDirty;
+    s_lastPrim = prim;
+    s_lastFmt = fmt;
+    s_lastStripTopology = stripTopology;
+    s_lastNativeStride = nativeStride;
+    configPtr = &s_currentConfig;
   } else {
     const auto tp0 = timing_now();
     s_currentConfig = {};
@@ -2939,190 +3766,241 @@ static void push_native_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
     configPtr = &s_currentConfig;
   }
 
-  ShaderInfo info;
-  gfx::PipelineRef pipeline;
-  GXBindGroups bindGroups;
-  gfx::Range uniformRange;
-  const u32 curFrame = gfx::current_frame();
-
-  const bool sameConfig = samePipeline || (s_hasLastDrawState && std::memcmp(configPtr, &s_lastConfig, sizeof(PipelineConfig)) == 0);
+  const bool sameConfig =
+      samePipeline ||
+      (!preCfgPopulated && s_hasLastDrawState && std::memcmp(configPtr, &s_lastConfig, sizeof(PipelineConfig)) == 0);
   if (sameConfig) {
-    info = s_lastInfo;
-    pipeline = s_lastPipeline;
-    const bool texChanged = (s_lastTextureDirty != g_gxState.textureDirty);
-    if (!texChanged) {
-      bindGroups = s_lastBindGroups;
-    } else {
-      const auto t_res0 = timing_now();
-      resolve_sampled_textures(info);
-      const auto t_res1 = timing_now();
-      bindGroups = build_bind_groups(info);
-      const auto t_bg1 = timing_now();
-      s_drainTiming.ms_tex_resolve += std::chrono::duration<double, std::milli>(t_res1 - t_res0).count();
-      s_drainTiming.ms_bg_build += std::chrono::duration<double, std::milli>(t_bg1 - t_res1).count();
-      ++s_drainTiming.bg_calls;
-      s_lastBindGroups = bindGroups;
+    const bool texChanged = preBgPopulated || forceTexResolve || (s_lastTextureDirty != g_gxState.textureDirty);
+    if (texChanged) {
+      s_lastBindGroups = preBgPopulated ? s_candidateBg : resolveBindGroupsTimed();
       s_lastTextureDirty = g_gxState.textureDirty;
     }
     const bool needUniformRebuild = texChanged || s_lastUniformFrame != curFrame ||
                                    s_lastUniformDirty != g_gxState.uniformDirty || s_lastUniformRange.size == 0;
     if (!needUniformRebuild) {
-      uniformRange = s_lastUniformRange;
       ++s_uniformCacheHits;
     } else {
       BindGroupRanges ranges{};
       const auto tu0 = timing_now();
-      uniformRange = build_uniform(info, vertRange.offset, ranges);
+      s_lastUniformRange = build_uniform(s_lastInfo, 0, ranges);
       const auto tu1 = timing_now();
       s_drainTiming.ms_uni_build += std::chrono::duration<double, std::milli>(tu1 - tu0).count();
-      s_lastUniformRange = uniformRange;
+      s_lastUniformDirty = g_gxState.uniformDirty;
+      s_lastUniformFrame = curFrame;
+      ++s_uniformCacheMisses;
+    }
+    return;
+  }
+
+  uint64_t cachedShaderHash = 0;
+  bool pipeReady = false;
+  size_t memoIdx = SIZE_MAX;
+  uint64_t cfgHash = 0;
+  s_lastPipeline = resolve_pipeline_cached(*configPtr, pipeReady, cachedShaderHash, &memoIdx, &cfgHash);
+  s_lastPipeMemoIdx = memoIdx;
+  s_lastCfgHash = cfgHash;
+  s_lastConfig = *configPtr;
+  s_hasLastDrawState = true;
+
+  const bool sameShader = std::memcmp(&s_lastConfig.shaderConfig, &s_lastShaderConfig, sizeof(ShaderConfig)) == 0;
+  if (sameShader) {
+    const bool texChanged = forceTexResolve || (s_lastTextureDirty != g_gxState.textureDirty);
+    if (texChanged) {
+      s_lastBindGroups = resolveBindGroupsTimed();
+      s_lastTextureDirty = g_gxState.textureDirty;
+    }
+    const bool needUniformRebuild = texChanged || s_lastUniformFrame != curFrame ||
+                                   s_lastUniformDirty != g_gxState.uniformDirty || s_lastUniformRange.size == 0;
+    if (!needUniformRebuild) {
+      ++s_uniformCacheHits;
+    } else {
+      BindGroupRanges ranges{};
+      const auto tu0 = timing_now();
+      s_lastUniformRange = build_uniform(s_lastInfo, 0, ranges);
+      const auto tu1 = timing_now();
+      s_drainTiming.ms_uni_build += std::chrono::duration<double, std::milli>(tu1 - tu0).count();
       s_lastUniformDirty = g_gxState.uniformDirty;
       s_lastUniformFrame = curFrame;
       ++s_uniformCacheMisses;
     }
   } else {
-    const uint32_t pipeGen = gfx::pipeline_cache_gen();
-    const uint64_t cfgHash = xxh3_hash(*configPtr);
-    auto& pipeMemo = s_nativePipeMemo[(cfgHash ^ (cfgHash >> 16)) & (kNativePipeMemoSize - 1)];
-    const bool pipeMemoHit = pipeMemo.valid && pipeMemo.gen == pipeGen && pipeMemo.cfgHash == cfgHash &&
-                             std::memcmp(&pipeMemo.config, configPtr, sizeof(PipelineConfig)) == 0;
-    uint64_t cachedShaderHash = 0;
-    bool pipeReady = false;
-    if (pipeMemoHit) {
-      pipeline = pipeMemo.pipeline;
-      cachedShaderHash = pipeMemo.shaderHash;
-      pipeReady = true;
-    } else {
-      const auto tr0 = timing_now();
-      pipeline = gfx::pipeline_ref_status(*configPtr, pipeReady);
-      const auto tr1 = timing_now();
-      s_drainTiming.ms_pipe_ref += std::chrono::duration<double, std::milli>(tr1 - tr0).count();
-    }
-    s_lastPipeline = pipeline;
-    s_lastConfig = *configPtr;
-    s_hasLastDrawState = true;
+    const uint64_t shaderHash =
+        cachedShaderHash != 0 ? cachedShaderHash : XXH3_64bits(&s_lastConfig.shaderConfig, sizeof(ShaderConfig));
+    const size_t slot = (shaderHash ^ (shaderHash >> 16)) & (kShaderDrawCacheSize - 1);
+    auto& entry = s_shaderDrawCache[slot];
 
-    const bool sameShader = std::memcmp(&configPtr->shaderConfig, &s_lastShaderConfig, sizeof(ShaderConfig)) == 0;
-    if (sameShader) {
-      info = s_lastInfo;
-      const bool texChanged = (s_lastTextureDirty != g_gxState.textureDirty);
+    if (entry.shaderHash == shaderHash) {
+      s_lastInfo = entry.info;
+      const bool texChanged = forceTexResolve || (entry.textureDirty != g_gxState.textureDirty);
       if (!texChanged) {
-        bindGroups = s_lastBindGroups;
+        s_lastBindGroups = entry.bindGroups;
       } else {
-        const auto t_res0 = timing_now();
-        resolve_sampled_textures(info);
-        const auto t_res1 = timing_now();
-        bindGroups = build_bind_groups(info);
-        const auto t_bg1 = timing_now();
-        s_drainTiming.ms_tex_resolve += std::chrono::duration<double, std::milli>(t_res1 - t_res0).count();
-        s_drainTiming.ms_bg_build += std::chrono::duration<double, std::milli>(t_bg1 - t_res1).count();
-        ++s_drainTiming.bg_calls;
-        s_lastBindGroups = bindGroups;
-        s_lastTextureDirty = g_gxState.textureDirty;
+        s_lastBindGroups = resolveBindGroupsTimed();
+        entry.bindGroups = s_lastBindGroups;
+        entry.textureDirty = g_gxState.textureDirty;
       }
-      const bool needUniformRebuild = texChanged || s_lastUniformFrame != curFrame ||
-                                     s_lastUniformDirty != g_gxState.uniformDirty || s_lastUniformRange.size == 0;
+      const bool needUniformRebuild = texChanged || entry.frame != curFrame ||
+                                     entry.uniformDirty != g_gxState.uniformDirty || entry.uniformRange.size == 0;
       if (!needUniformRebuild) {
-        uniformRange = s_lastUniformRange;
+        s_lastUniformRange = entry.uniformRange;
         ++s_uniformCacheHits;
       } else {
         BindGroupRanges ranges{};
         const auto tu0 = timing_now();
-        uniformRange = build_uniform(info, vertRange.offset, ranges);
+        s_lastUniformRange = build_uniform(s_lastInfo, 0, ranges);
         const auto tu1 = timing_now();
         s_drainTiming.ms_uni_build += std::chrono::duration<double, std::milli>(tu1 - tu0).count();
-        s_lastUniformRange = uniformRange;
-        s_lastUniformDirty = g_gxState.uniformDirty;
-        s_lastUniformFrame = curFrame;
-        ++s_uniformCacheMisses;
-      }
-    } else {
-      const uint64_t shaderHash =
-          cachedShaderHash != 0 ? cachedShaderHash : XXH3_64bits(&configPtr->shaderConfig, sizeof(ShaderConfig));
-      cachedShaderHash = shaderHash;
-      const size_t slot = (shaderHash ^ (shaderHash >> 16)) & (kShaderDrawCacheSize - 1);
-      auto& entry = s_shaderDrawCache[slot];
-
-      if (entry.shaderHash == shaderHash) {
-        info = entry.info;
-        const bool texChanged = (entry.textureDirty != g_gxState.textureDirty);
-        if (!texChanged) {
-          bindGroups = entry.bindGroups;
-        } else {
-          const auto t_res0 = timing_now();
-          resolve_sampled_textures(info);
-          const auto t_res1 = timing_now();
-          bindGroups = build_bind_groups(info);
-          const auto t_bg1 = timing_now();
-          s_drainTiming.ms_tex_resolve += std::chrono::duration<double, std::milli>(t_res1 - t_res0).count();
-          s_drainTiming.ms_bg_build += std::chrono::duration<double, std::milli>(t_bg1 - t_res1).count();
-          ++s_drainTiming.bg_calls;
-          entry.bindGroups = bindGroups;
-          entry.textureDirty = g_gxState.textureDirty;
-        }
-        const bool needUniformRebuild = texChanged || entry.frame != curFrame ||
-                                       entry.uniformDirty != g_gxState.uniformDirty || entry.uniformRange.size == 0;
-        if (!needUniformRebuild) {
-          uniformRange = entry.uniformRange;
-          ++s_uniformCacheHits;
-        } else {
-          BindGroupRanges ranges{};
-          const auto tu0 = timing_now();
-          uniformRange = build_uniform(info, vertRange.offset, ranges);
-          const auto tu1 = timing_now();
-          s_drainTiming.ms_uni_build += std::chrono::duration<double, std::milli>(tu1 - tu0).count();
-          entry.uniformRange = uniformRange;
-          entry.uniformDirty = g_gxState.uniformDirty;
-          entry.textureDirty = g_gxState.textureDirty;
-          entry.frame = curFrame;
-          ++s_uniformCacheMisses;
-        }
-      } else {
-        info = build_shader_info(configPtr->shaderConfig);
-        const auto t_res0 = timing_now();
-        resolve_sampled_textures(info);
-        const auto t_res1 = timing_now();
-        bindGroups = build_bind_groups(info);
-        const auto t_bg1 = timing_now();
-        s_drainTiming.ms_tex_resolve += std::chrono::duration<double, std::milli>(t_res1 - t_res0).count();
-        s_drainTiming.ms_bg_build += std::chrono::duration<double, std::milli>(t_bg1 - t_res1).count();
-        ++s_drainTiming.bg_calls;
-        BindGroupRanges ranges{};
-        const auto tu0 = timing_now();
-        uniformRange = build_uniform(info, vertRange.offset, ranges);
-        const auto tu1 = timing_now();
-        s_drainTiming.ms_uni_build += std::chrono::duration<double, std::milli>(tu1 - tu0).count();
-
-        entry.shaderHash = shaderHash;
-        entry.info = info;
-        entry.bindGroups = bindGroups;
-        entry.uniformRange = uniformRange;
-        entry.textureDirty = g_gxState.textureDirty;
+        entry.uniformRange = s_lastUniformRange;
         entry.uniformDirty = g_gxState.uniformDirty;
+        entry.textureDirty = g_gxState.textureDirty;
         entry.frame = curFrame;
         ++s_uniformCacheMisses;
       }
+    } else {
+      s_lastInfo = build_shader_info(s_lastConfig.shaderConfig);
+      s_lastBindGroups = resolveBindGroupsTimed();
+      BindGroupRanges ranges{};
+      const auto tu0 = timing_now();
+      s_lastUniformRange = build_uniform(s_lastInfo, 0, ranges);
+      const auto tu1 = timing_now();
+      s_drainTiming.ms_uni_build += std::chrono::duration<double, std::milli>(tu1 - tu0).count();
 
-      s_lastShaderConfig = configPtr->shaderConfig;
-      s_lastInfo = info;
-      s_lastBindGroups = bindGroups;
-      s_lastUniformRange = uniformRange;
-      s_lastTextureDirty = g_gxState.textureDirty;
-      s_lastUniformDirty = g_gxState.uniformDirty;
-      s_lastUniformFrame = curFrame;
+      entry.shaderHash = shaderHash;
+      entry.info = s_lastInfo;
+      entry.bindGroups = s_lastBindGroups;
+      entry.uniformRange = s_lastUniformRange;
+      entry.textureDirty = g_gxState.textureDirty;
+      entry.uniformDirty = g_gxState.uniformDirty;
+      entry.frame = curFrame;
+      ++s_uniformCacheMisses;
     }
 
-    if (!pipeMemoHit && pipeReady) {
-      if (cachedShaderHash == 0) {
-        cachedShaderHash = XXH3_64bits(&configPtr->shaderConfig, sizeof(ShaderConfig));
+    s_lastShaderConfig = s_lastConfig.shaderConfig;
+    s_lastTextureDirty = g_gxState.textureDirty;
+    s_lastUniformDirty = g_gxState.uniformDirty;
+    s_lastUniformFrame = curFrame;
+  }
+}
+
+static void emit_native_draw_command(gfx::PipelineRef pipeline, gfx::Range vertRange, gfx::Range idxRange,
+                                     gfx::Range uniformRange, u32 vtxCount, u32 numIndices,
+                                     const GXBindGroups& bindGroups, u32 dstAlpha, bool cachedGeometry,
+                                     uint32_t uniDirty, u32 texMtxGen, u32 lightsGen, u32 bpUniGen,
+                                     u32 othUniGen) noexcept {
+  if (is_timing_enabled()) UNLIKELY {
+    if (!s_splitHasPrev) {
+      s_splitHasPrev = true;
+    } else {
+      ++s_drainTiming.split_pairs;
+      const bool sPipe = (pipeline == s_splitPrevPipe);
+      const bool sTex = (bindGroups.textureBindGroup == s_splitPrevTex);
+      const bool sDa = (dstAlpha == s_splitPrevDstAlpha);
+      const bool cTm = (texMtxGen != s_splitPrevTexMtxGen);
+      const bool cLi = (lightsGen != s_splitPrevLightsGen);
+      const bool cBp = (bpUniGen != s_splitPrevBpUniGen);
+      const bool cOth = (othUniGen != s_splitPrevOthUniGen);
+      const bool sameNonPnUni = sDa && !cTm && !cLi && !cBp && !cOth;
+      if (sPipe) ++s_drainTiming.split_same_pipe;
+      if (sTex) ++s_drainTiming.split_same_tex;
+      if (sPipe && sTex) {
+        ++s_drainTiming.split_same_both;
+        if (sameNonPnUni) {
+          if (uniDirty == s_splitPrevUniformDirty) ++s_drainTiming.split_same_all;
+          else ++s_drainTiming.split_only_pnmtx;
+        }
+      } else if (sPipe && !sTex && sameNonPnUni) {
+        ++s_drainTiming.split_only_tex;
+      } else if (!sPipe && sTex && sameNonPnUni) {
+        ++s_drainTiming.split_only_pipe;
       }
-      pipeMemo.cfgHash = cfgHash;
-      pipeMemo.gen = pipeGen;
-      pipeMemo.config = *configPtr;
-      pipeMemo.pipeline = pipeline;
-      pipeMemo.shaderHash = cachedShaderHash;
-      pipeMemo.valid = true;
+      if (!sPipe) {
+        const auto& a = s_splitPrevConfig;
+        const auto& bcfg = s_lastConfig;
+        const bool dCull = (a.cullMode != bcfg.cullMode);
+        const bool dZ = (a.depthCompare != bcfg.depthCompare || a.depthUpdate != bcfg.depthUpdate || a.depthFunc != bcfg.depthFunc);
+        const bool dBlend = (a.blendMode != bcfg.blendMode || a.blendFacSrc != bcfg.blendFacSrc || a.blendFacDst != bcfg.blendFacDst ||
+                             a.blendOp != bcfg.blendOp || a.alphaUpdate != bcfg.alphaUpdate || a.colorUpdate != bcfg.colorUpdate ||
+                             a.dstAlpha != bcfg.dstAlpha);
+        const bool dTopo = (a.triangleStripTopology != bcfg.triangleStripTopology || a.shaderConfig.lineMode != bcfg.shaderConfig.lineMode);
+        const bool dFog = (a.shaderConfig.fogType != bcfg.shaderConfig.fogType);
+        const bool dAttrs = (a.shaderConfig.vtxStride != bcfg.shaderConfig.vtxStride ||
+                             std::memcmp(&a.shaderConfig.attrs, &bcfg.shaderConfig.attrs, sizeof(a.shaderConfig.attrs)) != 0);
+        const bool dTev = (a.shaderConfig.tevStageCount != bcfg.shaderConfig.tevStageCount ||
+                           a.shaderConfig.numIndStages != bcfg.shaderConfig.numIndStages ||
+                           std::memcmp(&a.shaderConfig.tevSwapTable, &bcfg.shaderConfig.tevSwapTable, sizeof(a.shaderConfig.tevSwapTable)) != 0 ||
+                           std::memcmp(&a.shaderConfig.tevStages, &bcfg.shaderConfig.tevStages, sizeof(a.shaderConfig.tevStages)) != 0 ||
+                           std::memcmp(&a.shaderConfig.indStages, &bcfg.shaderConfig.indStages, sizeof(a.shaderConfig.indStages)) != 0);
+        const bool dChan = (std::memcmp(&a.shaderConfig.colorChannels, &bcfg.shaderConfig.colorChannels, sizeof(a.shaderConfig.colorChannels)) != 0);
+        const bool dTcg = (std::memcmp(&a.shaderConfig.tcgs, &bcfg.shaderConfig.tcgs, sizeof(a.shaderConfig.tcgs)) != 0);
+        const bool dAcmp = (std::memcmp(&a.shaderConfig.alphaCompare, &bcfg.shaderConfig.alphaCompare, sizeof(a.shaderConfig.alphaCompare)) != 0);
+        const bool dPaper = (a.shaderConfig.edgeAA != bcfg.shaderConfig.edgeAA ||
+                             a.shaderConfig.shadowFill != bcfg.shaderConfig.shadowFill ||
+                             a.shaderConfig.sdfMaps != bcfg.shaderConfig.sdfMaps);
+        if (dCull) ++s_drainTiming.pd_cull;
+        if (dZ) ++s_drainTiming.pd_z;
+        if (dBlend) ++s_drainTiming.pd_blend;
+        if (dTopo) ++s_drainTiming.pd_topo;
+        if (dFog) ++s_drainTiming.pd_fog;
+        if (dAttrs) ++s_drainTiming.pd_attrs;
+        if (dTev) ++s_drainTiming.pd_tev;
+        if (dChan) ++s_drainTiming.pd_chan;
+        if (dTcg) ++s_drainTiming.pd_tcg;
+        if (dAcmp) ++s_drainTiming.pd_acmp;
+        if (dPaper) ++s_drainTiming.pd_paper;
+        if (sTex && sameNonPnUni) {
+          if (dCull) ++s_drainTiming.op_cull;
+          if (dZ) ++s_drainTiming.op_z;
+          if (dBlend) ++s_drainTiming.op_blend;
+          if (dTopo) ++s_drainTiming.op_topo;
+          if (dFog) ++s_drainTiming.op_fog;
+          if (dAttrs) ++s_drainTiming.op_attrs;
+          if (dTev) ++s_drainTiming.op_tev;
+          if (dChan) ++s_drainTiming.op_chan;
+          if (dTcg) ++s_drainTiming.op_tcg;
+          if (dAcmp) ++s_drainTiming.op_acmp;
+          if (dPaper) ++s_drainTiming.op_paper;
+        }
+      }
+      if (cTm) ++s_drainTiming.split_chg_texmtx;
+      if (cLi) ++s_drainTiming.split_chg_lights;
+      if (cBp) {
+        ++s_drainTiming.split_chg_bp_uni;
+        if (s_splitBpFogGen != s_splitPrevBpFogGen) ++s_drainTiming.bp_fog;
+        if (s_splitBpTevColGen != s_splitPrevBpTevColGen) ++s_drainTiming.bp_tcol;
+        if (s_splitBpSuGen != s_splitPrevBpSuGen) ++s_drainTiming.bp_su;
+        if (s_splitBpIndGen != s_splitPrevBpIndGen) ++s_drainTiming.bp_ind;
+        if (s_splitBpLineGen != s_splitPrevBpLineGen) ++s_drainTiming.bp_line;
+      }
+      if (cOth) {
+        ++s_drainTiming.split_chg_oth_uni;
+        if (s_splitOthAmbGen != s_splitPrevOthAmbGen) ++s_drainTiming.oth_amb;
+        if (s_splitOthMatGen != s_splitPrevOthMatGen) ++s_drainTiming.oth_mat;
+        if (s_splitOthVpGen != s_splitPrevOthVpGen) ++s_drainTiming.oth_vp;
+        if (s_splitOthProjGen != s_splitPrevOthProjGen) ++s_drainTiming.oth_proj;
+        if (s_splitOthTexDimGen != s_splitPrevOthTexDimGen) ++s_drainTiming.oth_tdim;
+        if (s_splitOthOffGen != s_splitPrevOthOffGen) ++s_drainTiming.oth_off;
+      }
     }
+    s_splitPrevPipe = pipeline;
+    s_splitPrevTex = bindGroups.textureBindGroup;
+    s_splitPrevDstAlpha = dstAlpha;
+    s_splitPrevUniformDirty = uniDirty;
+    s_splitPrevTexMtxGen = texMtxGen;
+    s_splitPrevLightsGen = lightsGen;
+    s_splitPrevBpUniGen = bpUniGen;
+    s_splitPrevOthUniGen = othUniGen;
+    s_splitPrevOthAmbGen = s_splitOthAmbGen;
+    s_splitPrevOthMatGen = s_splitOthMatGen;
+    s_splitPrevOthVpGen = s_splitOthVpGen;
+    s_splitPrevOthProjGen = s_splitOthProjGen;
+    s_splitPrevOthTexDimGen = s_splitOthTexDimGen;
+    s_splitPrevOthOffGen = s_splitOthOffGen;
+    s_splitPrevBpFogGen = s_splitBpFogGen;
+    s_splitPrevBpTevColGen = s_splitBpTevColGen;
+    s_splitPrevBpSuGen = s_splitBpSuGen;
+    s_splitPrevBpIndGen = s_splitBpIndGen;
+    s_splitPrevBpLineGen = s_splitBpLineGen;
+    s_splitPrevConfig = s_lastConfig;
   }
 
   const auto tc0 = timing_now();
@@ -3135,12 +4013,861 @@ static void push_native_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
       .indexCount = numIndices,
       .instanceCount = 1,
       .bindGroups = bindGroups,
-      .dstAlpha = g_gxState.dstAlpha,
+      .dstAlpha = dstAlpha,
       .nativeVertexFetch = true,
       .cachedGeometry = cachedGeometry,
   });
   const auto tc1 = timing_now();
   s_drainTiming.ms_push_cmd += std::chrono::duration<double, std::milli>(tc1 - tc0).count();
+}
+
+static constexpr u8 kItemStaticPool = 1u << 0;
+static constexpr u8 kItemCached = 1u << 1;
+static constexpr u8 kItemIndexed = 1u << 2;
+static constexpr u8 kItemStripTopology = 1u << 3;
+static constexpr u8 kItemPromoTried = 1u << 4;
+
+struct PendingPnMtxItem {
+  u32 refIdx = 0; // StaticDlDraw ref (with kStaticDrawExtraBit) if kItemStaticPool, else b.extras index
+  u16 vtxCount = 0;
+  u8 slotIdx = 0;
+  u8 texSlot = 0;
+  u8 flags = 0;
+};
+static_assert(sizeof(PendingPnMtxItem) == 12);
+
+struct PendingPnMtxExtra {
+  NativeGeomKey key{};
+  const NativeGeomEntry* cachedEntry = nullptr;
+  u32 cachedPtrEpoch = 0;
+  gfx::Range vertRange{};
+  gfx::Range idxRange{};
+  u32 numIndices = 0;
+  u32 scratchVtxOff = 0;
+  u32 scratchVtxBytes = 0;
+  u32 scratchIdxOff = 0;
+  u32 scratchIdxCount = 0;
+};
+
+struct PendingPnMtxBatch {
+  bool active = false;
+  GXPrimitive prim = GX_TRIANGLES;
+  GXVtxFmt fmt = GX_VTXFMT0;
+  bool stripTopology = false;
+  bool mixedTopology = false;
+  std::array<AttrConfig, MaxVtxAttr> nativeAttrs{};
+  u16 attrLayoutId = UINT16_MAX;
+  u8 nativeStride = 0;
+  uint32_t pipelineDirty = 0;
+  uint32_t textureDirty = 0;
+  u32 dstAlpha = 0;
+  u32 texMtxGen = 0;
+  u32 lightsGen = 0;
+  u32 bpUniGen = 0;
+  u32 othUniGen = 0;
+  u64 uniFastGen = UINT64_MAX;
+  BatchUniState uni{};
+  uint32_t finalUniformDirty = 0;
+
+  std::array<Mat3x4<float>, MaxPnMtx> posMtxs{};
+  std::array<Mat3x4<float>, MaxPnMtx> nrmMtxs{};
+  std::array<u32, MaxPnMtx> slotMtxGens{};
+  u32 mtxCount = 0;
+  u32 lastMtxIdx = UINT32_MAX;
+  u32 lastMtxGen = 0;
+  u32 lastMtxSlot = UINT32_MAX;
+  bool allowMultiTex = false;
+  u32 lastTexSlot = 0;
+  u32 texSlotCount = 1;
+  std::array<gfx::BindGroupRef, MaxTextures> texSlotBindGroups{};
+  std::array<f32, MaxTextures> texSlotBiases{};
+  static constexpr u64 kBatchFhSeed = 0x9e3779b97f4a7c15ull;
+  static constexpr u64 kBatchMhSeed = 0x504e4d54584d5247ull;
+
+  u32 totalVtxCount = 0;
+  bool allCached = true;
+  u64 batchFh = kBatchFhSeed;
+  u64 batchMh = kBatchMhSeed;
+
+  std::vector<PendingPnMtxItem> items;
+  std::vector<PendingPnMtxExtra> extras;
+  std::vector<u8> scratchVerts;
+  std::vector<u16> scratchIdxs;
+};
+static PendingPnMtxBatch s_pendingPnMtxBatch;
+
+static inline u64 batch_rotl64(u64 x, unsigned r) noexcept {
+  return (x << r) | (x >> (64u - r));
+}
+
+static inline u64 batch_mix64(u64 x) noexcept {
+  x = (x ^ (x >> 30u)) * 0xbf58476d1ce4e5b9ull;
+  x = (x ^ (x >> 27u)) * 0x94d049bb133111ebull;
+  return x ^ (x >> 31u);
+}
+
+static inline void batch_hash_append_cached(u64& fh, u64& mh, const NativeGeomKey& key, u32 slotIdx,
+                                            u32 texSlot, bool stripTopology) noexcept {
+  const u32 slotTag = (slotIdx & 0xFFu) | ((texSlot & 0xFFu) << 8u) | (stripTopology ? 0x10000u : 0u);
+  const u64 m1 = batch_mix64(key.fifoHash ^ batch_rotl64(key.metaHash, 19u) ^
+                             (static_cast<u64>(key.srcBytes) << 32u) ^ slotTag);
+  const u64 m2 = batch_mix64(key.metaHash ^ (static_cast<u64>(slotTag) * 0xff51afd7ed558ccdull) ^
+                             (static_cast<u64>(key.srcBytes) * 0xc4ceb9fe1a85ec53ull));
+  fh = batch_rotl64(fh, 13u) * 0x9e3779b97f4a7c15ull + m1;
+  mh = (batch_rotl64(mh, 17u) * 0xbf58476d1ce4e5b9ull) ^ m2;
+}
+} // namespace
+
+static u32 append_unrolled_strip_indices(ByteBuffer& dst, const u16* srcIdxs, u32 srcIdxCount, u16 vtxCount,
+                                         u16 vtxBase) noexcept {
+  u32 emitted = 0;
+  const u32 n = srcIdxs != nullptr ? srcIdxCount : static_cast<u32>(vtxCount);
+  if (n < 3) {
+    return 0;
+  }
+  dst.reserve_extra(static_cast<size_t>(n - 2) * 3u * sizeof(u16));
+  int runLen = 0;
+  u16 prev2 = 0;
+  u16 prev1 = 0;
+  bool flip = false;
+  for (u32 i = 0; i < n; ++i) {
+    const u16 idx = srcIdxs != nullptr ? srcIdxs[i] : static_cast<u16>(i);
+    if (idx == 0xFFFFu) {
+      runLen = 0;
+      flip = false;
+      continue;
+    }
+    if (runLen == 0) {
+      prev2 = idx;
+      runLen = 1;
+    } else if (runLen == 1) {
+      prev1 = idx;
+      runLen = 2;
+    } else {
+      const u16 a = flip ? prev1 : prev2;
+      const u16 bv = flip ? prev2 : prev1;
+      const u16 c = idx;
+      if (a != bv && bv != c && c != a) {
+        dst.append<u16>(static_cast<u16>(vtxBase + a));
+        dst.append<u16>(static_cast<u16>(vtxBase + bv));
+        dst.append<u16>(static_cast<u16>(vtxBase + c));
+        emitted += 3;
+      }
+      prev2 = prev1;
+      prev1 = idx;
+      flip = !flip;
+    }
+  }
+  return emitted;
+}
+
+static void flush_pending_pnmtx_batch() {
+  auto& b = s_pendingPnMtxBatch;
+  if (!b.active) {
+    return;
+  }
+  b.active = false;
+  if (b.items.empty()) {
+    return;
+  }
+  DrainScopeTimer _t_flush(s_drainTiming.ms_flush);
+
+  if (b.items.size() == 1) {
+    if (is_timing_enabled()) UNLIKELY ++s_drainTiming.bat_single;
+    const auto& item0 = b.items[0];
+    if ((item0.flags & kItemStaticPool) != 0) {
+      const StaticDlDraw& sd = get_static_dl_draw(item0.refIdx);
+      const NativeGeomEntry* ge = sd.cachedEntry;
+      if (ge == nullptr || sd.cachedPtrEpoch != s_nativeGeomPtrEpoch) UNLIKELY {
+        const auto cit = s_nativeGeomCache.find(sd.key);
+        CHECK(cit != s_nativeGeomCache.end(), "PendingPnMtxBatch: missing single static entry");
+        ge = &cit->second;
+      }
+      emit_native_draw_command(s_lastPipeline, ge->vertRange, ge->idxRange, s_lastUniformRange, item0.vtxCount,
+                               ge->indexCount, s_lastBindGroups, b.dstAlpha, /*cachedGeometry=*/true,
+                               b.finalUniformDirty, b.texMtxGen, b.lightsGen, b.bpUniGen, b.othUniGen);
+    } else {
+      PendingPnMtxExtra& ex0 = b.extras[item0.refIdx];
+      bool cached0 = (item0.flags & kItemCached) != 0;
+      if (!cached0) {
+        const bool indexed0 = (item0.flags & kItemIndexed) != 0;
+        const u8* vtxPtr = b.scratchVerts.data() + ex0.scratchVtxOff;
+        const u8* idxPtr = indexed0 ? reinterpret_cast<const u8*>(b.scratchIdxs.data() + ex0.scratchIdxOff) : nullptr;
+        const size_t idxBytes = indexed0 ? static_cast<size_t>(ex0.scratchIdxCount) * sizeof(u16) : 0u;
+        if ((item0.flags & kItemPromoTried) != 0) {
+          const size_t vertAlign = b.nativeStride > 4 ? static_cast<size_t>(b.nativeStride) : 4u;
+          ++s_geomCacheRingPushes;
+          ex0.vertRange = gfx::push_verts(vtxPtr, ex0.scratchVtxBytes, vertAlign);
+          if (idxPtr != nullptr && idxBytes > 0) {
+            ex0.idxRange = gfx::push_indices(idxPtr, idxBytes, 4);
+          }
+        } else {
+          native_geom_resolve_ranges(ex0.key, vtxPtr, ex0.scratchVtxBytes, b.nativeStride, idxPtr, idxBytes,
+                                     ex0.numIndices, ex0.vertRange, ex0.idxRange, cached0, /*mirrorCpu=*/false);
+        }
+      }
+      emit_native_draw_command(s_lastPipeline, ex0.vertRange, ex0.idxRange, s_lastUniformRange, item0.vtxCount,
+                               ex0.numIndices, s_lastBindGroups, b.dstAlpha, cached0, b.finalUniformDirty,
+                               b.texMtxGen, b.lightsGen, b.bpUniGen, b.othUniGen);
+    }
+    b.items.clear();
+    b.extras.clear();
+    b.scratchVerts.clear();
+    b.scratchIdxs.clear();
+    return;
+  }
+
+  if (is_timing_enabled()) UNLIKELY ++s_drainTiming.bat_merged;
+  ++s_pnmtxMergedBatches;
+  s_pnmtxMergedDrawsIn += b.items.size();
+
+  const bool outStrip = b.stripTopology && !b.mixedTopology;
+  const bool needListPipeMemo = b.mixedTopology && b.stripTopology;
+  const u8 batchTexTier = b.texSlotCount <= 1 ? 0u : (b.texSlotCount <= 2 ? 1u : (b.texSlotCount <= 4 ? 2u : 3u));
+  const u8 tierBit = static_cast<u8>(1u << batchTexTier);
+  const u8 mergedStride = static_cast<u8>(b.nativeStride + sizeof(u32));
+  bool haveMergedPipe = false;
+  gfx::PipelineRef mergedPipeline{};
+  const uint32_t pipeGen = gfx::pipeline_cache_gen();
+  const size_t memoIdx = s_lastPipeMemoIdx;
+  if (memoIdx < kNativePipeMemoSize) {
+    const auto& memo = s_nativePipeMemo[memoIdx];
+    if (memo.valid && memo.gen == pipeGen && memo.pipeline == s_lastPipeline && memo.cfgHash == s_lastCfgHash) {
+      if (!needListPipeMemo && (memo.hasMergedMask & tierBit) != 0) {
+        mergedPipeline = memo.mergedPipelines[batchTexTier];
+        haveMergedPipe = true;
+      } else if (needListPipeMemo && (memo.hasMergedListMask & tierBit) != 0) {
+        mergedPipeline = memo.mergedListPipelines[batchTexTier];
+        haveMergedPipe = true;
+      }
+    }
+  }
+  if (!haveMergedPipe) {
+    s_currentConfig = s_lastConfig;
+    s_currentConfig.triangleStripTopology = outStrip ? 1u : 0u;
+    s_currentConfig.shaderConfig.texBatchTier = batchTexTier;
+    auto& mergedAttrs = s_currentConfig.shaderConfig.attrs;
+    for (int a = GX_VA_PNMTXIDX + 1; a < MaxVtxAttr; ++a) {
+      if (mergedAttrs[a].attrType != GX_NONE) {
+        mergedAttrs[a].offset = static_cast<u8>(mergedAttrs[a].offset + sizeof(u32));
+      }
+    }
+    mergedAttrs[GX_VA_PNMTXIDX].attrType = GX_DIRECT;
+    mergedAttrs[GX_VA_PNMTXIDX].cnt = 1;
+    mergedAttrs[GX_VA_PNMTXIDX].compType = static_cast<u8>(GX_U8);
+    mergedAttrs[GX_VA_PNMTXIDX].offset = 0;
+    s_currentConfig.shaderConfig.vtxStride = mergedStride;
+
+    bool pipeReady = false;
+    uint64_t mergedShaderHash = 0;
+    mergedPipeline = resolve_pipeline_cached(s_currentConfig, pipeReady, mergedShaderHash);
+    if (pipeReady && memoIdx < kNativePipeMemoSize) {
+      auto& memo = s_nativePipeMemo[memoIdx];
+      if (memo.valid && memo.gen == pipeGen && memo.pipeline == s_lastPipeline && memo.cfgHash == s_lastCfgHash) {
+        if (!needListPipeMemo) {
+          memo.mergedPipelines[batchTexTier] = mergedPipeline;
+          memo.hasMergedMask |= tierBit;
+        } else {
+          memo.mergedListPipelines[batchTexTier] = mergedPipeline;
+          memo.hasMergedListMask |= tierBit;
+        }
+      }
+    }
+  }
+
+  const auto tu0 = timing_now();
+  const gfx::Range mergedUniformRange =
+      build_merged_uniform(s_lastInfo, s_lastUniformRange.offset, s_lastUniformRange.size,
+                           b.posMtxs.data(), b.nrmMtxs.data(), b.mtxCount,
+                           b.texSlotBiases.data(), b.texSlotCount);
+  const auto tu1 = timing_now();
+  s_drainTiming.ms_uni_build += std::chrono::duration<double, std::milli>(tu1 - tu0).count();
+
+  const GXBindGroups mergedBindGroups =
+      (b.texSlotCount > 1) ? build_batched_tex0_bind_groups(b.texSlotBindGroups.data(), b.texSlotCount)
+                           : s_lastBindGroups;
+
+  gfx::Range mergedVertRange{};
+  gfx::Range mergedIdxRange{};
+  u32 mergedNumIndices = 0;
+  bool mergedCached = false;
+
+  NativeGeomKey mergedKey{};
+  if (b.allCached) {
+    const u64 hdrHash = batch_mix64(
+        (static_cast<u64>(b.items.size()) << 32u) |
+        (static_cast<u64>(outStrip ? 1u : 0u) << 16u) |
+        (static_cast<u64>(b.mixedTopology ? 2u : 0u) << 16u) |
+        (static_cast<u64>(b.nativeStride) << 8u) |
+        static_cast<u64>(b.totalVtxCount));
+    mergedKey = {b.batchFh ^ hdrHash,
+                 b.batchMh ^ (static_cast<u64>(b.totalVtxCount) * 0x94d049bb133111ebull),
+                 b.totalVtxCount * static_cast<u32>(mergedStride)};
+    if (const auto hitIt = s_nativeGeomCache.find(mergedKey); hitIt != s_nativeGeomCache.end()) {
+      ++s_pnmtxMergedCacheHits;
+      mergedVertRange = hitIt->second.vertRange;
+      mergedIdxRange = hitIt->second.idxRange;
+      mergedNumIndices = hitIt->second.indexCount;
+      mergedCached = true;
+      if (needListPipeMemo) {
+        s_lastConfig.triangleStripTopology = 0u;
+      }
+      if (b.texSlotCount > 1) {
+        s_forceTexResolveAfterBatch = true;
+      }
+      emit_native_draw_command(mergedPipeline, mergedVertRange, mergedIdxRange, mergedUniformRange, b.totalVtxCount,
+                               mergedNumIndices, mergedBindGroups, b.dstAlpha, mergedCached, b.finalUniformDirty,
+                               b.texMtxGen, b.lightsGen, b.bpUniGen, b.othUniGen);
+      b.items.clear();
+      b.extras.clear();
+      b.scratchVerts.clear();
+      b.scratchIdxs.clear();
+      return;
+    }
+  }
+
+  bool anyIndexed = outStrip || b.mixedTopology;
+  for (const auto& it : b.items) {
+    if ((it.flags & kItemIndexed) != 0) {
+      anyIndexed = true;
+      break;
+    }
+  }
+
+  DrainScopeTimer _t_merge(s_drainTiming.ms_flush_merge);
+  s_nativeVtxBuf.clear();
+  const size_t mergedVtxTotalBytes = static_cast<size_t>(b.totalVtxCount) * mergedStride;
+  s_nativeVtxBuf.reserve_extra(mergedVtxTotalBytes);
+  s_nativeIdxBuf.clear();
+
+  u16 vtxBase = 0;
+  for (size_t s = 0; s < b.items.size(); ++s) {
+    const auto& it = b.items[s];
+    const bool itStatic = (it.flags & kItemStaticPool) != 0;
+    const bool itCached = itStatic || ((it.flags & kItemCached) != 0);
+    const bool itIndexed = (it.flags & kItemIndexed) != 0;
+    const bool itStrip = (it.flags & kItemStripTopology) != 0;
+    const u8* srcVerts = nullptr;
+    const u16* srcIdxs = nullptr;
+    u32 srcIdxCount = 0;
+    if (itCached) {
+      const NativeGeomEntry* ge = nullptr;
+      const NativeGeomKey* keyPtr = nullptr;
+      if (itStatic) {
+        const StaticDlDraw& sd = get_static_dl_draw(it.refIdx);
+        keyPtr = &sd.key;
+        if (sd.cachedPtrEpoch == s_nativeGeomPtrEpoch) {
+          ge = sd.cachedEntry;
+        }
+      } else {
+        const PendingPnMtxExtra& ex = b.extras[it.refIdx];
+        keyPtr = &ex.key;
+        if (ex.cachedPtrEpoch == s_nativeGeomPtrEpoch) {
+          ge = ex.cachedEntry;
+        }
+      }
+      if (ge == nullptr) UNLIKELY {
+        const auto cit = s_nativeGeomCache.find(*keyPtr);
+        CHECK(cit != s_nativeGeomCache.end(), "PendingPnMtxBatch: missing cached entry");
+        ge = &cit->second;
+      }
+      CHECK(!ge->cpuVerts.empty(), "PendingPnMtxBatch: missing cpuVerts mirror");
+      srcVerts = ge->cpuVerts.data();
+      srcIdxs = ge->cpuIndices.data();
+      srcIdxCount = static_cast<u32>(ge->cpuIndices.size());
+    } else {
+      const PendingPnMtxExtra& ex = b.extras[it.refIdx];
+      srcVerts = b.scratchVerts.data() + ex.scratchVtxOff;
+      srcIdxs = itIndexed ? (b.scratchIdxs.data() + ex.scratchIdxOff) : nullptr;
+      srcIdxCount = ex.scratchIdxCount;
+    }
+
+    const u32 slotVal = static_cast<u32>(it.slotIdx) | (static_cast<u32>(it.texSlot) << 4u);
+    for (u16 v = 0; v < it.vtxCount; ++v) {
+      s_nativeVtxBuf.append<u32>(slotVal);
+      const u8* vp = srcVerts + static_cast<size_t>(v) * b.nativeStride;
+      s_nativeVtxBuf.append(vp, b.nativeStride);
+    }
+
+    if (anyIndexed) {
+      if (outStrip) {
+        if (s > 0) {
+          s_nativeIdxBuf.append<u16>(0xFFFFu);
+          ++mergedNumIndices;
+        }
+        if (itIndexed) {
+          for (u32 ii = 0; ii < srcIdxCount; ++ii) {
+            const u16 idx = srcIdxs[ii];
+            s_nativeIdxBuf.append<u16>(idx == 0xFFFFu ? 0xFFFFu : static_cast<u16>(idx + vtxBase));
+          }
+          mergedNumIndices += srcIdxCount;
+        } else {
+          for (u16 v = 0; v < it.vtxCount; ++v) {
+            s_nativeIdxBuf.append<u16>(static_cast<u16>(vtxBase + v));
+          }
+          mergedNumIndices += it.vtxCount;
+        }
+      } else if (itStrip) {
+        mergedNumIndices += append_unrolled_strip_indices(
+            s_nativeIdxBuf, itIndexed ? srcIdxs : nullptr, srcIdxCount, it.vtxCount, vtxBase);
+      } else {
+        if (itIndexed) {
+          for (u32 ii = 0; ii < srcIdxCount; ++ii) {
+            s_nativeIdxBuf.append<u16>(static_cast<u16>(srcIdxs[ii] + vtxBase));
+          }
+          mergedNumIndices += srcIdxCount;
+        } else {
+          for (u16 v = 0; v < it.vtxCount; ++v) {
+            s_nativeIdxBuf.append<u16>(static_cast<u16>(vtxBase + v));
+          }
+          mergedNumIndices += it.vtxCount;
+        }
+      }
+    }
+    vtxBase = static_cast<u16>(vtxBase + it.vtxCount);
+  }
+
+  const u8* idxPtr = anyIndexed ? s_nativeIdxBuf.data() : nullptr;
+  const size_t idxBytes = anyIndexed ? s_nativeIdxBuf.size() : 0u;
+  if (b.allCached) {
+    native_geom_resolve_ranges(mergedKey, s_nativeVtxBuf.data(), s_nativeVtxBuf.size(), mergedStride, idxPtr, idxBytes,
+                               mergedNumIndices, mergedVertRange, mergedIdxRange, mergedCached, /*mirrorCpu=*/false);
+  } else {
+    const size_t vertAlign = mergedStride > 4 ? static_cast<size_t>(mergedStride) : 4u;
+    ++s_geomCacheRingPushes;
+    mergedVertRange = gfx::push_verts(s_nativeVtxBuf.data(), s_nativeVtxBuf.size(), vertAlign);
+    if (idxPtr != nullptr && idxBytes > 0) {
+      mergedIdxRange = gfx::push_indices(idxPtr, idxBytes, 4);
+    }
+  }
+  s_nativeIdxBuf.clear();
+
+  if (needListPipeMemo) {
+    s_lastConfig.triangleStripTopology = 0u;
+  }
+  if (b.texSlotCount > 1) {
+    s_forceTexResolveAfterBatch = true;
+  }
+  emit_native_draw_command(mergedPipeline, mergedVertRange, mergedIdxRange, mergedUniformRange, b.totalVtxCount,
+                           mergedNumIndices, mergedBindGroups, b.dstAlpha, mergedCached, b.finalUniformDirty,
+                           b.texMtxGen, b.lightsGen, b.bpUniGen, b.othUniGen);
+  b.items.clear();
+  b.extras.clear();
+  b.scratchVerts.clear();
+  b.scratchIdxs.clear();
+}
+
+static bool pnmtx_slot_equals(const Mat3x4<float>& a, const Mat3x4<float>& b) noexcept {
+  return std::memcmp(&a, &b, sizeof(Mat3x4<float>)) == 0;
+}
+
+static inline bool try_fit_pnmtx_tex_and_mtx(PendingPnMtxBatch& b, u32 mtxIdx, const PnMtx& curMtx, u32 curMtxGen,
+                                             u32& outSlotIdx, u32& outTexSlot, bool& outPreBgPopulated,
+                                             bool& outFlTex, bool& outFlMtx) noexcept {
+  bool sameTex = (g_gxState.textureDirty == b.textureDirty);
+  u32 texSlot = b.lastTexSlot;
+  bool texFit = sameTex;
+  bool needAllocTexSlot = false;
+  bool updateSingleTexDirty = false;
+  f32 newTexSlotBias = 0.f;
+  if (!sameTex) {
+    const auto t_res0 = timing_now();
+    s_candidateBg = resolve_and_build_bind_groups(s_lastInfo);
+    const auto t_res1 = timing_now();
+    s_drainTiming.ms_tex_resolve += std::chrono::duration<double, std::milli>(t_res1 - t_res0).count();
+    ++s_drainTiming.bg_calls;
+    const gfx::BindGroupRef candBg = s_candidateBg.textureBindGroup;
+    const f32 candBias = b.allowMultiTex ? current_tex_lod_bias(0) : 0.f;
+    if (candBg == b.texSlotBindGroups[b.lastTexSlot] &&
+        (!b.allowMultiTex || b.texSlotBiases[b.lastTexSlot] == candBias)) {
+      sameTex = true;
+      texFit = true;
+      b.textureDirty = g_gxState.textureDirty;
+      if (b.texSlotCount == 1 && b.lastTexSlot == 0) {
+        updateSingleTexDirty = true;
+      }
+    } else if (b.allowMultiTex && candBg != 0) {
+      u32 foundSlot = UINT32_MAX;
+      for (u32 ts = 0; ts < b.texSlotCount; ++ts) {
+        if (b.texSlotBindGroups[ts] == candBg && b.texSlotBiases[ts] == candBias) {
+          foundSlot = ts;
+          break;
+        }
+      }
+      if (foundSlot != UINT32_MAX) {
+        texSlot = foundSlot;
+        texFit = true;
+      } else if (b.texSlotCount < 4u) {
+        texSlot = b.texSlotCount;
+        needAllocTexSlot = true;
+        newTexSlotBias = candBias;
+        texFit = true;
+      }
+    }
+    if (!texFit) {
+      outPreBgPopulated = true;
+      outFlTex = true;
+      return false;
+    }
+  }
+
+  u32 slotIdx = UINT32_MAX;
+  if (b.lastMtxIdx == mtxIdx && b.lastMtxGen == curMtxGen) {
+    slotIdx = b.lastMtxSlot;
+  } else {
+    for (u32 s = 0; s < b.mtxCount; ++s) {
+      if (b.slotMtxGens[s] == curMtxGen ||
+          (b.posMtxs[s].m0[3] == curMtx.pos.m0[3] &&
+           b.posMtxs[s].m1[3] == curMtx.pos.m1[3] &&
+           b.posMtxs[s].m2[3] == curMtx.pos.m2[3] &&
+           pnmtx_slot_equals(b.posMtxs[s], curMtx.pos) &&
+           (!s_lastInfo.usesNormals || pnmtx_slot_equals(b.nrmMtxs[s], curMtx.nrm)))) {
+        slotIdx = s;
+        break;
+      }
+    }
+  }
+  bool needAllocMtxSlot = false;
+  if (slotIdx == UINT32_MAX && b.mtxCount < MaxPnMtx) {
+    slotIdx = b.mtxCount;
+    needAllocMtxSlot = true;
+  }
+  if (slotIdx == UINT32_MAX) {
+    if (!sameTex) {
+      outPreBgPopulated = true;
+    }
+    outFlMtx = true;
+    return false;
+  }
+
+  if (updateSingleTexDirty) {
+    s_lastBindGroups = s_candidateBg;
+    s_lastTextureDirty = g_gxState.textureDirty;
+  }
+  if (!sameTex) {
+    if (needAllocTexSlot) {
+      b.texSlotBindGroups[texSlot] = s_candidateBg.textureBindGroup;
+      b.texSlotBiases[texSlot] = newTexSlotBias;
+      ++b.texSlotCount;
+    }
+    b.textureDirty = g_gxState.textureDirty;
+    b.lastTexSlot = texSlot;
+  }
+  if (needAllocMtxSlot) {
+    ++b.mtxCount;
+    b.posMtxs[slotIdx] = curMtx.pos;
+    b.nrmMtxs[slotIdx] = curMtx.nrm;
+    b.slotMtxGens[slotIdx] = curMtxGen;
+  }
+  b.lastMtxIdx = mtxIdx;
+  b.lastMtxGen = curMtxGen;
+  b.lastMtxSlot = slotIdx;
+  outSlotIdx = slotIdx;
+  outTexSlot = texSlot;
+  return true;
+}
+
+static inline void record_pnmtx_item(PendingPnMtxBatch& b, u16 vtxCount, u32 slotIdx, u32 texSlot,
+                                     bool cached, bool indexed, bool stripTopology, bool promoTried,
+                                     u32 staticPoolRefIdx, const NativeGeomKey& key,
+                                     const NativeGeomEntry* cachedEntry, const gfx::Range& vertRange,
+                                     const gfx::Range& idxRange, u32 numIndices, const u8* vtxPtr,
+                                     size_t vtxBytes, const u8* idxPtr, size_t idxBytes) {
+  PendingPnMtxItem& item = b.items.emplace_back();
+  item.vtxCount = vtxCount;
+  item.slotIdx = static_cast<u8>(slotIdx);
+  item.texSlot = static_cast<u8>(texSlot);
+  item.flags = (cached ? kItemCached : 0u) | (indexed ? kItemIndexed : 0u) |
+               (stripTopology ? kItemStripTopology : 0u) | (promoTried ? kItemPromoTried : 0u);
+  if (staticPoolRefIdx != UINT32_MAX) {
+    item.flags |= kItemStaticPool;
+    item.refIdx = staticPoolRefIdx;
+    return;
+  }
+  item.refIdx = static_cast<u32>(b.extras.size());
+  PendingPnMtxExtra& ex = b.extras.emplace_back();
+  ex.key = key;
+  ex.cachedEntry = cachedEntry;
+  ex.cachedPtrEpoch = cached ? s_nativeGeomPtrEpoch : 0u;
+  ex.vertRange = vertRange;
+  ex.idxRange = idxRange;
+  ex.numIndices = numIndices;
+  if (!cached) {
+    ex.scratchVtxOff = static_cast<u32>(b.scratchVerts.size());
+    ex.scratchVtxBytes = static_cast<u32>(vtxBytes);
+    b.scratchVerts.resize(ex.scratchVtxOff + vtxBytes);
+    std::memcpy(b.scratchVerts.data() + ex.scratchVtxOff, vtxPtr, vtxBytes);
+    if (indexed && idxPtr != nullptr && idxBytes > 0) {
+      ex.scratchIdxOff = static_cast<u32>(b.scratchIdxs.size());
+      ex.scratchIdxCount = static_cast<u32>(idxBytes / sizeof(u16));
+      b.scratchIdxs.resize(ex.scratchIdxOff + ex.scratchIdxCount);
+      std::memcpy(b.scratchIdxs.data() + ex.scratchIdxOff, idxPtr, idxBytes);
+    }
+  }
+}
+
+static void submit_native_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
+                                  const std::array<AttrConfig, MaxVtxAttr>& nativeAttrs, u16 attrLayoutId,
+                                  u8 nativeStride, const NativeGeomKey& key, const NativeGeomEntry* cachedEntry,
+                                  const u8* vtxPtr, size_t vtxBytes, const u8* idxPtr, size_t idxBytes, u32 numIndices,
+                                  bool indexed, bool stripTopology, u32 staticPoolRefIdx = UINT32_MAX,
+                                  bool preBgPopulatedArg = false, bool preCfgSameArg = false) {
+  if (vtxCount == 0) {
+    return;
+  }
+  if (s_staticDlCaptureActive) UNLIKELY {
+    const u8 drawFlags = static_cast<u8>((indexed ? kStaticDrawIndexed : 0u) |
+                                         (stripTopology ? kStaticDrawStrip : 0u));
+    s_staticDlCapturedDraws.push_back(StaticDlDraw{
+        key,
+        nullptr,
+        0u,
+        vtxCount,
+        attrLayoutId,
+        static_cast<u8>(prim),
+        static_cast<u8>(fmt),
+        nativeStride,
+        drawFlags,
+    });
+    s_staticDlCapturedFmtMask |= static_cast<u32>(1u << fmt);
+  }
+
+  bool cached = (cachedEntry != nullptr);
+  bool hasCpuMirror = cached && !cachedEntry->cpuVerts.empty();
+  gfx::Range cachedVertRange = cached ? cachedEntry->vertRange : gfx::Range{};
+  gfx::Range cachedIdxRange = cached ? cachedEntry->idxRange : gfx::Range{};
+  u32 effectiveNumIndices = cached ? cachedEntry->indexCount : numIndices;
+
+  const bool baseEligible = kEnablePnMtxBatch && vtxCount <= 0xFFFEu &&
+                            nativeAttrs[GX_VA_PNMTXIDX].attrType == GX_NONE;
+
+  // Promote recurring uncached draws early when possible so static batches turn allCached faster.
+  bool promoTried = false;
+  if (baseEligible && !cached && vtxBytes <= kMaxNativeGeomCpuMirrorEntryBytes) {
+    promoTried = true;
+    const NativeGeomEntry* promotedEntry = nullptr;
+    if (try_promote_native_geom(key, vtxPtr, vtxBytes, nativeStride, idxPtr, idxBytes, numIndices,
+                                cachedVertRange, cachedIdxRange, /*mirrorCpu=*/true, &promotedEntry)) {
+      cached = true;
+      cachedEntry = promotedEntry;
+      hasCpuMirror = (promotedEntry != nullptr && !promotedEntry->cpuVerts.empty());
+    }
+  }
+
+  DrainScopeTimer _t_sub(s_drainTiming.ms_submit);
+  const bool itemBatchable = baseEligible && (!cached || hasCpuMirror);
+  auto& b = s_pendingPnMtxBatch;
+  const u32 mtxIdx = std::min<u32>(g_gxState.currentPnMtx, MaxPnMtx - 1);
+  const PnMtx& curMtx = g_gxState.pnMtx[mtxIdx];
+  const u32 curMtxGen = s_pnMtxGen[mtxIdx];
+
+  bool preCfgPopulated = false;
+  bool preConfigSame = preCfgSameArg;
+  bool preBgPopulated = preBgPopulatedArg;
+
+  const u64 curFastUniGen = (static_cast<u64>(s_splitBpUniGen) << 32) | s_splitOthUniGen;
+  UniMismatch uniMismatch = UniMismatch::None;
+  const bool sameUniFast =
+      !preCfgSameArg && !preBgPopulatedArg && b.active && itemBatchable &&
+      ((b.uniFastGen == curFastUniGen && (!s_lastInfo.lightingEnabled || b.lightsGen == s_splitLightsGen)) ||
+       ((uniMismatch = batch_uniforms_mismatch(b.uni, b.lightsGen, s_lastInfo, b.allowMultiTex)) == UniMismatch::None));
+  if (sameUniFast && b.uniFastGen != curFastUniGen) {
+    b.uniFastGen = curFastUniGen;
+  }
+
+  if (!preCfgSameArg && !preBgPopulatedArg && b.active && itemBatchable &&
+      (b.stripTopology == stripTopology || s_lastConfig.shaderConfig.lineMode == 0) &&
+      b.nativeStride == nativeStride &&
+      b.dstAlpha == g_gxState.dstAlpha &&
+      b.texMtxGen == s_splitTexMtxGen &&
+      sameUniFast &&
+      b.totalVtxCount + vtxCount <= 0xFFFEu &&
+      b.attrLayoutId == attrLayoutId) {
+    const u32 curStripU32 = stripTopology ? 1u : 0u;
+    const bool topoMatchesLastCfg = (curStripU32 == s_lastConfig.triangleStripTopology);
+    const bool lineZero = (s_lastConfig.shaderConfig.lineMode == 0);
+    const bool primTriCompatible =
+        (prim == b.prim) ||
+        (lineZero && (prim == GX_TRIANGLES || prim == GX_TRIANGLESTRIP) &&
+         (b.prim == GX_TRIANGLES || b.prim == GX_TRIANGLESTRIP));
+    bool cfgPopulated = false;
+    bool samePipe = (g_gxState.pipelineDirty == b.pipelineDirty && fmt == b.fmt &&
+                     (topoMatchesLastCfg ? (prim == b.prim) : primTriCompatible));
+    if (!samePipe) {
+      const auto tp0 = timing_now();
+      s_currentConfig = {};
+      populate_pipeline_config(s_currentConfig, prim, fmt, /*fillAttrs=*/false);
+      s_currentConfig.shaderConfig.attrs = nativeAttrs;
+      s_currentConfig.shaderConfig.vtxStride = nativeStride;
+      s_currentConfig.shaderConfig.nativeVertexFetch = 1;
+      const bool canIgnoreTopo = (s_currentConfig.shaderConfig.lineMode == 0 && s_lastConfig.shaderConfig.lineMode == 0);
+      if (canIgnoreTopo) {
+        s_currentConfig.triangleStripTopology = s_lastConfig.triangleStripTopology;
+      } else {
+        s_currentConfig.triangleStripTopology = curStripU32;
+      }
+      const auto tp1 = timing_now();
+      s_drainTiming.ms_pipe_cfg += std::chrono::duration<double, std::milli>(tp1 - tp0).count();
+      cfgPopulated = true;
+      if (std::memcmp(&s_currentConfig, &s_lastConfig, sizeof(PipelineConfig)) == 0) {
+        samePipe = true;
+        if (topoMatchesLastCfg || canIgnoreTopo) {
+          b.pipelineDirty = g_gxState.pipelineDirty;
+          b.prim = prim;
+          b.fmt = fmt;
+          s_lastPipelineDirty = g_gxState.pipelineDirty;
+          s_lastPrim = prim;
+          s_lastFmt = fmt;
+        }
+      } else {
+        s_currentConfig.triangleStripTopology = curStripU32;
+        preCfgPopulated = true;
+      }
+    }
+    if (samePipe) {
+      u32 slotIdx = 0;
+      u32 texSlot = b.lastTexSlot;
+      bool flTex = false;
+      bool flMtx = false;
+      if (try_fit_pnmtx_tex_and_mtx(b, mtxIdx, curMtx, curMtxGen, slotIdx, texSlot, preBgPopulated, flTex, flMtx)) {
+        if (!topoMatchesLastCfg) {
+          b.mixedTopology = true;
+        }
+        if (topoMatchesLastCfg || lineZero) {
+          b.pipelineDirty = g_gxState.pipelineDirty;
+          b.prim = prim;
+        }
+        b.textureDirty = g_gxState.textureDirty;
+        b.totalVtxCount += vtxCount;
+        b.finalUniformDirty = g_gxState.uniformDirty;
+        const bool itemIndexed = cached ? (effectiveNumIndices != 0) : indexed;
+        const u32 refId = (cached && hasCpuMirror) ? staticPoolRefIdx : UINT32_MAX;
+        record_pnmtx_item(b, vtxCount, slotIdx, texSlot, cached, itemIndexed, stripTopology, promoTried,
+                          refId, key, cachedEntry, cachedVertRange, cachedIdxRange, effectiveNumIndices,
+                          vtxPtr, vtxBytes, idxPtr, idxBytes);
+        if (!cached) {
+          b.allCached = false;
+        } else if (b.allCached) {
+          batch_hash_append_cached(b.batchFh, b.batchMh, key, slotIdx, texSlot, stripTopology);
+        }
+        if (is_timing_enabled()) UNLIKELY ++s_drainTiming.bat_ok;
+        return;
+      }
+      if (topoMatchesLastCfg) {
+        preConfigSame = true;
+      } else {
+        if (!cfgPopulated) {
+          s_currentConfig = s_lastConfig;
+        }
+        s_currentConfig.triangleStripTopology = curStripU32;
+        preCfgPopulated = true;
+      }
+      if (is_timing_enabled()) UNLIKELY {
+        if (flMtx) ++s_drainTiming.fl_mtx;
+        else if (flTex) ++s_drainTiming.fl_tex;
+      }
+    } else if (is_timing_enabled()) UNLIKELY {
+      ++s_drainTiming.fl_pipe;
+    }
+  } else if (!preCfgSameArg && !preBgPopulatedArg && b.active && is_timing_enabled()) UNLIKELY {
+    if (!itemBatchable) ++s_drainTiming.fl_nonbat;
+    else if ((b.stripTopology != stripTopology && s_lastConfig.shaderConfig.lineMode != 0) ||
+             b.nativeStride != nativeStride ||
+             b.attrLayoutId != attrLayoutId) ++s_drainTiming.fl_topo;
+    else if (b.dstAlpha != g_gxState.dstAlpha) ++s_drainTiming.fl_da;
+    else if (b.texMtxGen != s_splitTexMtxGen) ++s_drainTiming.fl_tm;
+    else if (uniMismatch == UniMismatch::Lights) ++s_drainTiming.fl_li;
+    else if (uniMismatch == UniMismatch::Bp) ++s_drainTiming.fl_bp;
+    else if (uniMismatch == UniMismatch::Oth) ++s_drainTiming.fl_oth;
+    else ++s_drainTiming.fl_vtx;
+  }
+
+  flush_pending_pnmtx_batch();
+
+  resolve_single_native_draw_state(prim, fmt, nativeAttrs, nativeStride, stripTopology, preCfgPopulated,
+                                   preConfigSame, preBgPopulated);
+
+  if (!itemBatchable || shader_uses_fixed_pnmtx_texgen(s_lastInfo, s_lastConfig.shaderConfig)) {
+    if (is_timing_enabled() && itemBatchable) UNLIKELY ++s_drainTiming.skip_fixtg;
+    if (!cached) {
+      if (promoTried) {
+        const size_t vertAlign = nativeStride > 4 ? static_cast<size_t>(nativeStride) : 4u;
+        ++s_geomCacheRingPushes;
+        cachedVertRange = gfx::push_verts(vtxPtr, vtxBytes, vertAlign);
+        if (idxPtr != nullptr && idxBytes > 0) {
+          cachedIdxRange = gfx::push_indices(idxPtr, idxBytes, 4);
+        }
+      } else {
+        native_geom_resolve_ranges(key, vtxPtr, vtxBytes, nativeStride, idxPtr, idxBytes, effectiveNumIndices,
+                                   cachedVertRange, cachedIdxRange, cached, /*mirrorCpu=*/false);
+      }
+    }
+    emit_native_draw_command(s_lastPipeline, cachedVertRange, cachedIdxRange, s_lastUniformRange, vtxCount,
+                             effectiveNumIndices, s_lastBindGroups, g_gxState.dstAlpha, cached,
+                             g_gxState.uniformDirty, s_splitTexMtxGen, s_splitLightsGen, s_splitBpUniGen,
+                             s_splitOthUniGen);
+    return;
+  }
+
+  if (b.items.capacity() < 256) {
+    b.items.reserve(256);
+    b.extras.reserve(256);
+    b.scratchVerts.reserve(65536);
+    b.scratchIdxs.reserve(16384);
+  }
+
+  b.active = true;
+  b.prim = prim;
+  b.fmt = fmt;
+  b.stripTopology = stripTopology;
+  b.mixedTopology = false;
+  b.nativeAttrs = nativeAttrs;
+  b.attrLayoutId = attrLayoutId;
+  b.nativeStride = nativeStride;
+  b.pipelineDirty = g_gxState.pipelineDirty;
+  b.textureDirty = g_gxState.textureDirty;
+  b.dstAlpha = g_gxState.dstAlpha;
+  b.texMtxGen = s_splitTexMtxGen;
+  b.lightsGen = s_splitLightsGen;
+  b.bpUniGen = s_splitBpUniGen;
+  b.othUniGen = s_splitOthUniGen;
+  b.uniFastGen = curFastUniGen;
+  b.uni = s_curUniState;
+  b.finalUniformDirty = g_gxState.uniformDirty;
+  b.posMtxs[0] = curMtx.pos;
+  b.nrmMtxs[0] = curMtx.nrm;
+  b.slotMtxGens[0] = curMtxGen;
+  b.mtxCount = 1;
+  b.lastMtxIdx = mtxIdx;
+  b.lastMtxGen = curMtxGen;
+  b.lastMtxSlot = 0;
+  b.allowMultiTex = (s_lastInfo.sampledTextures.count() == 1 &&
+                     s_lastInfo.sampledTextures.test(0) &&
+                     !s_lastInfo.usesTexSize &&
+                     !s_lastInfo.usesTexCoordScales &&
+                     s_lastConfig.shaderConfig.sdfMaps == 0 &&
+                     s_lastBindGroups.textureBindGroup != 0);
+  b.lastTexSlot = 0;
+  b.texSlotCount = 1;
+  b.texSlotBindGroups[0] = s_lastBindGroups.textureBindGroup;
+  b.texSlotBiases[0] = b.allowMultiTex ? current_tex_lod_bias(0) : 0.f;
+  b.totalVtxCount = vtxCount;
+  b.allCached = cached;
+  b.batchFh = PendingPnMtxBatch::kBatchFhSeed;
+  b.batchMh = PendingPnMtxBatch::kBatchMhSeed;
+  if (cached) {
+    batch_hash_append_cached(b.batchFh, b.batchMh, key, 0u, 0u, stripTopology);
+  }
+  b.items.clear();
+  b.extras.clear();
+  b.scratchVerts.clear();
+  b.scratchIdxs.clear();
+
+  const bool item0Indexed = cached ? (effectiveNumIndices != 0) : indexed;
+  const u32 refId = (cached && hasCpuMirror) ? staticPoolRefIdx : UINT32_MAX;
+  record_pnmtx_item(b, vtxCount, 0u, 0u, cached, item0Indexed, stripTopology, promoTried,
+                    refId, key, cachedEntry, cachedVertRange, cachedIdxRange, effectiveNumIndices,
+                    vtxPtr, vtxBytes, idxPtr, idxBytes);
 }
 
 // Expand `vtxCount` raw FIFO vertices and push a native draw, serving steady-state
@@ -3150,11 +4877,13 @@ static bool try_native_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const 
     return false;
   }
   u8 nativeStride = 0;
-  std::array<AttrConfig, MaxVtxAttr> nativeAttrs{};
+  const std::array<AttrConfig, MaxVtxAttr>* nativeAttrsPtr = nullptr;
+  u16 attrLayoutId = 0;
   const std::vector<NativeAttrDesc>* descsPtr = nullptr;
-  if (!get_native_layout(fmt, descsPtr, nativeStride, nativeAttrs)) {
+  if (!get_native_layout(fmt, descsPtr, nativeStride, nativeAttrsPtr, attrLayoutId)) {
     return false;
   }
+  const auto& nativeAttrs = *nativeAttrsPtr;
   const auto& descs = *descsPtr;
   ++s_geomDrawsSingle;
   const u32 srcBytes = static_cast<u32>(vtxCount) * vtxSize;
@@ -3174,8 +4903,8 @@ static bool try_native_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const 
     if (const auto it = s_nativeGeomCache.find(key); it != s_nativeGeomCache.end()) {
       ++s_geomCacheHits;
       pos += srcBytes;
-      push_native_gx_draw(prim, fmt, vtxCount, nativeAttrs, nativeStride, it->second.vertRange, it->second.idxRange,
-                          it->second.indexCount, /*cachedGeometry=*/true);
+      submit_native_gx_draw(prim, fmt, vtxCount, nativeAttrs, attrLayoutId, nativeStride, key, &it->second, nullptr, 0,
+                            nullptr, 0, it->second.indexCount, it->second.indexCount != 0, /*stripTopology=*/false);
       return true;
     }
     ++s_geomCacheMisses;
@@ -3183,9 +4912,11 @@ static bool try_native_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const 
 
   // Miss — expand the run into flat native attributes.
   s_nativeVtxBuf.clear();
-  s_nativeVtxBuf.reserve_extra(static_cast<u32>(vtxCount) * nativeStride);
-  for (u32 v = 0; v < vtxCount; ++v) {
-    expand_native_vertex(descs, data + pos + static_cast<size_t>(v) * vtxSize, s_nativeVtxBuf);
+  if (vtxCount > 0) {
+    std::array<PreparedNativeAttr, MaxVtxAttr> fastAttrs{};
+    const size_t attrCount = prepare_native_attrs(descs, fastAttrs.data());
+    u8* dst = s_nativeVtxBuf.alloc_write(static_cast<size_t>(vtxCount) * nativeStride);
+    expand_native_vertices_into(fastAttrs.data(), attrCount, data + pos, vtxSize, vtxCount, dst);
   }
   pos += srcBytes;
 
@@ -3197,14 +4928,10 @@ static bool try_native_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const 
     numIndices = prepare_idx_buffer(s_nativeIdxBuf, prim, 0, vtxCount);
   }
 
-  gfx::Range vertRange{};
-  gfx::Range idxRange{};
-  bool cached = false;
-  native_geom_resolve_ranges(key, s_nativeVtxBuf, nativeStride, indexed ? s_nativeIdxBuf.data() : nullptr,
-                             indexed ? s_nativeIdxBuf.size() : 0, numIndices, vertRange, idxRange, cached);
+  submit_native_gx_draw(prim, fmt, vtxCount, nativeAttrs, attrLayoutId, nativeStride, key, nullptr,
+                        s_nativeVtxBuf.data(), s_nativeVtxBuf.size(), indexed ? s_nativeIdxBuf.data() : nullptr,
+                        indexed ? s_nativeIdxBuf.size() : 0, numIndices, indexed, /*stripTopology=*/false);
   s_nativeIdxBuf.clear();
-
-  push_native_gx_draw(prim, fmt, vtxCount, nativeAttrs, nativeStride, vertRange, idxRange, numIndices, cached);
   return true;
 }
 
@@ -3226,11 +4953,13 @@ static bool try_native_draw_run(u8 cmd, GXPrimitive prim, GXVtxFmt fmt, u16 vtxC
     return false;
   }
   u8 nativeStride = 0;
-  std::array<AttrConfig, MaxVtxAttr> nativeAttrs{};
+  const std::array<AttrConfig, MaxVtxAttr>* nativeAttrsPtr = nullptr;
+  u16 attrLayoutId = 0;
   const std::vector<NativeAttrDesc>* descsPtr = nullptr;
-  if (!get_native_layout(fmt, descsPtr, nativeStride, nativeAttrs)) {
+  if (!get_native_layout(fmt, descsPtr, nativeStride, nativeAttrsPtr, attrLayoutId)) {
     return false;
   }
+  const auto& nativeAttrs = *nativeAttrsPtr;
   const auto& descs = *descsPtr;
 
   // Scan forward across back-to-back identical draw commands (including 0x00 CP_CMD_NOP
@@ -3303,8 +5032,9 @@ static bool try_native_draw_run(u8 cmd, GXPrimitive prim, GXVtxFmt fmt, u16 vtxC
     if (const auto it = s_nativeGeomCache.find(key); it != s_nativeGeomCache.end()) {
       ++s_geomCacheHits;
       pos = scan;
-      push_native_gx_draw(prim, fmt, static_cast<u16>(batchVtxCount), nativeAttrs, nativeStride, it->second.vertRange,
-                          it->second.idxRange, it->second.indexCount, /*cachedGeometry=*/true, stripTopology);
+      submit_native_gx_draw(prim, fmt, static_cast<u16>(batchVtxCount), nativeAttrs, attrLayoutId, nativeStride, key,
+                            &it->second, nullptr, 0, nullptr, 0, it->second.indexCount, it->second.indexCount != 0,
+                            stripTopology);
       return true;
     }
     ++s_geomCacheMisses;
@@ -3314,12 +5044,15 @@ static bool try_native_draw_run(u8 cmd, GXPrimitive prim, GXVtxFmt fmt, u16 vtxC
   const auto t_miss0 = timing_now();
   const auto te0 = timing_now();
   s_nativeVtxBuf.clear();
-  s_nativeVtxBuf.reserve_extra(batchVtxCount * nativeStride);
-  for (size_t s = 0; s < segCounts.size(); ++s) {
-    const u16 count = segCounts[s];
-    const u8* segData = data + segOffsets[s];
-    for (u16 v = 0; v < count; ++v) {
-      expand_native_vertex(descs, segData + static_cast<size_t>(v) * vtxSize, s_nativeVtxBuf);
+  if (batchVtxCount > 0) {
+    std::array<PreparedNativeAttr, MaxVtxAttr> fastAttrs{};
+    const size_t attrCount = prepare_native_attrs(descs, fastAttrs.data());
+    u8* dst = s_nativeVtxBuf.alloc_write(static_cast<size_t>(batchVtxCount) * nativeStride);
+    for (size_t s = 0; s < segCounts.size(); ++s) {
+      const u16 count = segCounts[s];
+      const u8* segData = data + segOffsets[s];
+      expand_native_vertices_into(fastAttrs.data(), attrCount, segData, vtxSize, count, dst);
+      dst += static_cast<size_t>(count) * nativeStride;
     }
   }
   const auto te1 = timing_now();
@@ -3344,17 +5077,13 @@ static bool try_native_draw_run(u8 cmd, GXPrimitive prim, GXVtxFmt fmt, u16 vtxC
     }
   }
 
-  gfx::Range vertRange{};
-  gfx::Range idxRange{};
-  bool cached = false;
-  native_geom_resolve_ranges(key, s_nativeVtxBuf, nativeStride, indexed ? s_nativeIdxBuf.data() : nullptr,
-                             indexed ? s_nativeIdxBuf.size() : 0, numIndices, vertRange, idxRange, cached);
+  submit_native_gx_draw(prim, fmt, static_cast<u16>(batchVtxCount), nativeAttrs, attrLayoutId, nativeStride, key,
+                        nullptr, s_nativeVtxBuf.data(), s_nativeVtxBuf.size(),
+                        indexed ? s_nativeIdxBuf.data() : nullptr, indexed ? s_nativeIdxBuf.size() : 0, numIndices,
+                        indexed, stripTopology);
   s_nativeIdxBuf.clear();
   const auto t_miss1 = timing_now();
   s_drainTiming.ms_geom_miss += std::chrono::duration<double, std::milli>(t_miss1 - t_miss0).count();
-
-  push_native_gx_draw(prim, fmt, static_cast<u16>(batchVtxCount), nativeAttrs, nativeStride, vertRange, idxRange,
-                      numIndices, cached, stripTopology);
   return true;
 }
 
@@ -3363,11 +5092,13 @@ static bool try_native_draw_run(u8 cmd, GXPrimitive prim, GXVtxFmt fmt, u16 vtxC
 static bool native_emit_indexed(GXVtxFmt fmt, u16 vtxCount, const u8* vtxData, u32 vtxSize, const u8* idxData,
                                 u32 idxBytes, u32 indexCount) {
   u8 nativeStride = 0;
-  std::array<AttrConfig, MaxVtxAttr> nativeAttrs{};
+  const std::array<AttrConfig, MaxVtxAttr>* nativeAttrsPtr = nullptr;
+  u16 attrLayoutId = 0;
   const std::vector<NativeAttrDesc>* descsPtr = nullptr;
-  if (!get_native_layout(fmt, descsPtr, nativeStride, nativeAttrs)) {
+  if (!get_native_layout(fmt, descsPtr, nativeStride, nativeAttrsPtr, attrLayoutId)) {
     return false;
   }
+  const auto& nativeAttrs = *nativeAttrsPtr;
   const auto& descs = *descsPtr;
   const u32 srcBytes = static_cast<u32>(vtxCount) * vtxSize;
 
@@ -3383,25 +5114,25 @@ static bool native_emit_indexed(GXVtxFmt fmt, u16 vtxCount, const u8* vtxData, u
     s_drainTiming.ms_geom_hash += std::chrono::duration<double, std::milli>(th1 - th0).count();
     if (const auto it = s_nativeGeomCache.find(key); it != s_nativeGeomCache.end()) {
       ++s_geomCacheHits;
-      push_native_gx_draw(GX_TRIANGLES, fmt, vtxCount, nativeAttrs, nativeStride, it->second.vertRange,
-                          it->second.idxRange, it->second.indexCount, /*cachedGeometry=*/true);
+      submit_native_gx_draw(GX_TRIANGLES, fmt, vtxCount, nativeAttrs, attrLayoutId, nativeStride, key, &it->second,
+                            nullptr, 0, nullptr, 0, it->second.indexCount, it->second.indexCount != 0,
+                            /*stripTopology=*/false);
       return true;
     }
     ++s_geomCacheMisses;
   }
 
   s_nativeVtxBuf.clear();
-  s_nativeVtxBuf.reserve_extra(static_cast<u32>(vtxCount) * nativeStride);
-  for (u32 v = 0; v < vtxCount; ++v) {
-    expand_native_vertex(descs, vtxData + static_cast<size_t>(v) * vtxSize, s_nativeVtxBuf);
+  if (vtxCount > 0) {
+    std::array<PreparedNativeAttr, MaxVtxAttr> fastAttrs{};
+    const size_t attrCount = prepare_native_attrs(descs, fastAttrs.data());
+    u8* dst = s_nativeVtxBuf.alloc_write(static_cast<size_t>(vtxCount) * nativeStride);
+    expand_native_vertices_into(fastAttrs.data(), attrCount, vtxData, vtxSize, vtxCount, dst);
   }
 
-  gfx::Range vertRange{};
-  gfx::Range idxRange{};
-  bool cached = false;
-  native_geom_resolve_ranges(key, s_nativeVtxBuf, nativeStride, idxData, idxBytes, indexCount, vertRange, idxRange, cached);
-
-  push_native_gx_draw(GX_TRIANGLES, fmt, vtxCount, nativeAttrs, nativeStride, vertRange, idxRange, indexCount, cached);
+  submit_native_gx_draw(GX_TRIANGLES, fmt, vtxCount, nativeAttrs, attrLayoutId, nativeStride, key, nullptr,
+                        s_nativeVtxBuf.data(), s_nativeVtxBuf.size(), idxData, idxBytes, indexCount, indexCount != 0,
+                        /*stripTopology=*/false);
   return true;
 }
 
@@ -3422,6 +5153,418 @@ std::string read_string(const u8* data, u32& pos, u32 size, bool bigEndian) {
   std::string str(reinterpret_cast<const char*>(data) + pos, length);
   pos += length;
   return str;
+}
+
+static inline bool try_append_cached_static_dl_draw(u32 staticPoolRefIdx, const StaticDlDraw& d, u32 mtxIdx,
+                                                    const PnMtx& curMtx, u32 curMtxGen, u64 curFastUniGen,
+                                                    bool& outPreBgPopulated, bool& outPrePipeSame) noexcept {
+  if (d.vtxCount == 0 || d.vtxCount > 0xFFFEu) {
+    return false;
+  }
+  auto& b = s_pendingPnMtxBatch;
+  if (!b.active) {
+    return false;
+  }
+  if (b.nativeStride != d.nativeStride || b.attrLayoutId != d.attrLayoutId ||
+      b.totalVtxCount + d.vtxCount > 0xFFFEu ||
+      b.dstAlpha != g_gxState.dstAlpha || b.texMtxGen != s_splitTexMtxGen) {
+    return false;
+  }
+  if ((b.uniFastGen != curFastUniGen || (s_lastInfo.lightingEnabled && b.lightsGen != s_splitLightsGen)) &&
+      batch_uniforms_mismatch(b.uni, b.lightsGen, s_lastInfo, b.allowMultiTex) != UniMismatch::None) {
+    return false;
+  }
+  const bool stripTopo = d.stripTopology();
+  const GXPrimitive prim = d.gxPrim();
+  const bool lineZero = (s_lastConfig.shaderConfig.lineMode == 0);
+  if (!lineZero && b.stripTopology != stripTopo) {
+    return false;
+  }
+  if (g_gxState.pipelineDirty != b.pipelineDirty || d.gxFmt() != b.fmt) {
+    return false;
+  }
+  const bool topoMatchesLastCfg = ((stripTopo ? 1u : 0u) == s_lastConfig.triangleStripTopology);
+  if (prim != b.prim &&
+      !(lineZero && (prim == GX_TRIANGLES || prim == GX_TRIANGLESTRIP) &&
+        (b.prim == GX_TRIANGLES || b.prim == GX_TRIANGLESTRIP))) {
+    return false;
+  }
+  if (!topoMatchesLastCfg && !lineZero) {
+    return false;
+  }
+
+  u32 slotIdx = 0;
+  u32 texSlot = b.lastTexSlot;
+  bool flTex = false;
+  bool flMtx = false;
+  if (!try_fit_pnmtx_tex_and_mtx(b, mtxIdx, curMtx, curMtxGen, slotIdx, texSlot, outPreBgPopulated, flTex, flMtx)) {
+    outPrePipeSame = topoMatchesLastCfg;
+    if (is_timing_enabled()) UNLIKELY {
+      if (flMtx) ++s_drainTiming.fl_mtx;
+      else if (flTex) ++s_drainTiming.fl_tex;
+    }
+    return false;
+  }
+
+  if (!topoMatchesLastCfg) {
+    b.mixedTopology = true;
+  }
+  if (topoMatchesLastCfg || lineZero) {
+    b.pipelineDirty = g_gxState.pipelineDirty;
+    b.prim = prim;
+  }
+  b.uniFastGen = curFastUniGen;
+  b.totalVtxCount += d.vtxCount;
+  b.finalUniformDirty = g_gxState.uniformDirty;
+  if (b.allCached) {
+    batch_hash_append_cached(b.batchFh, b.batchMh, d.key, slotIdx, texSlot, stripTopo);
+  }
+  PendingPnMtxItem& item = b.items.emplace_back();
+  item.refIdx = staticPoolRefIdx;
+  item.vtxCount = d.vtxCount;
+  item.slotIdx = static_cast<u8>(slotIdx);
+  item.texSlot = static_cast<u8>(texSlot);
+  item.flags = kItemStaticPool | kItemCached | (d.indexed() ? kItemIndexed : 0u) |
+               (stripTopo ? kItemStripTopology : 0u);
+  return true;
+}
+
+static inline u64 dl_head64(const u8* dlData, u32 dlSize) noexcept {
+  u64 head64 = 0;
+  if (dlData != nullptr && dlSize > 0) {
+    if (dlSize >= 8) {
+      std::memcpy(&head64, dlData, 8);
+    } else {
+      std::memcpy(&head64, dlData, dlSize);
+    }
+  }
+  return head64;
+}
+
+static bool replay_static_dl_entry(u32 poolIdx, StaticDlEntry& entry) {
+  if (!verify_dl_vtx_state(entry.vtxStateId)) {
+    return false;
+  }
+  const u32 ptrEpoch = s_nativeGeomPtrEpoch;
+  bool allCached = true;
+  if (entry.cachedAllPtrEpoch != ptrEpoch) UNLIKELY {
+    bool allMirror = true;
+    for (u32 i = 0; i < entry.drawCount; ++i) {
+      StaticDlDraw& d = (i == 0) ? entry.draw0 : s_staticDlExtraDraws[entry.extraStart + (i - 1u)];
+      if (d.cachedPtrEpoch != ptrEpoch || d.cachedEntry == nullptr) {
+        const auto git = s_nativeGeomCache.find(d.key);
+        if (git == s_nativeGeomCache.end()) {
+          allCached = false;
+          break;
+        }
+        d.cachedEntry = &git->second;
+        d.cachedPtrEpoch = ptrEpoch;
+      }
+      allMirror &= !d.cachedEntry->cpuVerts.empty();
+    }
+    if (allCached) {
+      entry.cachedAllPtrEpoch = ptrEpoch;
+      if (allMirror) {
+        entry.flags |= kStaticEntryMirror;
+      } else {
+        entry.flags &= static_cast<u8>(~kStaticEntryMirror);
+      }
+    }
+  }
+  if (!allCached) {
+    return false;
+  }
+  const u32 mtxIdx = std::min<u32>(g_gxState.currentPnMtx, MaxPnMtx - 1);
+  const PnMtx& curMtx = g_gxState.pnMtx[mtxIdx];
+  const u32 curMtxGen = s_pnMtxGen[mtxIdx];
+  const u64 curFastUniGen = (static_cast<u64>(s_splitBpUniGen) << 32) | s_splitOthUniGen;
+  const bool hasMirror = entry.allHaveMirror();
+  const bool timing = is_timing_enabled();
+  const u32 drawCount = entry.drawCount;
+  const u32 extraStart = entry.extraStart;
+  for (u32 i = 0; i < drawCount; ++i) {
+    const u32 refIdx = (i == 0) ? poolIdx : (kStaticDrawExtraBit | (extraStart + (i - 1u)));
+    const StaticDlDraw& d =
+        (i == 0) ? s_staticDlPool[poolIdx].draw0 : s_staticDlExtraDraws[extraStart + (i - 1u)];
+    ++s_geomCacheHits;
+    bool preBg = false;
+    bool prePipeSame = false;
+    if (hasMirror && try_append_cached_static_dl_draw(refIdx, d, mtxIdx, curMtx, curMtxGen, curFastUniGen, preBg,
+                                                      prePipeSame)) {
+      if (timing) UNLIKELY ++s_drainTiming.bat_ok;
+      continue;
+    }
+    const NativeGeomEntry* ge = d.cachedEntry;
+    if (ge == nullptr || d.cachedPtrEpoch != s_nativeGeomPtrEpoch) UNLIKELY {
+      const auto cit = s_nativeGeomCache.find(d.key);
+      CHECK(cit != s_nativeGeomCache.end(), "replay_static_dl_entry: missing cached entry");
+      ge = &cit->second;
+    }
+    submit_native_gx_draw(d.gxPrim(), d.gxFmt(), d.vtxCount, s_attrLayoutPool[d.attrLayoutId].attrs,
+                          d.attrLayoutId, d.nativeStride, d.key, ge, nullptr, 0, nullptr, 0, ge->indexCount,
+                          d.indexed(), d.stripTopology(), refIdx, preBg, prePipeSame);
+  }
+  return true;
+}
+
+static void store_static_dl_entry(const void* cacheKey, const void* dlData, u32 firstDlSize, u64 head64,
+                                  const void* lastDlData, u32 lastDlSize, u64 lastHead64, uintptr_t minAddr,
+                                  uintptr_t maxEnd, u32 sizeOrCount, u32 dlGen, bool isBatch, u32 usedFmtMask,
+                                  std::vector<StaticDlDraw>& draws) {
+  if (draws.empty()) {
+    return;
+  }
+  u16 usedArrayMask = 0;
+  bool hasMutableArr = false;
+  for (u32 a = 0; a < 12; ++a) {
+    const GXAttrType at = g_gxState.vtxDesc[GX_VA_POS + a];
+    if (at == GX_INDEX8 || at == GX_INDEX16) {
+      usedArrayMask |= static_cast<u16>(1u << a);
+      const AttrArray& arr = g_gxState.arrays[GX_VA_POS + a];
+      if (arr.le && !arr.immutable) {
+        hasMutableArr = true;
+      }
+    }
+  }
+  if (hasMutableArr) {
+    return;
+  }
+
+  const u32 ptrEpoch = s_nativeGeomPtrEpoch;
+  for (auto& d : draws) {
+    const auto git = s_nativeGeomCache.find(d.key);
+    if (git == s_nativeGeomCache.end()) {
+      return;
+    }
+    d.cachedEntry = &git->second;
+    d.cachedPtrEpoch = ptrEpoch;
+    if (git->second.indexCount != 0) {
+      d.flags |= kStaticDrawIndexed;
+    } else {
+      d.flags &= static_cast<u8>(~kStaticDrawIndexed);
+    }
+  }
+
+  if (draws.size() > 255u) {
+    return;
+  }
+
+  const u32 finalEpoch = s_nativeGeomPtrEpoch;
+  bool allMirror = true;
+  for (auto& d : draws) {
+    if (d.cachedEntry == nullptr || d.cachedPtrEpoch != finalEpoch) {
+      const auto git = s_nativeGeomCache.find(d.key);
+      if (git == s_nativeGeomCache.end()) {
+        return;
+      }
+      d.cachedEntry = &git->second;
+      d.cachedPtrEpoch = finalEpoch;
+    }
+    allMirror &= !d.cachedEntry->cpuVerts.empty();
+  }
+
+  const u16 vtxStateId = intern_dl_vtx_state(current_vtx_desc_bits(), s_gxDiscArrayInvalidateGen,
+                                             usedFmtMask, usedArrayMask);
+  if (vtxStateId == UINT16_MAX) {
+    return;
+  }
+
+  if (is_timing_enabled()) UNLIKELY {
+    s_drainTiming.sdl_max_sz = std::max<u32>(s_drainTiming.sdl_max_sz, static_cast<u32>(s_staticDlIndex.size()));
+  }
+  const auto existIt = s_staticDlIndex.find(cacheKey);
+  const u32 existingIdx = (existIt != s_staticDlIndex.end()) ? existIt->second : UINT32_MAX;
+  if (existingIdx != UINT32_MAX) {
+    flush_pending_pnmtx_batch();
+  } else if (s_staticDlPool.size() >= 16384u) {
+    flush_pending_pnmtx_batch();
+    if (is_timing_enabled()) UNLIKELY ++s_drainTiming.sdl_clears;
+    clear_static_dl_cache();
+  }
+  if (s_staticDlPool.capacity() == 0) {
+    s_staticDlPool.reserve(4096);
+    s_staticDlExtraDraws.reserve(4096);
+  }
+  u32 storePoolIdx = existingIdx;
+  if (storePoolIdx == UINT32_MAX) {
+    storePoolIdx = static_cast<u32>(s_staticDlPool.size());
+    s_staticDlPool.emplace_back();
+    s_staticDlIndex.emplace(cacheKey, storePoolIdx);
+  }
+  StaticDlEntry& entry = s_staticDlPool[storePoolIdx];
+  entry.dlData = dlData;
+  entry.lastDlData = lastDlData;
+  entry.minAddr = minAddr;
+  entry.maxEnd = maxEnd;
+  entry.head64 = head64;
+  entry.lastHead64 = lastHead64;
+  entry.size = sizeOrCount;
+  entry.firstDlSize = firstDlSize;
+  entry.lastDlSize = lastDlSize;
+  entry.dlGen = dlGen;
+  entry.cachedAllPtrEpoch = finalEpoch;
+  entry.vtxStateId = vtxStateId;
+  entry.drawCount = static_cast<u8>(draws.size());
+  entry.flags = static_cast<u8>(kStaticEntryReady | (allMirror ? kStaticEntryMirror : 0u) |
+                                (isBatch ? kStaticEntryBatch : 0u) | kStaticEntryCoalesced);
+  entry.draw0 = draws[0];
+  if (draws.size() > 1) {
+    entry.extraStart = static_cast<u32>(s_staticDlExtraDraws.size());
+    for (size_t i = 1; i < draws.size(); ++i) {
+      s_staticDlExtraDraws.push_back(draws[i]);
+    }
+  } else {
+    entry.extraStart = 0;
+  }
+  auto& fastSet = s_staticDlFast[static_dl_fast_set(cacheKey)];
+  if (fastSet.ways[0].key == cacheKey) {
+    fastSet.ways[0].idxPlus1 = storePoolIdx + 1u;
+  } else {
+    fastSet.ways[1] = fastSet.ways[0];
+    fastSet.ways[0] = {cacheKey, storePoolIdx + 1u};
+  }
+}
+
+static void handle_static_dl(const u8* dlData, u32 dlSize, u32 dlGen) {
+  if (!sBbox.armed && g_gxState.cullMode == GX_CULL_ALL) {
+    return;
+  }
+
+  native_geom_sync_generation();
+
+  const u64 head64 = dl_head64(dlData, dlSize);
+
+  if (!sBbox.armed && !s_staticDlCaptureActive && dlData != nullptr && dlSize > 0) {
+    const u32 poolIdx = find_static_dl_pool_idx(dlData);
+    if (poolIdx != UINT32_MAX) {
+      StaticDlEntry& entry = s_staticDlPool[poolIdx];
+      if (entry.ready() && !entry.isBatch() && entry.dlData == dlData && entry.size == dlSize &&
+          entry.dlGen == dlGen && entry.head64 == head64 && entry.drawCount > 0 &&
+          replay_static_dl_entry(poolIdx, entry)) {
+        return;
+      }
+    }
+  }
+
+  const bool prevActive = s_staticDlCaptureActive;
+  const bool prevAborted = s_staticDlCaptureAborted;
+  auto prevDraws = std::move(s_staticDlCapturedDraws);
+  const u32 prevFmtMask = s_staticDlCapturedFmtMask;
+  const u8* prevDbgPtr = s_dbgStaticDlPtr;
+  const u32 prevDbgSize = s_dbgStaticDlSize;
+  s_dbgStaticDlPtr = dlData;
+  s_dbgStaticDlSize = dlSize;
+
+  const bool canCapture = !sBbox.armed && !prevActive && g_gxState.cullMode != GX_CULL_ALL &&
+                          dlData != nullptr && dlSize > 0;
+  s_staticDlCaptureActive = canCapture;
+  s_staticDlCaptureAborted = false;
+  s_staticDlCapturedDraws.clear();
+  s_staticDlCapturedFmtMask = 0;
+
+  process_stream(dlData, dlSize, true, false);
+  s_dbgStaticDlPtr = prevDbgPtr;
+  s_dbgStaticDlSize = prevDbgSize;
+
+  const bool aborted = s_staticDlCaptureAborted;
+  auto draws = std::move(s_staticDlCapturedDraws);
+  const u32 usedFmtMask = s_staticDlCapturedFmtMask;
+
+  s_staticDlCaptureActive = prevActive;
+  s_staticDlCaptureAborted = prevAborted;
+  s_staticDlCapturedDraws = std::move(prevDraws);
+  s_staticDlCapturedFmtMask = prevFmtMask;
+
+  if (!canCapture || aborted || draws.empty()) {
+    return;
+  }
+  store_static_dl_entry(dlData, dlData, dlSize, head64, dlData, dlSize, head64,
+                        reinterpret_cast<uintptr_t>(dlData), reinterpret_cast<uintptr_t>(dlData) + dlSize,
+                        dlSize, dlGen, /*isBatch=*/false, usedFmtMask, draws);
+}
+
+static void handle_static_dl_batch(const void* batchKey, const u8* itemsData, u32 count, u32 dlGen,
+                                   bool bigEndian) {
+  if (!sBbox.armed && g_gxState.cullMode == GX_CULL_ALL) {
+    return;
+  }
+  if (count == 0) {
+    return;
+  }
+
+  native_geom_sync_generation();
+
+  const u8* const firstPtr =
+      reinterpret_cast<const u8*>(static_cast<uintptr_t>(read_u64(itemsData, bigEndian)));
+  const u32 firstSize = read_u32(itemsData + 8u, bigEndian);
+  const u8* const lastItem = itemsData + static_cast<size_t>(count - 1u) * 12u;
+  const u8* const lastPtr =
+      reinterpret_cast<const u8*>(static_cast<uintptr_t>(read_u64(lastItem, bigEndian)));
+  const u32 lastSize = read_u32(lastItem + 8u, bigEndian);
+  const u64 firstHead64 = dl_head64(firstPtr, firstSize);
+  const u64 lastHead64 = dl_head64(lastPtr, lastSize);
+
+  if (!sBbox.armed && !s_staticDlCaptureActive && batchKey != nullptr) {
+    const u32 poolIdx = find_static_dl_pool_idx(batchKey);
+    if (poolIdx != UINT32_MAX) {
+      StaticDlEntry& entry = s_staticDlPool[poolIdx];
+      if (entry.ready() && entry.isBatch() && entry.size == count && entry.dlGen == dlGen &&
+          entry.dlData == firstPtr && entry.firstDlSize == firstSize && entry.head64 == firstHead64 &&
+          entry.lastDlData == lastPtr && entry.lastDlSize == lastSize && entry.lastHead64 == lastHead64 &&
+          entry.drawCount > 0 && replay_static_dl_entry(poolIdx, entry)) {
+        return;
+      }
+    }
+  }
+
+  const bool prevActive = s_staticDlCaptureActive;
+  const bool prevAborted = s_staticDlCaptureAborted;
+  auto prevDraws = std::move(s_staticDlCapturedDraws);
+  const u32 prevFmtMask = s_staticDlCapturedFmtMask;
+  const u8* prevDbgPtr = s_dbgStaticDlPtr;
+  const u32 prevDbgSize = s_dbgStaticDlSize;
+
+  const bool canCapture = !sBbox.armed && !prevActive && g_gxState.cullMode != GX_CULL_ALL && batchKey != nullptr;
+  s_staticDlCaptureActive = canCapture;
+  s_staticDlCaptureAborted = false;
+  s_staticDlCapturedDraws.clear();
+  s_staticDlCapturedFmtMask = 0;
+
+  uintptr_t minAddr = UINTPTR_MAX;
+  uintptr_t maxEnd = 0;
+  for (u32 i = 0; i < count; ++i) {
+    const u8* item = itemsData + static_cast<size_t>(i) * 12u;
+    const u8* subPtr = reinterpret_cast<const u8*>(static_cast<uintptr_t>(read_u64(item, bigEndian)));
+    const u32 subSize = read_u32(item + 8u, bigEndian);
+    if (subPtr != nullptr && subSize > 0) {
+      const uintptr_t p = reinterpret_cast<uintptr_t>(subPtr);
+      if (p < minAddr) minAddr = p;
+      if (p + subSize > maxEnd) maxEnd = p + subSize;
+      s_dbgStaticDlPtr = subPtr;
+      s_dbgStaticDlSize = subSize;
+      process_stream(subPtr, subSize, true, false);
+    }
+  }
+  s_dbgStaticDlPtr = prevDbgPtr;
+  s_dbgStaticDlSize = prevDbgSize;
+
+  const bool aborted = s_staticDlCaptureAborted;
+  auto draws = std::move(s_staticDlCapturedDraws);
+  const u32 usedFmtMask = s_staticDlCapturedFmtMask;
+
+  s_staticDlCaptureActive = prevActive;
+  s_staticDlCaptureAborted = prevAborted;
+  s_staticDlCapturedDraws = std::move(prevDraws);
+  s_staticDlCapturedFmtMask = prevFmtMask;
+
+  if (!canCapture || aborted || draws.empty()) {
+    return;
+  }
+  if (minAddr == UINTPTR_MAX) {
+    minAddr = 0;
+  }
+  store_static_dl_entry(batchKey, firstPtr, firstSize, firstHead64, lastPtr, lastSize, lastHead64,
+                        minAddr, maxEnd, count, dlGen, /*isBatch=*/true, usedFmtMask, draws);
 }
 
 void handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian) {
@@ -3448,6 +5591,7 @@ void handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian) {
     const auto& rv = g_gxState.renderViewport;
     if (rv.left != left || rv.top != top || rv.width != width || rv.height != height ||
         rv.znear != nearZ || rv.zfar != farZ) {
+      flush_pending_pnmtx_batch();
       set_render_viewport({
           .left = left,
           .top = top,
@@ -3457,6 +5601,9 @@ void handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian) {
           .zfar = farZ,
       });
       g_gxState.uniformDirty++;
+      ++s_curUniState.vpProjGen;
+      ++s_splitOthUniGen;
+      ++s_splitOthVpGen;
     }
   } else if (subCmd == GX_AURORA_LOAD_SCISSOR_RENDER) {
     CHECK(pos + 16 <= size, "GX_AURORA_LOAD_SCISSOR_RENDER read overrun");
@@ -3468,6 +5615,7 @@ void handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian) {
     pos += 4;
     const int32_t height = static_cast<int32_t>(read_u32(data + pos, bigEndian));
     pos += 4;
+    flush_pending_pnmtx_batch();
     set_render_scissor({left, top, width, height});
   } else if (subCmd == GX_AURORA_SET_PROJECTION_SCALE_X) {
     CHECK(pos + 4 <= size, "GX_AURORA_SET_PROJECTION_SCALE_X read overrun");
@@ -3478,6 +5626,9 @@ void handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian) {
       g_gxState.pipelineDirty++;
       g_gxState.uniformDirty++;
       g_gxState.stateDirty = true;
+      ++s_curUniState.vpProjGen;
+      ++s_splitOthUniGen;
+      ++s_splitOthProjGen;
     }
   } else if (subCmd == GX_AURORA_SET_PAPER) {
     CHECK(pos + 10 <= size, "GX_AURORA_SET_PAPER read overrun");
@@ -3503,15 +5654,21 @@ void handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian) {
     }
   } else if (subCmd == GX_AURORA_LOAD_PROJECTION_FULL) {
     CHECK(pos + 64 <= size, "GX_AURORA_LOAD_PROJECTION_FULL read overrun");
-    auto& proj = g_gxState.proj;
+    Mat4x4<float> nextProj{};
     for (int r = 0; r < 4; ++r) {
       for (int c = 0; c < 4; ++c) {
-        proj[r][c] = read_f32(data + pos, bigEndian);
+        nextProj[r][c] = read_f32(data + pos, bigEndian);
         pos += 4;
       }
     }
-    g_gxState.uniformDirty++;
-    g_gxState.stateDirty = true;
+    if (std::memcmp(&g_gxState.proj, &nextProj, sizeof(nextProj)) != 0) {
+      g_gxState.proj = nextProj;
+      g_gxState.uniformDirty++;
+      g_gxState.stateDirty = true;
+      ++s_curUniState.vpProjGen;
+      ++s_splitOthUniGen;
+      ++s_splitOthProjGen;
+    }
   } else if (subCmd >= GX_AURORA_LOAD_ARRAYBASE && subCmd <= (GX_AURORA_LOAD_ARRAYBASE | 0x0f)) {
     CHECK(pos + 13 <= size, "GX_AURORA_LOAD_ARRAYBASE read overrun");
     u32 attrIdx = subCmd - GX_AURORA_LOAD_ARRAYBASE + GX_VA_POS;
@@ -3520,20 +5677,27 @@ void handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian) {
     pos += 8;
     u32 arraySize = read_u32(data + pos, bigEndian);
     pos += 4;
-    bool le = data[pos] == 1;
+    const u8 leByte = data[pos];
+    const bool le = (leByte != 0);
+    const bool immutable = (leByte == 2);
     pos += 1;
 
     auto& array = g_gxState.arrays[attrIdx];
     const auto newData = reinterpret_cast<void*>(arrayAddr);
-    if (array.data != newData || array.size != arraySize || array.le != le) {
+    if (array.data != newData || array.size != arraySize || array.le != le || array.immutable != immutable) {
       if (array.le != le || (array.data == nullptr) != (newData == nullptr)) {
         g_gxState.pipelineDirty++;
         s_vatGen++;
       }
       ++s_gxArrayBindGen;
+      if (attrIdx >= GX_VA_POS && attrIdx < GX_VA_POS + 12) {
+        ++s_arrayStateGen[attrIdx - GX_VA_POS];
+      }
+      ++s_vtxStateDirtyGen;
       array.data = newData;
       array.size = arraySize;
       array.le = le;
+      array.immutable = immutable;
       // Only drop the cached upload when the backing array actually changes.
       array.cachedRange = {};
       g_gxState.stateDirty = true;
@@ -3543,62 +5707,90 @@ void handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian) {
     const auto texMapId = data[pos];
     pos += 1;
     CHECK(texMapId < MaxTextures, "invalid texture map id {}", texMapId);
-    g_gxState.textureDirty++;
     auto& slot = g_gxState.loadedTextures[texMapId];
-    slot.data = reinterpret_cast<const void*>(read_u64(data + pos, bigEndian));
+    const void* const newData = reinterpret_cast<const void*>(read_u64(data + pos, bigEndian));
     pos += 8;
     const u32 newWidth = read_u32(data + pos, bigEndian);
     pos += 4;
     const u32 newHeight = read_u32(data + pos, bigEndian);
     pos += 4;
-    if (slot.mWidth != newWidth || slot.mHeight != newHeight) {
-      slot.mWidth = newWidth;
-      slot.mHeight = newHeight;
-      g_gxState.uniformDirty++;
-    }
-    slot.mFormat = static_cast<GXTexFmt>(read_u32(data + pos, bigEndian));
+    const GXTexFmt newFormat = static_cast<GXTexFmt>(read_u32(data + pos, bigEndian));
     pos += 4;
-    slot.tlut = static_cast<GXTlut>(read_u32(data + pos, bigEndian));
+    const GXTlut newTlut = static_cast<GXTlut>(read_u32(data + pos, bigEndian));
     pos += 4;
-    if (data[pos] != 0) {
-      slot.flags |= 1u;
-    } else {
-      slot.flags &= ~1u;
-    }
+    const bool newMip = data[pos] != 0;
     pos += 1;
-    slot.texObjId = read_u32(data + pos, bigEndian);
+    const u32 newTexObjId = read_u32(data + pos, bigEndian);
     pos += 4;
-    slot.texDataVersion = read_u32(data + pos, bigEndian);
+    const u32 newTexDataVersion = read_u32(data + pos, bigEndian);
     pos += 4;
-    slot.set_no_cache(false); // Reset no-cache flag
+    const bool dimChanged = slot.mWidth != newWidth || slot.mHeight != newHeight;
+    const bool metaChanged = slot.no_cache() || slot.data != newData || dimChanged || slot.mFormat != newFormat ||
+                             slot.tlut != newTlut || ((slot.flags & 1u) != 0) != newMip ||
+                             slot.texObjId != newTexObjId || slot.texDataVersion != newTexDataVersion;
     const u8 bit = static_cast<u8>(1u << texMapId);
-    const u8 sdfMaps = g_gxState.paperSdf != nullptr && slot.data == g_gxState.paperSdf
+    const u8 sdfMaps = g_gxState.paperSdf != nullptr && newData == g_gxState.paperSdf
                            ? static_cast<u8>(g_gxState.paperSdfMaps | bit)
                            : static_cast<u8>(g_gxState.paperSdfMaps & ~bit);
-    if (sdfMaps != g_gxState.paperSdfMaps) {
-      g_gxState.paperSdfMaps = sdfMaps;
-      g_gxState.pipelineDirty++;
+    const bool sdfChanged = sdfMaps != g_gxState.paperSdfMaps;
+    if (metaChanged || sdfChanged) {
+      if (metaChanged) {
+        g_gxState.textureDirty++;
+      }
+      if (dimChanged) {
+        g_gxState.uniformDirty++;
+        ++s_curUniState.texDimGen[texMapId];
+        ++s_splitOthUniGen;
+        ++s_splitOthTexDimGen;
+      }
+      slot.data = newData;
+      slot.mWidth = newWidth;
+      slot.mHeight = newHeight;
+      slot.mFormat = newFormat;
+      slot.tlut = newTlut;
+      if (newMip) {
+        slot.flags |= 1u;
+      } else {
+        slot.flags &= ~1u;
+      }
+      slot.texObjId = newTexObjId;
+      slot.texDataVersion = newTexDataVersion;
+      slot.set_no_cache(false); // Reset no-cache flag
+      if (sdfChanged) {
+        g_gxState.paperSdfMaps = sdfMaps;
+        g_gxState.pipelineDirty++;
+      }
+      g_gxState.stateDirty = true;
     }
-    g_gxState.stateDirty = true;
   } else if (subCmd == GX_AURORA_LOAD_TLUT) {
     CHECK(pos + 23 <= size, "GX_AURORA_LOAD_TLUT read overrun");
     const auto idx = data[pos];
     pos += 1;
     CHECK(idx < MaxTluts, "invalid tlut slot {}", idx);
-    g_gxState.textureDirty++;
-    auto& slot = g_gxState.loadedTluts[idx];
-    slot.data = reinterpret_cast<const void*>(read_u64(data + pos, bigEndian));
+    const void* tlutData = reinterpret_cast<const void*>(read_u64(data + pos, bigEndian));
     pos += 8;
-    slot.format = static_cast<GXTlutFmt>(read_u32(data + pos, bigEndian));
+    const auto fmt = static_cast<GXTlutFmt>(read_u32(data + pos, bigEndian));
     pos += 4;
-    slot.numEntries = read_u16(data + pos, bigEndian);
+    const u16 numEntries = read_u16(data + pos, bigEndian);
     pos += 2;
-    slot.tlutObjId = read_u32(data + pos, bigEndian);
+    const u32 tlutObjId = read_u32(data + pos, bigEndian);
     pos += 4;
-    slot.tlutDataVersion = read_u32(data + pos, bigEndian);
+    const u32 tlutDataVersion = read_u32(data + pos, bigEndian);
     pos += 4;
-    slot.set_no_cache(false); // Reset no-cache flag
-    g_gxState.stateDirty = true;
+    auto& slot = g_gxState.loadedTluts[idx];
+    const bool tlutChanged = slot.no_cache() || slot.data != tlutData || slot.format != fmt ||
+                             slot.numEntries != numEntries || slot.tlutObjId != tlutObjId ||
+                             slot.tlutDataVersion != tlutDataVersion;
+    if (tlutChanged) {
+      g_gxState.textureDirty++;
+      slot.data = tlutData;
+      slot.format = fmt;
+      slot.numEntries = numEntries;
+      slot.tlutObjId = tlutObjId;
+      slot.tlutDataVersion = tlutDataVersion;
+      slot.set_no_cache(false); // Reset no-cache flag
+      g_gxState.stateDirty = true;
+    }
   } else if (subCmd == GX2_SET_POLYGON_OFFSET) {
     CHECK(pos + 20 <= size, "GX2_SET_POLYGON_OFFSET read overrun");
     g_gxState.frontOffset = read_f32(data + pos, bigEndian);
@@ -3638,6 +5830,7 @@ void handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian) {
     g_gxState.texCopyDest = reinterpret_cast<const void*>(read_u64(data + pos, bigEndian));
     pos += 8;
   } else if (subCmd == GX_AURORA_REQUEST_DEPTH_SNAPSHOT) {
+    flush_pending_pnmtx_batch();
     gfx::depth_peek::request_snapshot();
   } else if (subCmd == GX_AURORA_BEGIN_OFFSCREEN) {
     CHECK(pos + 8 <= size, "GX_AURORA_BEGIN_OFFSCREEN read overrun");
@@ -3645,15 +5838,23 @@ void handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian) {
     pos += 4;
     const u32 height = read_u32(data + pos, bigEndian);
     pos += 4;
+    flush_pending_pnmtx_batch();
     gfx::begin_offscreen(width, height);
     g_gxState.pipelineDirty++;
     g_gxState.uniformDirty++;
     g_gxState.stateDirty = true;
+    ++s_curUniState.offGen;
+    ++s_splitOthUniGen;
+    ++s_splitOthOffGen;
   } else if (subCmd == GX_AURORA_END_OFFSCREEN) {
+    flush_pending_pnmtx_batch();
     gfx::end_offscreen();
     g_gxState.pipelineDirty++;
     g_gxState.uniformDirty++;
     g_gxState.stateDirty = true;
+    ++s_curUniState.offGen;
+    ++s_splitOthUniGen;
+    ++s_splitOthOffGen;
   } else if (subCmd == GX_AURORA_DESTROY_TEXOBJ) {
     CHECK(pos + 4 <= size, "GX_AURORA_DESTROY_TEXOBJ read overrun");
     evict_texture_object(read_u32(data + pos, bigEndian));
@@ -3664,12 +5865,14 @@ void handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian) {
     pos += 4;
   } else if (subCmd == GX_AURORA_DESTROY_COPY_TEX) {
     CHECK(pos + 8 <= size, "GX_AURORA_DESTROY_COPY_TEX read overrun");
+    flush_pending_pnmtx_batch();
     evict_copy_texture(reinterpret_cast<const void*>(read_u64(data + pos, bigEndian)));
     pos += 8;
   } else if (subCmd == GX_AURORA_ALIAS_COPY_TEX) {
     CHECK(pos + 16 <= size, "GX_AURORA_ALIAS_COPY_TEX read overrun");
     const auto* src = reinterpret_cast<const void*>(read_u64(data + pos, bigEndian));
     const auto* dest = reinterpret_cast<const void*>(read_u64(data + pos + 8, bigEndian));
+    flush_pending_pnmtx_batch();
     alias_copy_texture(src, dest);
     pos += 16;
   } else if (subCmd == GX_AURORA_FORGET_MEMORY) {
@@ -3683,8 +5886,33 @@ void handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian) {
       const uintptr_t p = reinterpret_cast<uintptr_t>(kv.first);
       return p >= loAddr && p < hiAddr;
     });
+    bool erasedDl = false;
+    absl::erase_if(s_staticDlIndex, [loAddr, hiAddr, &erasedDl](const auto& kv) {
+      const uintptr_t p = reinterpret_cast<uintptr_t>(kv.first);
+      bool hit = (p >= loAddr && p < hiAddr);
+      if (!hit && kv.second < s_staticDlPool.size()) {
+        const StaticDlEntry& e = s_staticDlPool[kv.second];
+        if (e.isBatch() && e.maxEnd > e.minAddr) {
+          hit = (e.minAddr < hiAddr && e.maxEnd > loAddr);
+        }
+      }
+      if (hit) {
+        if (kv.second < s_staticDlPool.size()) {
+          s_staticDlPool[kv.second].flags = 0;
+          s_staticDlPool[kv.second].drawCount = 0;
+        }
+        erasedDl = true;
+        return true;
+      }
+      return false;
+    });
+    if (erasedDl) {
+      flush_pending_pnmtx_batch();
+      invalidate_static_dl_fast();
+    }
     ++s_gxDiscArrayInvalidateGen;
     ++s_gxArrayBindGen;
+    ++s_vtxStateDirtyGen;
     pos += 16;
   } else if (subCmd == GX_AURORA_MOVE_MEMORY) {
     CHECK(pos + 24 <= size, "GX_AURORA_MOVE_MEMORY read overrun");
@@ -3694,10 +5922,12 @@ void handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian) {
     move_memory(from, to, static_cast<size_t>(sz));
     ++s_gxDiscArrayInvalidateGen;
     ++s_gxArrayBindGen;
+    ++s_vtxStateDirtyGen;
     pos += 24;
   } else if (subCmd == GX_AURORA_INVAL_DISC_ARRAYS) {
     ++s_gxDiscArrayInvalidateGen;
     ++s_gxArrayBindGen;
+    ++s_vtxStateDirtyGen;
   } else if (subCmd == GX_AURORA_DRAW_SIZED) {
     CHECK(pos + 5 <= size, "GX_AURORA_DRAW_SIZED read overrun");
     u8 cmd = data[pos];
@@ -3753,17 +5983,54 @@ void handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian) {
     }
     if (indexCount != 0 && g_gxState.cullMode != GX_CULL_ALL) {
       if (!try_native_draw_indexed(fmt, vtxCount, vtxData, vtxSize, idxData, idxBytes, indexCount)) {
+        if (s_staticDlCaptureActive) {
+          s_staticDlCaptureAborted = true;
+        }
+        flush_pending_pnmtx_batch();
         const gfx::Range idxRange = gfx::push_indices(idxData, idxBytes, 4);
         const gfx::Range vertRange = gfx::push_verts(vtxData, totalVtxBytes, 4);
         push_gx_draw(prim, fmt, vtxCount, vertRange, idxRange, indexCount);
       }
     }
+  } else if (subCmd == GX_AURORA_CALL_STATIC_DL) {
+    CHECK(pos + 16 <= size, "GX_AURORA_CALL_STATIC_DL read overrun");
+    const u64 dlAddr = read_u64(data + pos, bigEndian);
+    pos += 8;
+    const u32 dlSize = read_u32(data + pos, bigEndian);
+    pos += 4;
+    const u32 dlGen = read_u32(data + pos, bigEndian);
+    pos += 4;
+    {
+      DrainScopeTimer _t_sdl(s_drainTiming.ms_static_dl);
+      if (is_timing_enabled()) UNLIKELY ++s_drainTiming.sdl_calls;
+      handle_static_dl(reinterpret_cast<const u8*>(static_cast<uintptr_t>(dlAddr)), dlSize, dlGen);
+    }
+  } else if (subCmd == GX_AURORA_CALL_STATIC_DL_BATCH) {
+    CHECK(pos + 16 <= size, "GX_AURORA_CALL_STATIC_DL_BATCH header overrun");
+    const u64 batchAddr = read_u64(data + pos, bigEndian);
+    pos += 8;
+    const u32 count = read_u32(data + pos, bigEndian);
+    pos += 4;
+    const u32 dlGen = read_u32(data + pos, bigEndian);
+    pos += 4;
+    CHECK(count <= (size - pos) / 12u, "GX_AURORA_CALL_STATIC_DL_BATCH items overrun");
+    const u8* itemsData = data + pos;
+    pos += count * 12u;
+    {
+      DrainScopeTimer _t_sdl(s_drainTiming.ms_static_dl);
+      if (is_timing_enabled()) UNLIKELY ++s_drainTiming.sdl_calls;
+      handle_static_dl_batch(reinterpret_cast<const void*>(static_cast<uintptr_t>(batchAddr)), itemsData, count, dlGen,
+                             bigEndian);
+    }
   } else if (subCmd == GX_AURORA_DEBUG_GROUP_PUSH) {
+    flush_pending_pnmtx_batch();
     auto label = read_string(data, pos, size, bigEndian);
     gfx::push_debug_group(std::move(label));
   } else if (subCmd == GX_AURORA_DEBUG_GROUP_POP) {
+    flush_pending_pnmtx_batch();
     pop_debug_group();
   } else if (subCmd == GX_AURORA_DEBUG_MARKER_INSERT) {
+    flush_pending_pnmtx_batch();
     auto label = read_string(data, pos, size, bigEndian);
     gfx::insert_debug_marker(std::move(label));
   }

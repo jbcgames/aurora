@@ -84,6 +84,8 @@ struct BakedState {
   uint32_t stencilFail = 0;
   uint32_t stencilDepthFail = 0;
   uint32_t stencilPass = 0;
+
+  bool operator==(const BakedState&) const = default;
 };
 
 // Sentinel `vertexLayout` value marking an RmlUi geometry pipeline (interleaved
@@ -120,6 +122,8 @@ struct BindingSet {
   std::array<TextureBinding, kMaxTextureBindings> textures{};
   std::array<BufferBinding, kMaxBufferBindings> buffers{};
   uint8_t bufferCount = 0;
+  uint8_t activeTexMask = 0;
+  bool useActiveTexMask = false;
 };
 
 } // namespace aurora::gl

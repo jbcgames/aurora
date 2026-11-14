@@ -1,6 +1,7 @@
 #include "state.hpp"
 
 #include <array>
+#include <bit>
 #include <cstring>
 
 namespace aurora::gl {
@@ -140,6 +141,7 @@ struct Shadow {
 
   std::array<TextureUnit, kMaxTextureBindings> textures;
   std::array<UboBinding, kMaxBufferBindings> ubos;
+  uint32_t dirtyTexMask;
 };
 
 Shadow s;
@@ -174,6 +176,7 @@ void reset_state_cache() noexcept { invalidate(); }
 
 void invalidate_texture_bindings() noexcept {
   s.activeUnit = kInvalidId;
+  s.dirtyTexMask = 0xFFu;
   for (auto& u : s.textures) {
     u.texture = kInvalidId;
     u.sampler = kInvalidId;
@@ -184,6 +187,7 @@ void note_texture_destroyed(GLuint texture) noexcept {
   if (texture == 0) {
     return;
   }
+  s.dirtyTexMask = 0xFFu;
   for (auto& u : s.textures) {
     if (u.texture == texture) {
       u.texture = 0; // the delete reverted the real binding to 0
@@ -195,6 +199,7 @@ void note_sampler_destroyed(GLuint sampler) noexcept {
   if (sampler == 0) {
     return;
   }
+  s.dirtyTexMask = 0xFFu;
   for (auto& u : s.textures) {
     if (u.sampler == sampler) {
       u.sampler = 0;
@@ -339,6 +344,16 @@ void bind_texture_unit(uint32_t unit, GLuint texture, GLuint sampler) {
   if (u.sampler != sampler) {
     gl.BindSampler(unit, sampler);
     u.sampler = sampler;
+  }
+  s.dirtyTexMask &= ~(1u << unit);
+}
+
+void bind_texture_set(const BindingSet::TextureBinding* textures, uint32_t activeMask) {
+  uint32_t mask = (activeMask | s.dirtyTexMask) & 0xFFu;
+  while (mask != 0) {
+    const uint32_t i = static_cast<uint32_t>(std::countr_zero(mask));
+    mask &= (mask - 1u);
+    bind_texture_unit(i, textures[i].texture, textures[i].sampler);
   }
 }
 

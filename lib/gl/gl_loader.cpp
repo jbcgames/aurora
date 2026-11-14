@@ -282,6 +282,7 @@ bool load(ProcAddressFn getProc) {
   OPT(eglDestroySyncKHR, "eglDestroySyncKHR")
   OPT(eglClientWaitSyncKHR, "eglClientWaitSyncKHR")
   OPT(eglWaitSyncKHR, "eglWaitSyncKHR")
+  OPT(eglSwapInterval, "eglSwapInterval")
   OPT(glEGLImageTargetTexture2DOES, "glEGLImageTargetTexture2DOES")
 
 #undef REQ

@@ -14,9 +14,8 @@ void GXSetScissor(u32 left, u32 top, u32 width, u32 height) {
   SET_REG_FIELD(0, __gx->suScis1, 11, 0, bm);
   SET_REG_FIELD(0, __gx->suScis1, 11, 12, rt);
 
-  GX_WRITE_RAS_REG(__gx->suScis0);
-  GX_WRITE_RAS_REG(__gx->suScis1);
-  __gx->bpSent = 1;
+  __gx_write_shadow_ras_pair(__gx->suScis0, __gx->suScis1, __gxShadow.suScis0, __gxShadow.suScis1,
+                             __gxShadow.suScisEpoch);
 }
 
 void GXSetScissorBoxOffset(s32 x_off, s32 y_off) {
@@ -43,7 +42,7 @@ void GXSetCullMode(GXCullMode mode) {
 }
 
 void GXSetClipMode(GXClipMode mode) {
-  GX_WRITE_XF_REG(5, mode);
+  __gx_write_shadow_xf(5, static_cast<u32>(mode), __gxShadow.xfClipMode, __gxShadow.xfClipModeEpoch);
   __gx->bpSent = 1;
 }
 
@@ -59,5 +58,9 @@ void GXSetCoPlanar(GXBool enable) {
 
   // immediately flush
   GX_WRITE_RAS_REG(__gx->genMode);
+  if (!aurora::gx::fifo::in_display_list()) {
+    __gxShadow.genModeEpoch = __gxShadow.epoch;
+    __gxShadow.genMode = __gx->genMode;
+  }
 }
 }

@@ -91,6 +91,11 @@ bool in_display_list();
 // Drain the internal FIFO buffer through the command processor
 void drain();
 
+// Async end-of-frame drain: swaps FIFO slots so the command processor can drain the
+// finished frame on a dedicated worker thread concurrently with presentation.
+void drain_async_start();
+double drain_async_wait();
+
 // Internal buffer inspection
 const uint8_t* get_buffer_data();
 uint32_t get_buffer_size();

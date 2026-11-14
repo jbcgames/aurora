@@ -141,7 +141,11 @@ void AuroraCaptureJoin(uint8_t join) { (void)join; }
 uint64_t AuroraFifoStreamPos(void) { return 0; }
 void AuroraSetFifoErrorCallback(AuroraFifoErrorCallback callback) { (void)callback; }
 void AuroraSetDrawProbe(AuroraDrawProbeFn fn) { (void)fn; }
-void AuroraGXSync(void) {}
+void AuroraGXSync(void) {
+  if (!aurora::gx::fifo::in_display_list() && aurora::gfx::in_frame()) {
+    aurora::gx::fifo::drain();
+  }
+}
 
 void GXSetDrawClassAurora(uint8_t drawClass) { (void)drawClass; }
 void GXSceneEndAurora(void) {}
@@ -176,6 +180,9 @@ void AuroraForgetMemory(const void* lo, const void* hi) {
   if (lo == nullptr || hi <= lo) {
     return;
   }
+  __gx_shadow_invalidate_tex();
+  __gx_shadow_invalidate_arrays();
+  __gx_dl_forget_memory(lo, hi);
   GX_WRITE_AURORA(GX_AURORA_FORGET_MEMORY);
   GX_WRITE_U64(reinterpret_cast<u64>(lo));
   GX_WRITE_U64(reinterpret_cast<u64>(hi));
@@ -185,6 +192,9 @@ void AuroraMoveMemory(const void* from, const void* to, u32 size) {
   if (from == nullptr || to == nullptr || from == to || size == 0) {
     return;
   }
+  __gx_shadow_invalidate_tex();
+  __gx_shadow_invalidate_arrays();
+  __gx_dl_invalidate_cache();
   GX_WRITE_AURORA(GX_AURORA_MOVE_MEMORY);
   GX_WRITE_U64(reinterpret_cast<u64>(from));
   GX_WRITE_U64(reinterpret_cast<u64>(to));
@@ -192,6 +202,8 @@ void AuroraMoveMemory(const void* from, const void* to, u32 size) {
 }
 
 void AuroraInvalidateDiscArrays(void) {
+  __gx_shadow_invalidate_arrays();
+  __gx_dl_invalidate_cache();
   GX_WRITE_AURORA(GX_AURORA_INVAL_DISC_ARRAYS);
 }
 
@@ -248,6 +260,7 @@ void AuroraSetDrawsBlocking(bool blocking) {
 }
 
 void AuroraFlushTextureCaches(void) {
+  __gx_shadow_invalidate_tex();
   aurora::gx::clear_static_texture_cache();
   aurora::gx::clear_copy_texture_cache();
 }

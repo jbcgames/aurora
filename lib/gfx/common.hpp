@@ -139,6 +139,7 @@ void queue_texture_copy(TextureCopyView src, TextureCopyView dst, gl::Extent3D s
 void begin_offscreen(uint32_t width, uint32_t height);
 void end_offscreen();
 bool is_offscreen() noexcept;
+bool in_frame() noexcept;
 uint32_t get_sample_count() noexcept;
 void clear_caches() noexcept;
 
@@ -205,6 +206,8 @@ bool bind_pipeline(PipelineRef ref, gl::PassEncoder& pass);
 // in; the cache keys on its content hash.
 BindGroupRef bind_group_ref(const gl::BindingSet& bindingSet);
 const gl::BindingSet& find_bind_group(BindGroupRef id);
+uint32_t bind_group_cache_gen() noexcept;
+bool touch_bind_group(BindGroupRef id) noexcept;
 
 gl::Sampler sampler_ref(const gl::SamplerDescriptor& descriptor);
 

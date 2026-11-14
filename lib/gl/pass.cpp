@@ -4,6 +4,9 @@
 #include "state.hpp"
 
 #include <absl/container/flat_hash_map.h>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 
 // The PassEncoder issues GL directly against the render worker's current context
 // (aurora's own command list already provides the WebGPU CommandEncoder ordering).
@@ -146,10 +149,29 @@ void bind_gx_layout_fallback(GxVaoLayout& layout, uint32_t mask, const Buffer& v
   layout.fallbackBaseOffset = baseOffset;
 }
 
+struct FastGxVaoCache {
+  struct Entry {
+    uint64_t key = 0;
+    GxVaoLayout* layout = nullptr;
+  };
+  Entry entries[64]{};
+};
+FastGxVaoCache s_fastGxVao{};
+
+void reset_fast_gx_vao_cache() noexcept { s_fastGxVao = {}; }
+
 GxVaoLayout& get_or_create_gx_layout(uint32_t mask, const Buffer& vbuf, const Buffer& ibuf) {
   const uint64_t key = (static_cast<uint64_t>(vbuf.id) << 32) | mask;
+  const size_t slot = static_cast<size_t>(key ^ (key >> 6) ^ (key >> 32)) & 63u;
+  auto& cached = s_fastGxVao.entries[slot];
+  if (cached.layout != nullptr && cached.key == key) {
+    return *cached.layout;
+  }
+
   auto it = g_gxVaoCache.find(key);
   if (it != g_gxVaoCache.end()) {
+    cached.key = key;
+    cached.layout = &it->second;
     return it->second;
   }
 
@@ -188,6 +210,10 @@ GxVaoLayout& get_or_create_gx_layout(uint32_t mask, const Buffer& vbuf, const Bu
   }
 
   auto res = g_gxVaoCache.emplace(key, GxVaoLayout{.vao = vao, .stride = stride, .ibufId = ibuf.id});
+  // Reset TLS/static pointers since emplace() may rehash g_gxVaoCache.
+  s_fastGxVao = {};
+  s_fastGxVao.entries[slot].key = key;
+  s_fastGxVao.entries[slot].layout = &res.first->second;
   return res.first->second;
 }
 
@@ -230,6 +256,7 @@ void reset_pass_vao_cache() noexcept {
     }
   }
   g_gxVaoCache.clear();
+  reset_fast_gx_vao_cache();
   for (const auto& [_, vao] : g_vaoCache) {
     if (vao != 0) {
       gl.DeleteVertexArrays(1, &vao);
@@ -243,10 +270,18 @@ void reset_pass_vao_cache() noexcept {
 }
 
 void PassEncoder::SetPipeline(const Pipeline& pipeline) {
+  if (!m_hasPipeline || m_pipeline.program != pipeline.program) {
+    use_program(pipeline.program);
+  }
+  if (!m_hasPipeline || !(m_pipeline.state == pipeline.state)) {
+    apply_baked_state(pipeline.state);
+  }
   m_pipeline = pipeline;
   m_hasPipeline = true;
-  use_program(pipeline.program);
-  apply_baked_state(pipeline.state);
+}
+
+void PassEncoder::SetUniformBuffer0(GLuint buffer, uint32_t offset, uint32_t size) {
+  bind_uniform_range(0, buffer, offset, size);
 }
 
 void PassEncoder::SetBindGroup(uint32_t index, const BindingSet& set, size_t dynamicOffsetCount,
@@ -255,9 +290,7 @@ void PassEncoder::SetBindGroup(uint32_t index, const BindingSet& set, size_t dyn
   if (set.bufferCount == 0) {
     // Texture group (GX group 2 / RmlUi): unit i == GX slot i (S3). Sampler uniforms
     // were bound to these units at link time.
-    for (uint32_t i = 0; i < kMaxTextureBindings; ++i) {
-      bind_texture_unit(i, set.textures[i].texture, set.textures[i].sampler);
-    }
+    bind_texture_set(set.textures.data(), set.useActiveTexMask ? set.activeTexMask : 0xFFu);
     return;
   }
   // Uniform group (GX group 1): one buffer bound with a per-draw dynamic offset.
@@ -313,11 +346,77 @@ void PassEncoder::SetStencilReference(uint32_t reference) {
   set_stencil_reference(reference);
 }
 
+static uint32_t s_passStatDraws = 0;
+static uint32_t s_passStatDrawArrays = 0;
+static uint32_t s_passStatDrawIdx = 0;
+static uint32_t s_passStatFallback = 0;
+static uint32_t s_passStatBase0 = 0;
+static uint32_t s_passStatBaseN = 0;
+static uint32_t s_passStatEabBind = 0;
+static uint32_t s_passStatPr = 0;
+static uint32_t s_passStatSlow = 0;
+static double s_passStatLookupMs = 0.0;
+static double s_passStatGlMs = 0.0;
+static double s_passStatArrMs = 0.0;
+static double s_passStatB0Ms = 0.0;
+static double s_passStatBNMs = 0.0;
+static double s_passStatPrMs = 0.0;
+static double s_passStatMaxMs = 0.0;
+
+static inline bool pass_timing_detail() noexcept {
+  static const bool enabled = std::getenv("TTYD_TIMING_DETAIL") != nullptr;
+  return enabled;
+}
+
+static inline void pass_stat_tick(bool isIdx, bool fallback, bool base0, bool eabBind, bool pr,
+                                  double lookupMs, double glMs) {
+  ++s_passStatDraws;
+  if (isIdx) ++s_passStatDrawIdx; else { ++s_passStatDrawArrays; s_passStatArrMs += glMs; }
+  if (fallback) ++s_passStatFallback;
+  if (isIdx && !fallback) {
+    if (base0) { ++s_passStatBase0; s_passStatB0Ms += glMs; }
+    else { ++s_passStatBaseN; s_passStatBNMs += glMs; }
+  }
+  if (pr) { ++s_passStatPr; s_passStatPrMs += glMs; }
+  if (eabBind) ++s_passStatEabBind;
+  if (glMs > 0.05) ++s_passStatSlow;
+  if (glMs > s_passStatMaxMs) s_passStatMaxMs = glMs;
+  s_passStatLookupMs += lookupMs;
+  s_passStatGlMs += glMs;
+  if (s_passStatDraws >= 470) {
+    std::fprintf(stderr,
+                 "[PASS-DETAIL/470d] arr=%u(%.2fms) b0=%u(%.2fms) bN=%u(%.2fms) pr=%u(%.2fms) fall=%u eab=%u slow=%u max=%.2fms lookup=%.2fms gl=%.2fms\n",
+                 s_passStatDrawArrays, s_passStatArrMs, s_passStatBase0, s_passStatB0Ms,
+                 s_passStatBaseN, s_passStatBNMs, s_passStatPr, s_passStatPrMs,
+                 s_passStatFallback, s_passStatEabBind, s_passStatSlow, s_passStatMaxMs,
+                 s_passStatLookupMs, s_passStatGlMs);
+    s_passStatDraws = 0;
+    s_passStatDrawArrays = 0;
+    s_passStatDrawIdx = 0;
+    s_passStatFallback = 0;
+    s_passStatBase0 = 0;
+    s_passStatBaseN = 0;
+    s_passStatEabBind = 0;
+    s_passStatPr = 0;
+    s_passStatSlow = 0;
+    s_passStatLookupMs = 0.0;
+    s_passStatGlMs = 0.0;
+    s_passStatArrMs = 0.0;
+    s_passStatB0Ms = 0.0;
+    s_passStatBNMs = 0.0;
+    s_passStatPrMs = 0.0;
+    s_passStatMaxMs = 0.0;
+  }
+}
+
 void PassEncoder::Draw(uint32_t vertexCount, uint32_t instanceCount, uint32_t firstVertex, uint32_t firstInstance) {
   (void)firstInstance;
   if (!m_hasPipeline || m_pipeline.program == 0 || vertexCount == 0) {
     return;
   }
+  const bool logDetail = pass_timing_detail();
+  const auto t0 = logDetail ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+  bool usedFallback = false;
   if (m_pipeline.vertexLayout == kRmlGeometryVertexLayout) {
     bind_rml_layout(m_vertexBuffer, m_vertexOffset, m_indexBuffer);
   } else if (m_pipeline.vertexLayout != 0) {
@@ -327,17 +426,25 @@ void PassEncoder::Draw(uint32_t vertexCount, uint32_t instanceCount, uint32_t fi
       firstVertex += static_cast<uint32_t>(m_vertexOffset / layout.stride);
     } else {
       bind_gx_layout_fallback(layout, m_pipeline.vertexLayout, m_vertexBuffer, m_vertexOffset, m_indexBuffer);
+      usedFallback = true;
     }
   } else {
     // Attribute-less draw (clear / present / RmlUi fullscreen triangle via gl_VertexID).
     bind_vertex_array(0);
   }
+  const auto t1 = logDetail ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
   const GLenum mode = topology_gl(m_pipeline.state.topology);
   if (instanceCount > 1) {
     gl.DrawArraysInstanced(mode, static_cast<GLint>(firstVertex), static_cast<GLsizei>(vertexCount),
                            static_cast<GLsizei>(instanceCount));
   } else {
     gl.DrawArrays(mode, static_cast<GLint>(firstVertex), static_cast<GLsizei>(vertexCount));
+  }
+  if (logDetail) [[unlikely]] {
+    const auto t2 = std::chrono::steady_clock::now();
+    pass_stat_tick(false, usedFallback, false, false, m_pipeline.state.primitiveRestart,
+                   std::chrono::duration<double, std::milli>(t1 - t0).count(),
+                   std::chrono::duration<double, std::milli>(t2 - t1).count());
   }
 }
 
@@ -348,6 +455,8 @@ void PassEncoder::DrawIndexed(uint32_t indexCount, uint32_t instanceCount, uint3
   if (!m_hasPipeline || m_pipeline.program == 0 || indexCount == 0) {
     return;
   }
+  const bool logDetail = pass_timing_detail();
+  const auto t0 = logDetail ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
   const GLenum mode = topology_gl(m_pipeline.state.topology);
   const bool u32 = m_indexFormat == IndexFormat::Uint32;
   const GLenum idxType = u32 ? GL_UNSIGNED_INT : GL_UNSIGNED_SHORT;
@@ -355,6 +464,9 @@ void PassEncoder::DrawIndexed(uint32_t indexCount, uint32_t instanceCount, uint3
   const uintptr_t idxBytes = m_indexOffset + static_cast<uintptr_t>(firstIndex) * (u32 ? 4u : 2u);
   const auto* idxPtr = reinterpret_cast<const void*>(idxBytes);
 
+  bool usedFallback = false;
+  bool base0 = false;
+  bool eabBind = false;
   if (m_pipeline.vertexLayout == kRmlGeometryVertexLayout) {
     bind_rml_layout(m_vertexBuffer, m_vertexOffset, m_indexBuffer);
   } else {
@@ -367,26 +479,43 @@ void PassEncoder::DrawIndexed(uint32_t indexCount, uint32_t instanceCount, uint3
       if (m_indexBuffer.id != 0 && layout.ibufId != m_indexBuffer.id) {
         gl.BindBuffer(GL_ELEMENT_ARRAY_BUFFER, m_indexBuffer.id);
         layout.ibufId = m_indexBuffer.id;
+        eabBind = true;
       }
       const GLint baseVert = m_vertexOffset == 0 ? 0 : static_cast<GLint>(m_vertexOffset / layout.stride);
+      base0 = (baseVert == 0);
       if (baseVert != 0) {
+        const auto t1 = logDetail ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         if (instanceCount > 1) {
           gl.DrawElementsInstancedBaseVertex(mode, static_cast<GLsizei>(indexCount), idxType, idxPtr,
                                              static_cast<GLsizei>(instanceCount), baseVert);
         } else {
           gl.DrawElementsBaseVertex(mode, static_cast<GLsizei>(indexCount), idxType, idxPtr, baseVert);
         }
+        if (logDetail) [[unlikely]] {
+          const auto t2 = std::chrono::steady_clock::now();
+          pass_stat_tick(true, false, false, eabBind, m_pipeline.state.primitiveRestart,
+                         std::chrono::duration<double, std::milli>(t1 - t0).count(),
+                         std::chrono::duration<double, std::milli>(t2 - t1).count());
+        }
         return;
       }
     } else {
       bind_gx_layout_fallback(layout, m_pipeline.vertexLayout, m_vertexBuffer, m_vertexOffset, m_indexBuffer);
+      usedFallback = true;
     }
   }
+  const auto t1 = logDetail ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
   if (instanceCount > 1) {
     gl.DrawElementsInstanced(mode, static_cast<GLsizei>(indexCount), idxType, idxPtr,
                              static_cast<GLsizei>(instanceCount));
   } else {
     gl.DrawElements(mode, static_cast<GLsizei>(indexCount), idxType, idxPtr);
+  }
+  if (logDetail) [[unlikely]] {
+    const auto t2 = std::chrono::steady_clock::now();
+    pass_stat_tick(true, usedFallback, base0, eabBind, m_pipeline.state.primitiveRestart,
+                   std::chrono::duration<double, std::milli>(t1 - t0).count(),
+                   std::chrono::duration<double, std::milli>(t2 - t1).count());
   }
 }
 

@@ -312,10 +312,12 @@ struct AttrArray {
   u32 size;
   u8 stride;
   bool le = true;
+  bool immutable = false;
   gfx::Range cachedRange;
 };
 inline bool operator==(const AttrArray& lhs, const AttrArray& rhs) {
-  return lhs.data == rhs.data && lhs.size == rhs.size && lhs.stride == rhs.stride && lhs.le == rhs.le;
+  return lhs.data == rhs.data && lhs.size == rhs.size && lhs.stride == rhs.stride && lhs.le == rhs.le &&
+         lhs.immutable == rhs.immutable;
 }
 inline bool operator!=(const AttrArray& lhs, const AttrArray& rhs) { return !(lhs == rhs); }
 
@@ -361,6 +363,14 @@ struct GXState {
   std::array<Light, GX::MaxLights> lights;
   std::array<TevStage, MaxTevStages> tevStages;
   std::array<gfx::TextureBind, MaxTextures> textures;
+  struct TexMetric {
+    f32 width = 0.f;
+    f32 height = 0.f;
+    f32 lodBias = 0.f;
+    u32 texWidth = 0;
+    bool arbitraryMips = false;
+  };
+  std::array<TexMetric, MaxTextures> texMetrics{};
   std::array<GXTexObj_, MaxTextures> loadedTextures;
   u8 paperEdges = 0;
   bool paperShadow = false;
@@ -429,6 +439,7 @@ struct GXState {
     regs[0xFE] = 0x00FFFFFF;
     return regs;
   }();
+  std::array<u32, 8> tevKColorBpCache{};
   std::array<u32, 0x60> xfRegCache{};
   std::array<bool, 0x60> xfRegValid{};
 
@@ -469,6 +480,7 @@ void set_render_scissor(const gfx::ClipRect& scissor) noexcept;
 void copy_tex(const void* dest, GXBool clear) noexcept;
 const gfx::TextureBind& get_texture(GXTexMapID id) noexcept;
 void resolve_sampled_textures(const ShaderInfo& info) noexcept;
+void note_copy_textures_changed() noexcept;
 
 inline float clear_depth_value() {
   const float normalizedDepth = static_cast<float>(g_gxState.clearDepth) / 16777215.f;
@@ -515,7 +527,7 @@ struct ShaderConfig {
   u8 nativeVertexFetch : 1 = 0;
   u8 edgeAA : 2 = 0;
   u8 shadowFill : 1 = 0;
-  u8 pad1 : 2 = 0;
+  u8 texBatchTier : 2 = 0;
   u8 sdfMaps = 0;
   std::array<AttrConfig, MaxVtxAttr> attrs;
   std::array<TevSwap, MaxTevSwap> tevSwapTable;
@@ -530,6 +542,10 @@ struct ShaderConfig {
   bool operator==(const ShaderConfig& rhs) const { return memcmp(this, &rhs, sizeof(*this)) == 0; }
 };
 static_assert(std::has_unique_object_representations_v<ShaderConfig>);
+
+inline constexpr u32 tex_batch_slots(u8 tier) noexcept {
+  return tier == 0 ? 1u : (1u << tier);
+}
 
 struct PipelineConfig;
 
@@ -560,6 +576,10 @@ struct ShaderInfo {
   // True iff any sampled texgen indexes into GX_TEXMTX0..9.
   bool usesTexMtx : 1 = false;
   u8 lineMode : 2 = 0;
+  bool usesTexCoordScales : 1 = false;
+  bool usesTexSize : 1 = false;
+  u8 usesAmbColorMask : 2 = 0;
+  u8 usesMatColorMask : 2 = 0;
 };
 struct BindGroupRanges {
   std::array<gfx::Range, MaxIndexAttr> vaRanges{};
@@ -577,6 +597,8 @@ uint32_t build_shader(const ShaderConfig& config) noexcept;
 size_t shader_program_count() noexcept;
 void clear_shader_program_cache() noexcept;
 GXBindGroups build_bind_groups(const ShaderInfo& info) noexcept;
+GXBindGroups resolve_and_build_bind_groups(const ShaderInfo& info) noexcept;
+GXBindGroups build_batched_tex0_bind_groups(const gfx::BindGroupRef* slotBindGroups, u32 slotCount) noexcept;
 
 u8 comp_type_size(GXAttr attr, GXCompType type) noexcept;
 u8 comp_cnt_count(GXAttr attr, GXCompCnt cnt) noexcept;

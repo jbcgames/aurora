@@ -113,6 +113,27 @@ extern "C" {
 #define GX_AURORA_DRAW_INDEXED 0x0041
 
 /**
+ * Reference an immutable pure-primitive display list by pointer/size/dlGen instead of
+ * copying its raw commands into the per-frame FIFO buffer every draw.
+ * Must be followed by a u64 data pointer, u32 byte length, and u32 dlGen.
+ */
+#define GX_AURORA_CALL_STATIC_DL 0x0042
+/**
+ * Reference a contiguous batch of immutable pure-primitive display lists as a single unit.
+ * Followed by: u64 batchKey, u32 count, u32 dlGen, then count * (u64 dataPtr, u32 nbytes).
+ */
+#define GX_AURORA_CALL_STATIC_DL_BATCH 0x0043
+
+typedef struct AuroraStaticDlDesc {
+  const void* data;
+  u32 nbytes;
+} AuroraStaticDlDesc;
+
+void GXCallStaticDisplayList(const void* data, u32 nbytes);
+void GXCallStaticDisplayListBatch(const void* batchKey, const AuroraStaticDlDesc* lists, u32 count);
+void GXSetArrayExt(GXAttr attr, const void* data, u32 size, u8 stride, u8 leMode);
+
+/**
  * Wireframe override (debug viewers). Followed by a u8 enable flag and a u32 RGBA8 line colour.
  * While enabled, every triangle-type draw is rasterized as its triangle edges (a line list,
  * no culling) and every fragment gets the line colour. Lines and points are unaffected.
