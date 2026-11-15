@@ -990,6 +990,7 @@ static void process_stream(const u8* data, u32 size, bool bigEndian, bool logTim
       if (addr != 0x30 && addr != 0x40) {
         g_gxState.pipelineDirty++;
         s_vatGen++;
+        g_gxState.lastVtxFmt = GX_MAX_VTXFMT;
       }
       // CP registers set vertex attribute tables (VCD/VAT) and array bases/strides.
       // These affect PipelineConfig vertex attributes, NOT uniform buffer contents.
