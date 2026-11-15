@@ -1120,6 +1120,13 @@ static void process_stream(const u8* data, u32 size, bool bigEndian, bool logTim
               hex += fmt::format(" {:02x}", data[i]);
           }
           Log.error("  hex dump (pos {}-{}):{}", dumpStart, dumpEnd - 1, hex);
+          for (int a = GX_VA_PNMTXIDX; a <= GX_VA_TEX7; ++a) {
+            if (g_gxState.vtxDesc[a] != GX_NONE) {
+              const auto& af = g_gxState.vtxFmts[0].attrs[a];
+              Log.error("  vtxDesc[{}]={}: cnt={} type={} frac={}", a, static_cast<int>(g_gxState.vtxDesc[a]),
+                        static_cast<int>(af.cnt), static_cast<int>(af.type), af.frac);
+            }
+          }
         }
         FATAL("command_processor: unknown opcode 0x{:02X} at pos {}", cmd, pos - 1);
       }
