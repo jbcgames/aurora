@@ -322,13 +322,26 @@ void blit_and_swap(Slot& slot) {
 
   // Autonomous screenshot trigger
   if (access("/tmp/ttyd_screenshot.req", F_OK) == 0) {
+    char customOut[256] = {};
+    if (FILE* rf = fopen("/tmp/ttyd_screenshot.req", "r")) {
+      if (fgets(customOut, sizeof(customOut), rf)) {
+        size_t len = strlen(customOut);
+        while (len > 0 && (customOut[len - 1] == '\n' || customOut[len - 1] == '\r' || customOut[len - 1] == ' ')) {
+          customOut[--len] = '\0';
+        }
+      }
+      fclose(rf);
+    }
     unlink("/tmp/ttyd_screenshot.req");
     const int sw = drawableWidth > 0 ? drawableWidth : 640;
     const int sh = drawableHeight > 0 ? drawableHeight : 480;
     std::vector<uint8_t> px(sw * sh * 4);
     gl::gl.BindFramebuffer(gl::GL_FRAMEBUFFER, 0);
     gl::gl.ReadPixels(0, 0, sw, sh, gl::GL_RGBA, gl::GL_UNSIGNED_BYTE, px.data());
-    FILE* fp = fopen("/tmp/screenshot.ppm", "wb");
+    const size_t outLen = strlen(customOut);
+    const bool directPpm = outLen > 4 && strcmp(customOut + outLen - 4, ".ppm") == 0;
+    const char* ppmTarget = directPpm ? customOut : "/tmp/screenshot.ppm";
+    FILE* fp = fopen(ppmTarget, "wb");
     if (fp) {
       fprintf(fp, "P6\n%d %d\n255\n", sw, sh);
       std::vector<uint8_t> row(sw * 3);
@@ -342,7 +355,19 @@ void blit_and_swap(Slot& slot) {
         fwrite(row.data(), 1, sw * 3, fp);
       }
       fclose(fp);
-      (void)system("ffmpeg -y -f image2 -i /tmp/screenshot.ppm /tmp/screenshot.png >/dev/null 2>&1 && touch /tmp/ttyd_screenshot.done &");
+      if (directPpm) {
+        if (FILE* df = fopen("/tmp/ttyd_screenshot.done", "wb")) {
+          fclose(df);
+        }
+      } else if (outLen > 0) {
+        char cmd[512];
+        snprintf(cmd, sizeof(cmd),
+                 "ffmpeg -loglevel quiet -y -f image2 -i /tmp/screenshot.ppm \"%s\" >/dev/null 2>&1 && touch /tmp/ttyd_screenshot.done",
+                 customOut);
+        (void)system(cmd);
+      } else {
+        (void)system("ffmpeg -y -f image2 -i /tmp/screenshot.ppm /tmp/screenshot.png >/dev/null 2>&1 && touch /tmp/ttyd_screenshot.done &");
+      }
     }
   }
 
