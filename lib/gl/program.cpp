@@ -91,7 +91,8 @@ GLuint compile_program(const char* vertexSource, const char* fragmentSource, con
     gl.GetProgramiv(program, GL_INFO_LOG_LENGTH, &logLength);
     std::string infoLog(logLength > 0 ? static_cast<size_t>(logLength) : 1, '\0');
     gl.GetProgramInfoLog(program, static_cast<GLsizei>(infoLog.size()), nullptr, infoLog.data());
-    Log.error("compile_program({}): link failed: {}", label, infoLog.c_str());
+    const GLenum err = gl.GetError();
+    Log.error("compile_program({}): link failed (glErr={:#x}, prog={}, logLen={}): {}", label, err, program, logLength, infoLog.c_str());
     gl.DeleteProgram(program);
     return 0;
   }

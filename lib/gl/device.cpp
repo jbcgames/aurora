@@ -467,9 +467,12 @@ void main() { out_color = texture(tex, v_uv); }
 )";
 gl::GLuint g_presentUiProgram = 0;
 
+static bool s_presentUiFailed = false;
+
 // Compile the present-UI program on demand (worker context current).
 static gl::GLuint present_ui_program() {
-  if (g_presentUiProgram == 0) {
+  if (g_presentUiProgram == 0 && !s_presentUiFailed) {
+    while (gl::gl.GetError() != gl::GL_NO_ERROR) {}
     g_presentUiProgram = gl::compile_program(kPresentUiVertex, kPresentUiFragment, "Present UI Composite");
     if (g_presentUiProgram != 0) {
       gl::gl.UseProgram(g_presentUiProgram);
@@ -478,6 +481,8 @@ static gl::GLuint present_ui_program() {
         gl::gl.Uniform1i(loc, 0);
       }
       gl::gl.UseProgram(0);
+    } else {
+      s_presentUiFailed = true;
     }
   }
   return g_presentUiProgram;
@@ -513,12 +518,27 @@ void present_frame(uint32_t targetFbo) noexcept {
     }
 
     const gl::GLuint readFbo = gl::get_framebuffer(source.texture);
+    gl::GLenum preErr = gl::gl.GetError();
+    if (preErr != gl::GL_NO_ERROR) {
+      static int s_preErrLogged = 0;
+      if (s_preErrLogged < 16) {
+        s_preErrLogged++;
+        Log.warn("[gl] present_frame: sticky GL error {:#x} BEFORE BlitFramebuffer", preErr);
+      }
+      while (gl::gl.GetError() != gl::GL_NO_ERROR) {}
+    }
     gl::gl.BindFramebuffer(gl::GL_READ_FRAMEBUFFER, readFbo);
     gl::gl.BindFramebuffer(gl::GL_DRAW_FRAMEBUFFER, targetFbo);
     gl::gl.Disable(gl::GL_SCISSOR_TEST);
     gl::gl.BlitFramebuffer(0, 0, static_cast<gl::GLint>(source.size.width), static_cast<gl::GLint>(source.size.height),
                            dstX0, dstY0, dstX1, dstY1, gl::GL_COLOR_BUFFER_BIT, gl::GL_LINEAR);
-    if (gl::gl.GetError() != gl::GL_NO_ERROR) {
+    if (const gl::GLenum blitErr = gl::gl.GetError(); blitErr != gl::GL_NO_ERROR) {
+      static int s_blitErrLogged = 0;
+      if (s_blitErrLogged < 8) {
+        s_blitErrLogged++;
+        Log.warn("[gl] present_frame: BlitFramebuffer error {:#x} (src={}x{} dst=({},{})->({},{}) readFbo={} targetFbo={})",
+                 blitErr, source.size.width, source.size.height, dstX0, dstY0, dstX1, dstY1, readFbo, targetFbo);
+      }
       const gl::GLuint program = present_ui_program();
       if (program != 0) {
         gl::gl.BindFramebuffer(gl::GL_FRAMEBUFFER, targetFbo);

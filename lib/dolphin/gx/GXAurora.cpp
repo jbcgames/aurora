@@ -194,7 +194,8 @@ void AuroraMoveMemory(const void* from, const void* to, u32 size) {
   }
   __gx_shadow_invalidate_tex();
   __gx_shadow_invalidate_arrays();
-  __gx_dl_invalidate_cache();
+  __gx_dl_forget_memory(from, static_cast<const u8*>(from) + size);
+  __gx_dl_forget_memory(to, static_cast<const u8*>(to) + size);
   GX_WRITE_AURORA(GX_AURORA_MOVE_MEMORY);
   GX_WRITE_U64(reinterpret_cast<u64>(from));
   GX_WRITE_U64(reinterpret_cast<u64>(to));

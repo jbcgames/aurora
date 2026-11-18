@@ -516,12 +516,8 @@ struct DrainTiming {
   double ms_static_dl = 0.0;
   double ms_submit = 0.0;
   double ms_flush = 0.0;
-  double ms_flush_merge = 0.0;
   double ms_total = 0.0;
   u32 frames = 0;
-  u32 sdl_calls = 0;
-  u32 sdl_clears = 0;
-  u32 sdl_max_sz = 0;
   u32 draw_count = 0;
   u32 bg_calls = 0;
   u32 arr_hash_calls = 0;
@@ -804,19 +800,6 @@ void process(const u8* data, u32 size, bool bigEndian) {
   process_stream(data, size, bigEndian, logTiming);
 
   flush_pending_pnmtx_batch();
-  if (logTiming) UNLIKELY {
-    if (s_drainTiming.frames + 1 >= 30) {
-      const double f = 1.0 / (s_drainTiming.frames + 1);
-      std::printf("[DRAIN-EXTRA-30f] sub=%.1fms flush=%.1fms(merge=%.1fms) sdl=%.1fms[n=%.0f clr=%.0f maxsz=%u]\n",
-                  s_drainTiming.ms_submit * f,
-                  s_drainTiming.ms_flush * f,
-                  s_drainTiming.ms_flush_merge * f,
-                  s_drainTiming.ms_static_dl * f,
-                  s_drainTiming.sdl_calls * f,
-                  s_drainTiming.sdl_clears * f,
-                  s_drainTiming.sdl_max_sz);
-    }
-  }
 
   if (logTiming) UNLIKELY {
     const auto t_proc_end = std::chrono::steady_clock::now();
@@ -3128,6 +3111,8 @@ struct NativeGeomEntry {
 static size_t s_nativeGeomCpuMirrorBytes = 0;
 static constexpr size_t kMaxNativeGeomCpuMirrorEntryBytes = 64 * 1024;
 static constexpr size_t kMaxNativeGeomCpuMirrorTotalBytes = 16 * 1024 * 1024;
+static constexpr size_t kMaxNativeGeomCacheEntries = 65536;
+static constexpr size_t kMaxNativeGeomMergedCacheEntries = 65536;
 static absl::flat_hash_map<NativeGeomKey, NativeGeomEntry, NativeGeomKeyHash> s_nativeGeomCache;
 // Keys seen but not yet promoted, mapped to the frame they were last seen in. Content is
 // promoted to the persistent cache only once it recurs across frames, which keeps
@@ -3353,7 +3338,7 @@ struct StaticDlEntry {
   u32 cachedAllPtrEpoch = 0;
   u32 extraStart = 0;
   u16 vtxStateId = UINT16_MAX;
-  u8 drawCount = 0;
+  u16 drawCount = 0;
   u8 flags = 0;
   StaticDlDraw draw0{};
 
@@ -3609,7 +3594,8 @@ static bool try_promote_native_geom(const NativeGeomKey& key, const u8* vtxPtr, 
                                     const u8* idxData, size_t idxBytes, u32 numIndices, gfx::Range& vertRange,
                                     gfx::Range& idxRange, bool mirrorCpu,
                                     const NativeGeomEntry** outCachedEntry = nullptr) {
-  if (kNativeGeomCacheEnabled && (vtxBytes >= kNativeGeomCacheMinBytes || (s_staticDlCaptureActive && vtxBytes > 0))) {
+  if (kNativeGeomCacheEnabled && s_nativeGeomCache.size() < kMaxNativeGeomCacheEntries &&
+      (vtxBytes >= kNativeGeomCacheMinBytes || (s_staticDlCaptureActive && vtxBytes > 0))) {
     const u32 frame = gfx::current_frame();
     auto [seenIt, inserted] = s_nativeGeomSeen.emplace(key, frame);
     if (!inserted && seenIt->second != frame) {
@@ -4202,7 +4188,6 @@ static void flush_pending_pnmtx_batch() {
     return;
   }
   DrainScopeTimer _t_flush(s_drainTiming.ms_flush);
-
   if (b.items.size() == 1) {
     if (is_timing_enabled()) UNLIKELY ++s_drainTiming.bat_single;
     const auto& item0 = b.items[0];
@@ -4373,7 +4358,6 @@ static void flush_pending_pnmtx_batch() {
     }
   }
 
-  DrainScopeTimer _t_merge(s_drainTiming.ms_flush_merge);
   static ByteBuffer s_mergedVtxBuf;
   static ByteBuffer s_mergedIdxBuf;
   s_mergedVtxBuf.clear();
@@ -4495,7 +4479,7 @@ static void flush_pending_pnmtx_batch() {
 
   const u8* idxPtr = anyIndexed ? s_mergedIdxBuf.data() : nullptr;
   const size_t idxBytes = anyIndexed ? s_mergedIdxBuf.size() : 0u;
-  if (b.allCached) {
+  if (b.allCached && s_nativeGeomCache.size() < kMaxNativeGeomMergedCacheEntries) {
     native_geom_resolve_ranges(mergedKey, s_mergedVtxBuf.data(), s_mergedVtxBuf.size(), mergedStride, idxPtr, idxBytes,
                                mergedNumIndices, mergedVertRange, mergedIdxRange, mergedCached, /*mirrorCpu=*/false);
   } else {
@@ -5440,7 +5424,7 @@ static void store_static_dl_entry(const void* cacheKey, const void* dlData, u32 
     }
   }
 
-  if (draws.size() > 255u) {
+  if (draws.size() > 8192u) {
     return;
   }
 
@@ -5466,16 +5450,12 @@ static void store_static_dl_entry(const void* cacheKey, const void* dlData, u32 
     return;
   }
 
-  if (is_timing_enabled()) UNLIKELY {
-    s_drainTiming.sdl_max_sz = std::max<u32>(s_drainTiming.sdl_max_sz, static_cast<u32>(s_staticDlIndex.size()));
-  }
   const auto existIt = s_staticDlIndex.find(cacheKey);
   const u32 existingIdx = (existIt != s_staticDlIndex.end()) ? existIt->second : UINT32_MAX;
-  if (existingIdx != UINT32_MAX) {
+  if (existIt != s_staticDlIndex.end()) {
     flush_pending_pnmtx_batch();
-  } else if (s_staticDlPool.size() >= 16384u) {
+  } else if (s_staticDlPool.size() >= 16384u || s_staticDlExtraDraws.size() >= 131072u) {
     flush_pending_pnmtx_batch();
-    if (is_timing_enabled()) UNLIKELY ++s_drainTiming.sdl_clears;
     clear_static_dl_cache();
   }
   if (s_staticDlPool.capacity() == 0) {
@@ -5501,7 +5481,7 @@ static void store_static_dl_entry(const void* cacheKey, const void* dlData, u32 
   entry.dlGen = dlGen;
   entry.cachedAllPtrEpoch = finalEpoch;
   entry.vtxStateId = vtxStateId;
-  entry.drawCount = static_cast<u8>(draws.size());
+  entry.drawCount = static_cast<u16>(draws.size());
   entry.flags = static_cast<u8>(kStaticEntryReady | (allMirror ? kStaticEntryMirror : 0u) |
                                 (isBatch ? kStaticEntryBatch : 0u) | kStaticEntryCoalesced);
   entry.draw0 = draws[0];
@@ -5662,6 +5642,77 @@ static void handle_static_dl_batch(const void* batchKey, const u8* itemsData, u3
   }
   store_static_dl_entry(batchKey, firstPtr, firstSize, firstHead64, lastPtr, lastSize, lastHead64,
                         minAddr, maxEnd, count, dlGen, /*isBatch=*/true, usedFmtMask, draws);
+}
+
+static void invalidate_dl_memory_range(uintptr_t rLo, uintptr_t rHi) {
+  if (rHi <= rLo) {
+    return;
+  }
+  auto overlapsRange = [rLo, rHi](const void* ptr, u32 bytes) -> bool {
+    if (ptr == nullptr) {
+      return false;
+    }
+    const uintptr_t p = reinterpret_cast<uintptr_t>(ptr);
+    const uintptr_t end = bytes != 0u ? (p + static_cast<uintptr_t>(bytes)) : (p + 1u);
+    return p < rHi && end > rLo;
+  };
+  absl::erase_if(s_arrayHashMemo, [rLo, rHi](const auto& kv) {
+    const uintptr_t p = reinterpret_cast<uintptr_t>(kv.first);
+    return p >= rLo && p < rHi;
+  });
+  bool erasedDl = false;
+  absl::erase_if(s_staticDlIndex, [rLo, rHi, &erasedDl](const auto& kv) {
+    const uintptr_t p = reinterpret_cast<uintptr_t>(kv.first);
+    bool hit = (p >= rLo && p < rHi);
+    if (!hit && kv.second < s_staticDlPool.size()) {
+      const StaticDlEntry& e = s_staticDlPool[kv.second];
+      if (e.isBatch() && e.maxEnd > e.minAddr) {
+        hit = (e.minAddr < rHi && e.maxEnd > rLo);
+      }
+    }
+    if (hit) {
+      if (kv.second < s_staticDlPool.size()) {
+        s_staticDlPool[kv.second].flags = 0;
+        s_staticDlPool[kv.second].drawCount = 0;
+      }
+      erasedDl = true;
+      return true;
+    }
+    return false;
+  });
+  if (erasedDl) {
+    flush_pending_pnmtx_batch();
+    invalidate_static_dl_fast();
+  }
+  bool vtxStateOverlap = false;
+  for (DlVtxState& st : s_dlVtxStates) {
+    u32 am = st.usedArrayMask;
+    bool hit = false;
+    for (u32 a = 0; am != 0u; ++a, am >>= 1u) {
+      if ((am & 1u) != 0u && overlapsRange(st.arrays[a].data, st.arrays[a].size)) {
+        hit = true;
+        break;
+      }
+    }
+    if (hit) {
+      st.discInvalGen = UINT32_MAX - 1u;
+      vtxStateOverlap = true;
+    }
+  }
+  bool boundOverlap = false;
+  for (const auto& arr : g_gxState.arrays) {
+    if (overlapsRange(arr.data, arr.size)) {
+      boundOverlap = true;
+      break;
+    }
+  }
+  if (boundOverlap) {
+    ++s_gxDiscArrayInvalidateGen;
+    ++s_gxArrayBindGen;
+  }
+  if (boundOverlap || vtxStateOverlap) {
+    ++s_vtxStateDirtyGen;
+  }
 }
 
 void handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian) {
@@ -5979,37 +6030,7 @@ void handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian) {
     forget_memory(lo, hi);
     const uintptr_t loAddr = reinterpret_cast<uintptr_t>(lo);
     const uintptr_t hiAddr = reinterpret_cast<uintptr_t>(hi);
-    absl::erase_if(s_arrayHashMemo, [loAddr, hiAddr](const auto& kv) {
-      const uintptr_t p = reinterpret_cast<uintptr_t>(kv.first);
-      return p >= loAddr && p < hiAddr;
-    });
-    bool erasedDl = false;
-    absl::erase_if(s_staticDlIndex, [loAddr, hiAddr, &erasedDl](const auto& kv) {
-      const uintptr_t p = reinterpret_cast<uintptr_t>(kv.first);
-      bool hit = (p >= loAddr && p < hiAddr);
-      if (!hit && kv.second < s_staticDlPool.size()) {
-        const StaticDlEntry& e = s_staticDlPool[kv.second];
-        if (e.isBatch() && e.maxEnd > e.minAddr) {
-          hit = (e.minAddr < hiAddr && e.maxEnd > loAddr);
-        }
-      }
-      if (hit) {
-        if (kv.second < s_staticDlPool.size()) {
-          s_staticDlPool[kv.second].flags = 0;
-          s_staticDlPool[kv.second].drawCount = 0;
-        }
-        erasedDl = true;
-        return true;
-      }
-      return false;
-    });
-    if (erasedDl) {
-      flush_pending_pnmtx_batch();
-      invalidate_static_dl_fast();
-    }
-    ++s_gxDiscArrayInvalidateGen;
-    ++s_gxArrayBindGen;
-    ++s_vtxStateDirtyGen;
+    invalidate_dl_memory_range(loAddr, hiAddr);
     pos += 16;
   } else if (subCmd == GX_AURORA_MOVE_MEMORY) {
     CHECK(pos + 24 <= size, "GX_AURORA_MOVE_MEMORY read overrun");
@@ -6017,9 +6038,11 @@ void handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian) {
     const auto* to = reinterpret_cast<const void*>(read_u64(data + pos + 8, bigEndian));
     const u64 sz = read_u64(data + pos + 16, bigEndian);
     move_memory(from, to, static_cast<size_t>(sz));
-    ++s_gxDiscArrayInvalidateGen;
-    ++s_gxArrayBindGen;
-    ++s_vtxStateDirtyGen;
+    const uintptr_t fromAddr = reinterpret_cast<uintptr_t>(from);
+    const uintptr_t toAddr = reinterpret_cast<uintptr_t>(to);
+    const size_t moveBytes = static_cast<size_t>(sz);
+    invalidate_dl_memory_range(fromAddr, fromAddr + moveBytes);
+    invalidate_dl_memory_range(toAddr, toAddr + moveBytes);
     pos += 24;
   } else if (subCmd == GX_AURORA_INVAL_DISC_ARRAYS) {
     ++s_gxDiscArrayInvalidateGen;
@@ -6099,7 +6122,6 @@ void handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian) {
     pos += 4;
     {
       DrainScopeTimer _t_sdl(s_drainTiming.ms_static_dl);
-      if (is_timing_enabled()) UNLIKELY ++s_drainTiming.sdl_calls;
       handle_static_dl(reinterpret_cast<const u8*>(static_cast<uintptr_t>(dlAddr)), dlSize, dlGen);
     }
   } else if (subCmd == GX_AURORA_CALL_STATIC_DL_BATCH) {
@@ -6115,7 +6137,6 @@ void handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian) {
     pos += count * 12u;
     {
       DrainScopeTimer _t_sdl(s_drainTiming.ms_static_dl);
-      if (is_timing_enabled()) UNLIKELY ++s_drainTiming.sdl_calls;
       handle_static_dl_batch(reinterpret_cast<const void*>(static_cast<uintptr_t>(batchAddr)), itemsData, count, dlGen,
                              bigEndian);
     }

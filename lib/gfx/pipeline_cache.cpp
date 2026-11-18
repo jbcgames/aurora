@@ -871,7 +871,7 @@ INSERT INTO aurora_schema VALUES ({});)",
   ret = sqlite3_prepare_v3(g_pipelineCacheDb,
                            "SELECT config, first_frame_used FROM pipeline_cache "
                            "WHERE type = ? AND config_version = ? "
-                           "ORDER BY first_frame_used ASC, rowid ASC",
+                           "ORDER BY first_frame_used ASC, rowid ASC LIMIT 1200",
                            -1, SQLITE_PREPARE_PERSISTENT, &g_pipelineCacheLoadStmt, nullptr);
   if (ret != SQLITE_OK) {
     Log.error("Failed to prepare pipeline cache load statement: {}", sqlite3_errmsg(g_pipelineCacheDb));
@@ -1145,8 +1145,9 @@ static size_t load_pipeline_cache_entries(ShaderType type, uint32_t configVersio
     return 0;
   }
 
+  constexpr size_t kMaxBootPrecompileRows = 1200;
   size_t acceptedRows = 0;
-  while ((ret = sqlite3_step(g_pipelineCacheLoadStmt)) == SQLITE_ROW) {
+  while (acceptedRows < kMaxBootPrecompileRows && (ret = sqlite3_step(g_pipelineCacheLoadStmt)) == SQLITE_ROW) {
     const auto* configBlob = static_cast<const uint8_t*>(sqlite3_column_blob(g_pipelineCacheLoadStmt, 0));
     const auto configSize = sqlite3_column_bytes(g_pipelineCacheLoadStmt, 0);
     const auto firstFrameUsed = static_cast<uint32_t>(sqlite3_column_int64(g_pipelineCacheLoadStmt, 1));
@@ -1164,9 +1165,10 @@ static size_t load_pipeline_cache_entries(ShaderType type, uint32_t configVersio
     ++acceptedRows;
   }
 
-  if (ret != SQLITE_DONE) {
+  if (ret != SQLITE_DONE && !(ret == SQLITE_ROW && acceptedRows >= kMaxBootPrecompileRows)) {
     Log.error("Failed to read pipeline cache rows: {}", sqlite3_errmsg(g_pipelineCacheDb));
     pipeline_cache_abort();
+    return acceptedRows;
   }
 
   sqlite3_reset(g_pipelineCacheLoadStmt);
