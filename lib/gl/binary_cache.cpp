@@ -20,6 +20,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace aurora::gl {
@@ -56,7 +57,9 @@ bool g_enabled = false;
 
 std::mutex g_mapMutex;
 std::unordered_map<uint64_t, Entry> g_map;
+std::unordered_set<uint64_t> g_knownKeys;
 
+std::mutex g_dbMutex;
 sqlite3* g_db = nullptr;
 std::string g_sentinelPath;
 
@@ -206,6 +209,9 @@ size_t load_map_and_evict() {
     }
     Log.info("[binary-cache] evicted {} oldest entries to fit the {} MiB cap", evicted, kMaxCacheBytes >> 20);
   }
+  for (const auto& [k, _] : g_map) {
+    g_knownKeys.insert(k);
+  }
   return g_map.size();
 }
 
@@ -221,6 +227,7 @@ void writer_thread() {
       batch.swap(g_writeQueue);
     }
 
+    std::lock_guard dbLock{g_dbMutex};
     sqlite::Transaction tx(g_db, Log, true);
     if (!tx) {
       Log.error("Failed to begin write transaction; dropping {} ops", batch.size());
@@ -415,12 +422,16 @@ void binary_cache_shutdown() {
   remove_sentinel();
 
   if (g_db != nullptr) {
-    sqlite3_close(g_db);
-    g_db = nullptr;
+    std::lock_guard dbLock{g_dbMutex};
+    if (g_db != nullptr) {
+      sqlite3_close(g_db);
+      g_db = nullptr;
+    }
   }
   {
     std::lock_guard lock{g_mapMutex};
     g_map.clear();
+    g_knownKeys.clear();
   }
   g_enabled = false;
 }
@@ -442,14 +453,43 @@ bool binary_cache_try_load(uint64_t key, GLuint program) {
     return false;
   }
   Entry entry;
+  bool found = false;
+  bool inDb = false;
   {
     std::lock_guard lock{g_mapMutex};
     const auto it = g_map.find(key);
-    if (it == g_map.end()) {
-      ++g_misses;
-      return false;
+    if (it != g_map.end()) {
+      entry = std::move(it->second);
+      g_map.erase(it);
+      found = true;
+    } else {
+      inDb = g_knownKeys.contains(key);
     }
-    entry = it->second;
+  }
+  if (!found && inDb) {
+    std::lock_guard dbLock{g_dbMutex};
+    if (g_db != nullptr) {
+      sqlite3_stmt* stmt = nullptr;
+      if (sqlite3_prepare_v2(g_db, "SELECT format, binary FROM programs WHERE key = ?", -1, &stmt, nullptr) ==
+          SQLITE_OK) {
+        sqlite3_bind_int64(stmt, 1, static_cast<sqlite3_int64>(key));
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+          const auto format = static_cast<GLenum>(sqlite3_column_int64(stmt, 0));
+          const auto* blob = static_cast<const uint8_t*>(sqlite3_column_blob(stmt, 1));
+          const int size = sqlite3_column_bytes(stmt, 1);
+          if (blob != nullptr && size > 0) {
+            entry.format = format;
+            entry.blob.assign(blob, blob + size);
+            found = true;
+          }
+        }
+        sqlite3_finalize(stmt);
+      }
+    }
+  }
+  if (!found) {
+    ++g_misses;
+    return false;
   }
 
   gl.ProgramBinary(program, entry.format, entry.blob.data(), static_cast<GLsizei>(entry.blob.size()));
@@ -463,6 +503,7 @@ bool binary_cache_try_load(uint64_t key, GLuint program) {
     {
       std::lock_guard lock{g_mapMutex};
       g_map.erase(key);
+      g_knownKeys.erase(key);
     }
     enqueue(WriteOp{.kind = WriteOp::Kind::Erase, .key = key});
     ++g_misses;
@@ -478,7 +519,7 @@ void binary_cache_store(uint64_t key, GLuint program) {
   }
   {
     std::lock_guard lock{g_mapMutex};
-    if (g_map.count(key) != 0) {
+    if (g_knownKeys.count(key) != 0) {
       return;
     }
   }
@@ -501,7 +542,7 @@ void binary_cache_store(uint64_t key, GLuint program) {
 
   {
     std::lock_guard lock{g_mapMutex};
-    g_map.insert_or_assign(key, Entry{.format = format, .blob = blob});
+    g_knownKeys.insert(key);
   }
   enqueue(WriteOp{.kind = WriteOp::Kind::Upsert, .key = key, .format = format, .blob = std::move(blob)});
 }
@@ -509,6 +550,11 @@ void binary_cache_store(uint64_t key, GLuint program) {
 void binary_cache_precompile_drained() {
   if (!g_enabled) {
     return;
+  }
+  // Free preloaded blobs once boot precompile finishes; future cache hits load on demand from SQLite.
+  {
+    std::lock_guard lock{g_mapMutex};
+    std::unordered_map<uint64_t, Entry>{}.swap(g_map);
   }
   // Survived the glProgramBinary loading window: disarm the sentinel and clear the poison counter so
   // an unrelated later crash cannot accumulate against the cache.

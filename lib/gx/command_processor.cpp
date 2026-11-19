@@ -2101,12 +2101,12 @@ static void handle_xf(const u8* data, u32& pos, u32 size, bool bigEndian, bool& 
             g_gxState.xfRegValid[0x1A + k] = true;
             g_gxState.xfRegCache[0x1A + k] = k == 0 ? val : read_u32(xfData + (i + k) * 4, bigEndian);
           }
-          const f32 sx = read_f32(xfData + 0, bigEndian);
-          const f32 sy = read_f32(xfData + 4, bigEndian);
-          const f32 sz = read_f32(xfData + 8, bigEndian);
-          const f32 ox = read_f32(xfData + 12, bigEndian);
-          const f32 oy = read_f32(xfData + 16, bigEndian);
-          const f32 oz = read_f32(xfData + 20, bigEndian);
+          const f32 sx = read_f32(xfData + (i + 0) * 4, bigEndian);
+          const f32 sy = read_f32(xfData + (i + 1) * 4, bigEndian);
+          const f32 sz = read_f32(xfData + (i + 2) * 4, bigEndian);
+          const f32 ox = read_f32(xfData + (i + 3) * 4, bigEndian);
+          const f32 oy = read_f32(xfData + (i + 4) * 4, bigEndian);
+          const f32 oz = read_f32(xfData + (i + 5) * 4, bigEndian);
           const f32 width = sx * 2.0f;
           const f32 height = -sy * 2.0f;
           const f32 left = ox - 340.0f - width / 2.0f;
@@ -2160,13 +2160,13 @@ static void handle_xf(const u8* data, u32& pos, u32 size, bool bigEndian, bool& 
             g_gxState.xfRegValid[0x20 + k] = true;
             g_gxState.xfRegCache[0x20 + k] = k == 0 ? val : read_u32(xfData + (i + k) * 4, bigEndian);
           }
-          const f32 p0 = read_f32(xfData + 0, bigEndian);
-          const f32 p1 = read_f32(xfData + 4, bigEndian);
-          const f32 p2 = read_f32(xfData + 8, bigEndian);
-          const f32 p3 = read_f32(xfData + 12, bigEndian);
-          const f32 p4 = read_f32(xfData + 16, bigEndian);
-          const f32 p5 = read_f32(xfData + 20, bigEndian);
-          const u32 projType = read_u32(xfData + 24, bigEndian);
+          const f32 p0 = read_f32(xfData + (i + 0) * 4, bigEndian);
+          const f32 p1 = read_f32(xfData + (i + 1) * 4, bigEndian);
+          const f32 p2 = read_f32(xfData + (i + 2) * 4, bigEndian);
+          const f32 p3 = read_f32(xfData + (i + 3) * 4, bigEndian);
+          const f32 p4 = read_f32(xfData + (i + 4) * 4, bigEndian);
+          const f32 p5 = read_f32(xfData + (i + 5) * 4, bigEndian);
+          const u32 projType = read_u32(xfData + (i + 6) * 4, bigEndian);
           Mat4x4<float> nextProj{};
           nextProj.m0[0] = p0;
           nextProj.m1[1] = p2;
@@ -3114,10 +3114,16 @@ static constexpr size_t kMaxNativeGeomCpuMirrorTotalBytes = 16 * 1024 * 1024;
 static constexpr size_t kMaxNativeGeomCacheEntries = 65536;
 static constexpr size_t kMaxNativeGeomMergedCacheEntries = 65536;
 static absl::flat_hash_map<NativeGeomKey, NativeGeomEntry, NativeGeomKeyHash> s_nativeGeomCache;
-// Keys seen but not yet promoted, mapped to the frame they were last seen in. Content is
-// promoted to the persistent cache only once it recurs across frames, which keeps
-// single-shot and per-frame-animated geometry from ever entering the cache.
-static absl::flat_hash_map<NativeGeomKey, u32, NativeGeomKeyHash> s_nativeGeomSeen;
+// Keys seen but not yet promoted, mapped to (lastFrame, distinct-frame hit count). Content is
+// promoted to the persistent cache only once it recurs across enough frames, which keeps
+// single-shot, short-lived, and per-frame-animated geometry from churning the cache.
+struct NativeGeomSeenInfo {
+  u32 lastFrame = 0;
+  u8 hits = 0;
+};
+static absl::flat_hash_map<NativeGeomKey, NativeGeomSeenInfo, NativeGeomKeyHash> s_nativeGeomSeen;
+static u32 s_lastGeomAutoResetFrame = 0;
+static u32 s_geomFullSinceReset = 0;
 static u32 s_nativeGeomCacheGen = 0;
 static u32 s_nativeGeomPtrEpoch = 1;
 static u64 s_pnmtxMergedBatches = 0;
@@ -3419,10 +3425,14 @@ static inline void native_geom_sync_generation() {
     flush_pending_pnmtx_batch();
     s_nativeGeomCacheGen = gen;
     s_nativeGeomCache.clear();
+    s_nativeGeomCache.rehash(0);
     ++s_nativeGeomPtrEpoch;
     s_nativeGeomSeen.clear();
+    s_nativeGeomSeen.rehash(0);
     clear_static_dl_cache();
     s_nativeGeomCpuMirrorBytes = 0;
+    s_geomFullSinceReset = 0;
+    prune_unreferenced_textures();
   }
 }
 
@@ -3593,28 +3603,50 @@ static const NativeGeomEntry* push_and_cache_native_geom(const NativeGeomKey& ke
 static bool try_promote_native_geom(const NativeGeomKey& key, const u8* vtxPtr, size_t vtxBytes, u8 vtxStride,
                                     const u8* idxData, size_t idxBytes, u32 numIndices, gfx::Range& vertRange,
                                     gfx::Range& idxRange, bool mirrorCpu,
-                                    const NativeGeomEntry** outCachedEntry = nullptr) {
-  if (kNativeGeomCacheEnabled && s_nativeGeomCache.size() < kMaxNativeGeomCacheEntries &&
+                                    const NativeGeomEntry** outCachedEntry = nullptr, u8 minRecurFrames = 4u) {
+  if (kNativeGeomCacheEnabled &&
       (vtxBytes >= kNativeGeomCacheMinBytes || (s_staticDlCaptureActive && vtxBytes > 0))) {
     const u32 frame = gfx::current_frame();
-    auto [seenIt, inserted] = s_nativeGeomSeen.emplace(key, frame);
-    if (!inserted && seenIt->second != frame) {
-      if (const NativeGeomEntry* cached =
-              push_and_cache_native_geom(key, vtxPtr, vtxBytes, vtxStride, idxData, idxBytes, numIndices, mirrorCpu,
-                                         kMaxNativeGeomCpuMirrorEntryBytes, vertRange, idxRange)) {
-        if (outCachedEntry != nullptr) {
-          *outCachedEntry = cached;
-        }
-        s_nativeGeomSeen.erase(seenIt);
-        ++s_geomCachePromotes;
-        return true;
-      }
-      seenIt->second = frame;
+    const auto maybeRequestAutoReset = [frame]() {
       ++s_geomCacheFull;
-    } else if (!inserted) {
-      seenIt->second = frame;
+      ++s_geomFullSinceReset;
+      if (s_geomFullSinceReset >= 32u &&
+          (s_lastGeomAutoResetFrame == 0 ||
+           (frame != UINT32_MAX && frame >= s_lastGeomAutoResetFrame && frame - s_lastGeomAutoResetFrame >= 300u))) {
+        gfx::request_native_geometry_cache_reset();
+        s_lastGeomAutoResetFrame = frame;
+        s_geomFullSinceReset = 0;
+      }
+    };
+    if (s_nativeGeomCache.size() >= kMaxNativeGeomCacheEntries) {
+      maybeRequestAutoReset();
+      return false;
     }
-    if (s_nativeGeomSeen.size() > 65536) {
+    auto [seenIt, inserted] = s_nativeGeomSeen.emplace(key, NativeGeomSeenInfo{frame, 1u});
+    if (!inserted && seenIt->second.lastFrame != frame) {
+      if (frame != UINT32_MAX && frame > seenIt->second.lastFrame && frame - seenIt->second.lastFrame > 60u) {
+        seenIt->second.hits = 1u;
+      } else if (seenIt->second.hits < 255u) {
+        ++seenIt->second.hits;
+      }
+      seenIt->second.lastFrame = frame;
+      if (seenIt->second.hits >= minRecurFrames) {
+        if (const NativeGeomEntry* cached =
+                push_and_cache_native_geom(key, vtxPtr, vtxBytes, vtxStride, idxData, idxBytes, numIndices, mirrorCpu,
+                                           kMaxNativeGeomCpuMirrorEntryBytes, vertRange, idxRange)) {
+          if (outCachedEntry != nullptr) {
+            *outCachedEntry = cached;
+          }
+          s_nativeGeomSeen.erase(seenIt);
+          ++s_geomCachePromotes;
+          return true;
+        }
+        maybeRequestAutoReset();
+      }
+    } else if (!inserted) {
+      seenIt->second.lastFrame = frame;
+    }
+    if (s_nativeGeomSeen.size() > 32768u) {
       s_nativeGeomSeen.clear();
     }
   }
@@ -3627,9 +3659,10 @@ static bool try_promote_native_geom(const NativeGeomKey& key, const u8* vtxPtr, 
 // `idxData`/`idxBytes` may be null/0 for non-indexed (triangle-list) draws.
 static void native_geom_resolve_ranges(const NativeGeomKey& key, const u8* vtxPtr, size_t vtxBytes, u8 vtxStride,
                                        const u8* idxData, size_t idxBytes, u32 numIndices, gfx::Range& vertRange,
-                                       gfx::Range& idxRange, bool& cached, bool mirrorCpu = true) {
+                                       gfx::Range& idxRange, bool& cached, bool mirrorCpu = true,
+                                       u8 minRecurFrames = 4u) {
   if (try_promote_native_geom(key, vtxPtr, vtxBytes, vtxStride, idxData, idxBytes, numIndices, vertRange, idxRange,
-                              mirrorCpu)) {
+                              mirrorCpu, nullptr, minRecurFrames)) {
     cached = true;
     return;
   }
@@ -3903,7 +3936,7 @@ static void emit_native_draw_command(gfx::PipelineRef pipeline, gfx::Range vertR
                                      gfx::Range uniformRange, u32 vtxCount, u32 numIndices,
                                      const GXBindGroups& bindGroups, u32 dstAlpha, bool cachedGeometry,
                                      uint32_t uniDirty, u32 texMtxGen, u32 lightsGen, u32 bpUniGen,
-                                     u32 othUniGen) noexcept {
+                                     u32 othUniGen, u8 lineWidth = 6) noexcept {
   if (is_timing_enabled()) UNLIKELY {
     if (!s_splitHasPrev) {
       s_splitHasPrev = true;
@@ -4033,6 +4066,7 @@ static void emit_native_draw_command(gfx::PipelineRef pipeline, gfx::Range vertR
       .dstAlpha = dstAlpha,
       .nativeVertexFetch = true,
       .cachedGeometry = cachedGeometry,
+      .lineWidth = lineWidth,
   });
   const auto tc1 = timing_now();
   s_drainTiming.ms_push_cmd += std::chrono::duration<double, std::milli>(tc1 - tc0).count();
@@ -4227,7 +4261,8 @@ static void flush_pending_pnmtx_batch() {
           }
         } else {
           native_geom_resolve_ranges(ex0.key, vtxPtr, ex0.scratchVtxBytes, b.nativeStride, idxPtr, idxBytes,
-                                     ex0.numIndices, ex0.vertRange, ex0.idxRange, cached0, /*mirrorCpu=*/true);
+                                     ex0.numIndices, ex0.vertRange, ex0.idxRange, cached0, /*mirrorCpu=*/true,
+                                     static_cast<u8>(s_staticDlCaptureActive ? 2u : 4u));
         }
       }
       emit_native_draw_command(s_lastPipeline, ex0.vertRange, ex0.idxRange, s_lastUniformRange, item0.vtxCount,
@@ -4481,7 +4516,8 @@ static void flush_pending_pnmtx_batch() {
   const size_t idxBytes = anyIndexed ? s_mergedIdxBuf.size() : 0u;
   if (b.allCached && s_nativeGeomCache.size() < kMaxNativeGeomMergedCacheEntries) {
     native_geom_resolve_ranges(mergedKey, s_mergedVtxBuf.data(), s_mergedVtxBuf.size(), mergedStride, idxPtr, idxBytes,
-                               mergedNumIndices, mergedVertRange, mergedIdxRange, mergedCached, /*mirrorCpu=*/false);
+                               mergedNumIndices, mergedVertRange, mergedIdxRange, mergedCached, /*mirrorCpu=*/false,
+                               8u);
   } else {
     const size_t vertAlign = mergedStride > 4 ? static_cast<size_t>(mergedStride) : 4u;
     ++s_geomCacheRingPushes;
@@ -4692,7 +4728,8 @@ static void submit_native_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
                       (!indexed || cachedEntry->cpuIndices.size() >= effectiveNumIndices);
 
   const bool baseEligible = kEnablePnMtxBatch && vtxCount <= 0xFFFEu &&
-                            nativeAttrs[GX_VA_PNMTXIDX].attrType == GX_NONE;
+                            nativeAttrs[GX_VA_PNMTXIDX].attrType == GX_NONE &&
+                            prim != GX_LINES && prim != GX_LINESTRIP && prim != GX_POINTS;
 
   // Promote recurring uncached draws early when possible so static batches turn allCached faster.
   bool promoTried = false;
@@ -4700,7 +4737,8 @@ static void submit_native_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
     promoTried = true;
     const NativeGeomEntry* promotedEntry = nullptr;
     if (try_promote_native_geom(key, vtxPtr, vtxBytes, nativeStride, idxPtr, idxBytes, numIndices,
-                                cachedVertRange, cachedIdxRange, /*mirrorCpu=*/true, &promotedEntry)) {
+                                cachedVertRange, cachedIdxRange, /*mirrorCpu=*/true, &promotedEntry,
+                                static_cast<u8>(s_staticDlCaptureActive ? 2u : 4u))) {
       cached = true;
       cachedEntry = promotedEntry;
       cachedEntryEpoch = s_nativeGeomPtrEpoch;
@@ -4872,13 +4910,17 @@ static void submit_native_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
         }
       } else {
         native_geom_resolve_ranges(key, vtxPtr, vtxBytes, nativeStride, idxPtr, idxBytes, effectiveNumIndices,
-                                   cachedVertRange, cachedIdxRange, cached, /*mirrorCpu=*/true);
+                                   cachedVertRange, cachedIdxRange, cached, /*mirrorCpu=*/true,
+                                   static_cast<u8>(s_staticDlCaptureActive ? 2u : 4u));
       }
     }
+    const u8 lineWidth = (prim == GX_LINES || prim == GX_LINESTRIP)
+                             ? (g_gxState.lineWidth != 0 ? g_gxState.lineWidth : static_cast<u8>(6))
+                             : static_cast<u8>(6);
     emit_native_draw_command(s_lastPipeline, cachedVertRange, cachedIdxRange, s_lastUniformRange, vtxCount,
                              effectiveNumIndices, s_lastBindGroups, g_gxState.dstAlpha, cached,
                              g_gxState.uniformDirty, s_splitTexMtxGen, s_splitLightsGen, s_splitBpUniGen,
-                             s_splitOthUniGen);
+                             s_splitOthUniGen, lineWidth);
     return;
   }
 
@@ -4946,7 +4988,8 @@ static void submit_native_gx_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
 // Expand `vtxCount` raw FIFO vertices and push a native draw, serving steady-state
 // geometry from the persistent content-hash cache (no re-expand, no re-upload).
 static bool try_native_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const u8* data, u32& pos, u32 vtxSize) {
-  if (prim != GX_TRIANGLES && prim != GX_TRIANGLESTRIP && prim != GX_TRIANGLEFAN && prim != GX_QUADS) {
+  if (prim != GX_TRIANGLES && prim != GX_TRIANGLESTRIP && prim != GX_TRIANGLEFAN && prim != GX_QUADS &&
+      prim != GX_LINES && prim != GX_LINESTRIP && prim != GX_POINTS) {
     return false;
   }
   u8 nativeStride = 0;
@@ -4960,6 +5003,11 @@ static bool try_native_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const 
   const auto& descs = *descsPtr;
   ++s_geomDrawsSingle;
   const u32 srcBytes = static_cast<u32>(vtxCount) * vtxSize;
+  if (((prim == GX_LINES || prim == GX_LINESTRIP) && vtxCount < 2) || (prim == GX_POINTS && vtxCount == 0)) {
+    pos += srcBytes;
+    return true;
+  }
+  const u16 drawVtxCount = (prim == GX_LINES) ? static_cast<u16>(vtxCount & ~1u) : vtxCount;
 
   // Content-hash key: source FIFO bytes + decode layout (+ indexed array contents). A hit
   // replays the cached GPU ranges without touching the CPU-side vertex data at all.
@@ -4976,8 +5024,8 @@ static bool try_native_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const 
     if (const auto it = s_nativeGeomCache.find(key); it != s_nativeGeomCache.end()) {
       ++s_geomCacheHits;
       pos += srcBytes;
-      submit_native_gx_draw(prim, fmt, vtxCount, nativeAttrs, attrLayoutId, nativeStride, key, &it->second, nullptr, 0,
-                            nullptr, 0, it->second.indexCount, it->second.indexCount != 0, /*stripTopology=*/false);
+      submit_native_gx_draw(prim, fmt, drawVtxCount, nativeAttrs, attrLayoutId, nativeStride, key, &it->second, nullptr,
+                            0, nullptr, 0, it->second.indexCount, it->second.indexCount != 0, /*stripTopology=*/false);
       return true;
     }
     ++s_geomCacheMisses;
@@ -4993,15 +5041,22 @@ static bool try_native_draw(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount, const 
   }
   pos += srcBytes;
 
-  // Strips/fans/quads get a generated index buffer; plain triangle lists draw non-indexed.
-  const bool indexed = prim != GX_TRIANGLES;
+  // Strips/fans/quads/line-strips get a generated index buffer; plain triangles, lines, and points draw non-indexed.
+  const bool indexed = (prim != GX_TRIANGLES && prim != GX_LINES && prim != GX_POINTS);
   u32 numIndices = 0;
   s_nativeIdxBuf.clear();
-  if (indexed) {
+  if (prim == GX_LINESTRIP) {
+    s_nativeIdxBuf.reserve_extra(static_cast<size_t>(vtxCount - 1u) * 2u * sizeof(u16));
+    for (u16 v = 0; v + 1u < vtxCount; ++v) {
+      s_nativeIdxBuf.append<u16>(v);
+      s_nativeIdxBuf.append<u16>(static_cast<u16>(v + 1u));
+    }
+    numIndices = static_cast<u32>(vtxCount - 1u) * 2u;
+  } else if (indexed) {
     numIndices = prepare_idx_buffer(s_nativeIdxBuf, prim, 0, vtxCount);
   }
 
-  submit_native_gx_draw(prim, fmt, vtxCount, nativeAttrs, attrLayoutId, nativeStride, key, nullptr,
+  submit_native_gx_draw(prim, fmt, drawVtxCount, nativeAttrs, attrLayoutId, nativeStride, key, nullptr,
                         s_nativeVtxBuf.data(), s_nativeVtxBuf.size(), indexed ? s_nativeIdxBuf.data() : nullptr,
                         indexed ? s_nativeIdxBuf.size() : 0, numIndices, indexed, /*stripTopology=*/false);
   s_nativeIdxBuf.clear();
@@ -5740,6 +5795,9 @@ void handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian) {
     if (rv.left != left || rv.top != top || rv.width != width || rv.height != height ||
         rv.znear != nearZ || rv.zfar != farZ) {
       flush_pending_pnmtx_batch();
+      for (int k = 0; k < 6; ++k) {
+        g_gxState.xfRegValid[0x1A + k] = false;
+      }
       set_render_viewport({
           .left = left,
           .top = top,
@@ -5770,6 +5828,7 @@ void handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian) {
     const f32 scale = read_f32(data + pos, bigEndian);
     pos += 4;
     if (g_gxState.projScaleX != scale) {
+      flush_pending_pnmtx_batch();
       g_gxState.projScaleX = scale;
       g_gxState.pipelineDirty++;
       g_gxState.uniformDirty++;
@@ -5810,6 +5869,10 @@ void handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian) {
       }
     }
     if (std::memcmp(&g_gxState.proj, &nextProj, sizeof(nextProj)) != 0) {
+      flush_pending_pnmtx_batch();
+      for (int k = 0; k < 7; ++k) {
+        g_gxState.xfRegValid[0x20 + k] = false;
+      }
       g_gxState.proj = nextProj;
       g_gxState.uniformDirty++;
       g_gxState.stateDirty = true;

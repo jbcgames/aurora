@@ -21,6 +21,7 @@ struct DrawData {
   // (g_nativeVertexCacheBuffer / g_nativeIndexCacheBuffer) rather than the per-frame
   // rings. Implies nativeVertexFetch. Set by the native geometry cache on a hit/promote.
   bool cachedGeometry = false;
+  uint8_t lineWidth = 6;
 };
 
 constexpr uint32_t GXPipelineConfigVersion = 15;

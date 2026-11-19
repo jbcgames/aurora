@@ -5,6 +5,7 @@
 #include "shader_info.hpp"
 #include "tracy/Tracy.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -68,6 +69,9 @@ void render(const DrawData& data, gl::PassEncoder& pass) {
     pass.SetBlendConstant(&color);
   }
   const auto t4 = s_detail ? Clock::now() : Clock::time_point{};
+  if (data.lineWidth != 0) {
+    pass.SetLineWidth(std::max(1.0f, static_cast<float>(data.lineWidth) / 6.0f));
+  }
   if (data.indexCount == 0) {
     pass.Draw(data.vtxCount, data.instanceCount);
   } else {

@@ -83,6 +83,10 @@ void query_caps() {
   gl::GLint uboAlign = 256;
   gl::gl.GetIntegerv(gl::GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT, &uboAlign);
   g_uniformBufferOffsetAlignment = uboAlign > 0 ? static_cast<uint32_t>(uboAlign) : 256u;
+
+  gl::GLfloat lineWidthRange[2] = {1.0f, 1.0f};
+  gl::gl.GetFloatv(gl::GL_ALIASED_LINE_WIDTH_RANGE, lineWidthRange);
+  Log.info("[gl] line width range: [{}, {}]", lineWidthRange[0], lineWidthRange[1]);
 }
 } // namespace
 

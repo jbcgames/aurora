@@ -59,5 +59,6 @@ void set_blend_color(float r, float g, float b, float a);
 // Re-issue stencil func with a new reference, reusing the compare+read-mask that
 // apply_baked_state last baked.
 void set_stencil_reference(uint32_t reference);
+void set_line_width(float width);
 
 } // namespace aurora::gl

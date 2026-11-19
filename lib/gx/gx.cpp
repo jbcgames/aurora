@@ -947,7 +947,7 @@ void expire_texture_object_caches() noexcept {
   // when game heaps free or compact allocations, so they must not be evicted on a fixed frame timeout.
 
   // If cached textures exceed budget on 1 GB RAM devices, drop stale non-bound texture objects first.
-  if (s_staticContentCache.size() > 4096) {
+  if (s_staticContentCache.size() > 512) {
     for (auto it = s_textureObjectCaches.begin(); it != s_textureObjectCaches.end();) {
       if (!boundTexObjs.contains(it->first) && frame - it->second.lastUsedFrame > 300) {
         invalidate_fast_tex_id(it->first);
@@ -959,14 +959,51 @@ void expire_texture_object_caches() noexcept {
     }
   }
 
-  // Prune unreferenced static content cache entries only when over safe budget (2048 entries).
-  if (s_staticContentCache.size() > 2048) {
+  // Prune unreferenced static content cache entries only when over safe budget (256 entries).
+  if (s_staticContentCache.size() > 256) {
     for (auto it = s_staticContentCache.begin(); it != s_staticContentCache.end();) {
       if (!it->second || it->second.use_count() <= 1) {
         s_staticContentCache.erase(it++);
       } else {
         ++it;
       }
+    }
+  }
+}
+
+void prune_unreferenced_textures() noexcept {
+  const u32 frame = gfx::current_frame();
+  absl::flat_hash_set<u32> boundTexObjs;
+  for (const auto& obj : g_gxState.loadedTextures) {
+    if (obj.texObjId != 0) {
+      boundTexObjs.insert(obj.texObjId);
+    }
+  }
+  for (const auto& bind : g_gxState.textures) {
+    if (bind.texObj.texObjId != 0) {
+      boundTexObjs.insert(bind.texObj.texObjId);
+    }
+  }
+  bool erasedTex = false;
+  for (auto it = s_textureObjectCaches.begin(); it != s_textureObjectCaches.end();) {
+    if (!boundTexObjs.contains(it->first) && frame != UINT32_MAX && frame >= it->second.lastUsedFrame &&
+        frame - it->second.lastUsedFrame > 120u) {
+      invalidate_fast_tex_id(it->first);
+      clear_texture_dependency(it->first, it->second.tlutObjId);
+      s_textureObjectCaches.erase(it++);
+      erasedTex = true;
+    } else {
+      ++it;
+    }
+  }
+  if (erasedTex) {
+    ++s_resolvedBindGroupGen;
+  }
+  for (auto it = s_staticContentCache.begin(); it != s_staticContentCache.end();) {
+    if (!it->second || it->second.use_count() <= 1) {
+      s_staticContentCache.erase(it++);
+    } else {
+      ++it;
     }
   }
 }
@@ -1521,9 +1558,17 @@ gl::Pipeline build_pipeline(const PipelineConfig& config, uint32_t program, cons
 
   // TriangleStrip batches separate strips with the max Uint16 index (0xffff) as an
   // implicit primitive restart; a triangle *list* must NOT enable restart (S6).
-  state.topology =
-      config.triangleStripTopology != 0 ? gfx::PrimitiveTopology::TriangleStrip : gfx::PrimitiveTopology::TriangleList;
-  state.primitiveRestart = config.triangleStripTopology != 0;
+  if (config.shaderConfig.lineMode == 1 || config.shaderConfig.lineMode == 2) {
+    state.topology = gfx::PrimitiveTopology::LineList;
+    state.primitiveRestart = false;
+  } else if (config.shaderConfig.lineMode == 3) {
+    state.topology = gfx::PrimitiveTopology::PointList;
+    state.primitiveRestart = false;
+  } else {
+    state.topology =
+        config.triangleStripTopology != 0 ? gfx::PrimitiveTopology::TriangleStrip : gfx::PrimitiveTopology::TriangleList;
+    state.primitiveRestart = config.triangleStripTopology != 0;
+  }
   state.alphaToCoverage = (config.shaderConfig.edgeAA == 1 && config.msaaSamples > 1);
 
   // Native vertex layout as a present-attr bitmask over canonical GX attr order

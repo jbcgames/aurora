@@ -967,6 +967,9 @@ GlslProgram emit_glsl(const ShaderConfig& config, const ShaderInfo& info) {
     vsBody += "\n    gl_Position.z += gl_Position.w;";
   }
   vsBody += "\n    gl_Position.z = gl_Position.z * 2.0 - gl_Position.w;";
+  if (info.lineMode == 3) {
+    vsBody += "\n    gl_PointSize = max(1.0, ubuf.line_width * (ubuf.render_viewport_size.y / max(ubuf.logical_viewport_size.y, 1.0)));";
+  }
   if (info.usesNormals) {
     vsBody += fmt::format(
         "\n    vec3 nrm_tmp = vec4({0}, 0.0) * ubuf.nrm_mtx[{1}];"
@@ -983,6 +986,13 @@ GlslProgram emit_glsl(const ShaderConfig& config, const ShaderInfo& info) {
 
   const u32 pnMtxSlots = info.usesMultiPnMtx ? MaxPnMtx : 1;
   const u32 texMtxSlots = info.usesTexMtx ? MaxTexMtx : 0;
+  if (info.lineMode != 0) {
+    uniformFields +=
+        "\n    float line_width;"
+        "\n    float line_aspect_y;"
+        "\n    float line_tex_offset;"
+        "\n    uint line_texcoord_mask;";
+  }
   uniformFields += "\n    mat4 proj;";
   uniformFields += fmt::format("\n    mat3x4 postex_mtx[{}];", pnMtxSlots + texMtxSlots);
   if (info.usesNormals) {

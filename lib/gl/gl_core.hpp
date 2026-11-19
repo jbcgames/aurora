@@ -229,6 +229,7 @@ inline constexpr GLenum GL_MIN = 0x8007;
 inline constexpr GLenum GL_MAX = 0x8008;
 
 // Depth / stencil compare funcs, cull, winding
+inline constexpr GLenum GL_ALIASED_LINE_WIDTH_RANGE = 0x846E;
 inline constexpr GLenum GL_NEVER = 0x0200;
 inline constexpr GLenum GL_LESS = 0x0201;
 inline constexpr GLenum GL_EQUAL = 0x0202;
@@ -426,6 +427,7 @@ struct GlProcTable {
   void (*CullFace)(GLenum) = nullptr;
   void (*FrontFace)(GLenum) = nullptr;
   void (*PolygonOffset)(GLfloat, GLfloat) = nullptr;
+  void (*LineWidth)(GLfloat) = nullptr;
   void (*Viewport)(GLint, GLint, GLsizei, GLsizei) = nullptr;
   void (*Scissor)(GLint, GLint, GLsizei, GLsizei) = nullptr;
   void (*StencilFuncSeparate)(GLenum, GLenum, GLint, GLuint) = nullptr;

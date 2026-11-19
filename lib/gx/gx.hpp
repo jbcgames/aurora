@@ -470,6 +470,7 @@ void evict_copy_texture(const void* dest) noexcept;
 void evict_texture_object(u32 texObjId) noexcept;
 void evict_tlut_object(u32 tlutObjId) noexcept;
 void expire_texture_object_caches() noexcept;
+void prune_unreferenced_textures() noexcept;
 Vec2<uint32_t> logical_fb_size() noexcept;
 gfx::Viewport map_logical_viewport(const gfx::Viewport& logicalViewport) noexcept;
 gfx::ClipRect map_logical_scissor(const gfx::ClipRect& logicalScissor) noexcept;

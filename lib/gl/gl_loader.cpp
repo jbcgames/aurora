@@ -217,6 +217,7 @@ bool load(ProcAddressFn getProc) {
   REQ(CullFace, "glCullFace")
   REQ(FrontFace, "glFrontFace")
   REQ(PolygonOffset, "glPolygonOffset")
+  REQ(LineWidth, "glLineWidth")
   REQ(Viewport, "glViewport")
   REQ(Scissor, "glScissor")
   REQ(StencilFuncSeparate, "glStencilFuncSeparate")

@@ -346,6 +346,10 @@ void PassEncoder::SetStencilReference(uint32_t reference) {
   set_stencil_reference(reference);
 }
 
+void PassEncoder::SetLineWidth(float width) {
+  set_line_width(width);
+}
+
 static uint32_t s_passStatDraws = 0;
 static uint32_t s_passStatDrawArrays = 0;
 static uint32_t s_passStatDrawIdx = 0;

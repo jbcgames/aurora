@@ -51,6 +51,9 @@ void AuroraGetRenderSize(u32* width, u32* height) {
 }
 
 void GXSetViewportRender(f32 left, f32 top, f32 wd, f32 ht, f32 nearz, f32 farz) {
+  if (!aurora::gx::fifo::in_display_list()) {
+    __gxShadow.vpEpoch = 0;
+  }
   GX_WRITE_AURORA(GX_AURORA_LOAD_VIEWPORT_RENDER);
   GX_WRITE_F32(left);
   GX_WRITE_F32(top);
@@ -61,6 +64,9 @@ void GXSetViewportRender(f32 left, f32 top, f32 wd, f32 ht, f32 nearz, f32 farz)
 }
 
 void GXSetScissorRender(u32 left, u32 top, u32 wd, u32 ht) {
+  if (!aurora::gx::fifo::in_display_list()) {
+    __gxShadow.suScisEpoch = 0;
+  }
   GX_WRITE_AURORA(GX_AURORA_LOAD_SCISSOR_RENDER);
   GX_WRITE_U32(left);
   GX_WRITE_U32(top);
@@ -69,6 +75,9 @@ void GXSetScissorRender(u32 left, u32 top, u32 wd, u32 ht) {
 }
 
 void GXSetProjectionFull(const void* mtx) {
+  if (!aurora::gx::fifo::in_display_list()) {
+    __gxShadow.projEpoch = 0;
+  }
   const f32* values = reinterpret_cast<const f32*>(mtx);
   GX_WRITE_AURORA(GX_AURORA_LOAD_PROJECTION_FULL);
   for (int i = 0; i < 16; ++i) {

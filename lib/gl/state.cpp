@@ -124,6 +124,7 @@ struct Shadow {
   GLenum cullFace, frontFace;
   int polygonOffset;
   float poFactor, poUnits;
+  float lineWidth;
   int primitiveRestart;
   int alphaToCoverage;
   // Stencil
@@ -398,6 +399,26 @@ void set_stencil_reference(uint32_t reference) {
   if (ref != s.stencilRef) {
     s.stencilRef = ref;
     apply_stencil_func();
+  }
+}
+
+void set_line_width(float width) {
+  static bool sRangeQueried = false;
+  static float sMinWidth = 1.0f;
+  static float sMaxWidth = 1.0f;
+  if (!sRangeQueried) {
+    GLfloat range[2] = {1.0f, 1.0f};
+    gl.GetFloatv(GL_ALIASED_LINE_WIDTH_RANGE, range);
+    if (range[0] > 0.0f && range[1] >= range[0]) {
+      sMinWidth = range[0];
+      sMaxWidth = range[1];
+    }
+    sRangeQueried = true;
+  }
+  const float clamped = width < sMinWidth ? sMinWidth : (width > sMaxWidth ? sMaxWidth : width);
+  if (clamped != s.lineWidth) {
+    s.lineWidth = clamped;
+    gl.LineWidth(clamped);
   }
 }
 

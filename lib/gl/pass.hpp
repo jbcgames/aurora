@@ -54,6 +54,7 @@ public:
   void SetScissorRect(uint32_t x, uint32_t y, uint32_t width, uint32_t height);
   void SetBlendConstant(const Color* color);
   void SetStencilReference(uint32_t reference);
+  void SetLineWidth(float width);
   void Draw(uint32_t vertexCount, uint32_t instanceCount = 1, uint32_t firstVertex = 0, uint32_t firstInstance = 0);
   void DrawIndexed(uint32_t indexCount, uint32_t instanceCount = 1, uint32_t firstIndex = 0, int32_t baseVertex = 0,
                    uint32_t firstInstance = 0);
